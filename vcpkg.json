@@ -1,0 +1,7 @@
+{
+  "name": "dumapril-taglocalization",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "pthreads"
+  ]
+}

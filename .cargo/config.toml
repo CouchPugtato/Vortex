@@ -1,0 +1,7 @@
+[env]
+# Paths to pthreads headers and static lib from vcpkg
+APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR = 'f:\Coding\Repositories\Vortex\vcpkg\installed\x64-windows-static\include'
+APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB = 'f:\Coding\Repositories\Vortex\vcpkg\installed\x64-windows-static\lib\pthreadVC3.lib'
+
+# Link apriltag statically
+APRILTAG_STATIC = '1'
