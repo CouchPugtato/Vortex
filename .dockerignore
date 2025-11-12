@@ -1,0 +1,8 @@
+target
+vcpkg
+.git
+.gitignore
+Dockerfile
+node_modules
+**/*.tmp
+.DS_Store

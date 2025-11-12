@@ -15,7 +15,7 @@ pub fn build_detector() -> Result<Detector> {
     )
 }
 
-pub fn detect_corners(detector: &mut Detector, gray: &GrayImage, scale_factor: f32) -> Result<Vec<[(i32, i32); 4]>> {
+pub fn detect_corners(detector: &mut Detector, gray: &GrayImage, scale_factor: f32) -> Result<Vec<[(f64, f64); 4]>> {
     let at_img: AprilImage = gray_to_april_image(gray)?;
 
     let gray_eq = crate::preprocess::contrast_stretch(gray);
@@ -33,22 +33,22 @@ pub fn detect_corners(detector: &mut Detector, gray: &GrayImage, scale_factor: f
     detections.append(&mut det_eq);
     let mut ids: HashSet<usize> = detections.iter().map(|d| d.id()).collect();
 
-    let mut corners_list: Vec<[(i32, i32); 4]> = Vec::new();
+    let mut corners_list: Vec<[(f64, f64); 4]> = Vec::new();
     for det in detections.iter() {
         let corners = det.corners();
-        let to_i = |p: [f64; 2]| (p[0].round() as i32, p[1].round() as i32);
-        corners_list.push([to_i(corners[0]), to_i(corners[1]), to_i(corners[2]), to_i(corners[3])]);
+        let to_f = |p: [f64; 2]| (p[0], p[1]);
+        corners_list.push([to_f(corners[0]), to_f(corners[1]), to_f(corners[2]), to_f(corners[3])]);
     }
 
     for det in det_scaled_eq.iter() {
         if ids.insert(det.id()) {
             let corners = det.corners();
-            let to_i_scaled = |p: [f64; 2]| ((p[0] / sf as f64).round() as i32, (p[1] / sf as f64).round() as i32);
+            let to_f_scaled = |p: [f64; 2]| (p[0] / sf as f64, p[1] / sf as f64);
             corners_list.push([
-                to_i_scaled(corners[0]),
-                to_i_scaled(corners[1]),
-                to_i_scaled(corners[2]),
-                to_i_scaled(corners[3]),
+                to_f_scaled(corners[0]),
+                to_f_scaled(corners[1]),
+                to_f_scaled(corners[2]),
+                to_f_scaled(corners[3]),
             ]);
         }
     }

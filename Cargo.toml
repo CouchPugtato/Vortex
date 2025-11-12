@@ -12,8 +12,13 @@ apriltag-image = "0.1"
 anyhow = "1"
 image = { version = "0.23", features = ["png", "jpeg"] }
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nalgebra = "0.32"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Removed separate distance_estimation binary; functionality integrated into main

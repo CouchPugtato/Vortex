@@ -1,12 +1,12 @@
 use image::{RgbaImage, Rgba};
 
-pub fn draw_detections(overlay: &mut RgbaImage, corners_list: &Vec<[(i32, i32); 4]>) {
+pub fn draw_detections(overlay: &mut RgbaImage, corners_list: &Vec<[(f64, f64); 4]>) {
     let color = Rgba([0, 255, 0, 255]);
     for corners in corners_list.iter() {
-        let (x0, y0) = corners[0];
-        let (x1, y1) = corners[1];
-        let (x2, y2) = corners[2];
-        let (x3, y3) = corners[3];
+        let (x0, y0) = (corners[0].0.round() as i32, corners[0].1.round() as i32);
+        let (x1, y1) = (corners[1].0.round() as i32, corners[1].1.round() as i32);
+        let (x2, y2) = (corners[2].0.round() as i32, corners[2].1.round() as i32);
+        let (x3, y3) = (corners[3].0.round() as i32, corners[3].1.round() as i32);
         draw_line_thick(overlay, x0, y0, x1, y1, color);
         draw_line_thick(overlay, x1, y1, x2, y2, color);
         draw_line_thick(overlay, x2, y2, x3, y3, color);

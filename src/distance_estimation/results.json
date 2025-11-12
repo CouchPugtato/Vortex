@@ -1,0 +1,170 @@
+[
+  {
+    "image": "194px-ft2.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      55.244995,
+      186.01294
+    ],
+    "norm_offset": [
+      0.018268848,
+      0.046134163
+    ],
+    "distance_px": 194.04335,
+    "translation_m": [
+      -0.019977015,
+      0.019752597,
+      0.003241341
+    ]
+  },
+  {
+    "image": "212px-ft6.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -12.292725,
+      -211.50342
+    ],
+    "norm_offset": [
+      -0.0040650545,
+      -0.052456204
+    ],
+    "distance_px": 211.86034,
+    "translation_m": [
+      0.007325885,
+      -0.0011937984,
+      0.0019908303
+    ]
+  },
+  {
+    "image": "57px-ft3.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -4.250122,
+      56.948975
+    ],
+    "norm_offset": [
+      -0.0014054637,
+      0.01412425
+    ],
+    "distance_px": 57.10735,
+    "translation_m": [
+      -0.0073752603,
+      0.017102068,
+      0.0053852424
+    ]
+  },
+  {
+    "image": "ft2.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      54.83069,
+      185.58008
+    ],
+    "norm_offset": [
+      0.018131841,
+      0.046026804
+    ],
+    "distance_px": 193.51064,
+    "translation_m": [
+      -0.020245269,
+      0.019431818,
+      0.0030140548
+    ]
+  },
+  {
+    "image": "ft3.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -4.800049,
+      56.62793
+    ],
+    "norm_offset": [
+      -0.0015873178,
+      0.014044626
+    ],
+    "distance_px": 56.831005,
+    "translation_m": [
+      -0.00759679,
+      0.016965982,
+      0.0052658855
+    ]
+  },
+  {
+    "image": "ft6.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -12.995972,
+      -212.05847
+    ],
+    "norm_offset": [
+      -0.00429761,
+      -0.05259387
+    ],
+    "distance_px": 212.45633,
+    "translation_m": [
+      0.0061615733,
+      -0.0033484364,
+      0.000645308
+    ]
+  },
+  {
+    "image": "ft3.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -4.800049,
+      56.62793
+    ],
+    "norm_offset": [
+      -0.0015873178,
+      0.014044626
+    ],
+    "distance_px": 56.831005,
+    "translation_m": [
+      -0.00759679,
+      0.016965982,
+      0.0052658855
+    ]
+  },
+  {
+    "image": "ft6.png",
+    "width": 3024,
+    "height": 4032,
+    "num_detections": 2,
+    "class": "centered",
+    "offset_px": [
+      -12.995972,
+      -212.05847
+    ],
+    "norm_offset": [
+      -0.00429761,
+      -0.05259387
+    ],
+    "distance_px": 212.45633,
+    "translation_m": [
+      0.0061615733,
+      -0.0033484364,
+      0.000645308
+    ]
+  }
+]
