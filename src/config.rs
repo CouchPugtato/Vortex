@@ -1,8 +1,11 @@
 // Camera intrinsics and tag size
-pub const CAM_FX: f64 = 1000.0;
-pub const CAM_FY: f64 = 1000.0;
-pub const CAM_CX: f64 = 640.0;
-pub const CAM_CY: f64 = 360.0;
+// Defaults aligned for a 1920x1200 AR0234-based USB camera with ~126° HFOV.
+// fx is approximated from HFOV: fx ≈ W / (2 * tan(HFOV/2)).
+// These are placeholders; for accurate 3D, calibrate and update.
+pub const CAM_FX: f64 = 490.0; // pixels (approx for 126° at 1920 width)
+pub const CAM_FY: f64 = 490.0; // assume square pixels; update after calibration
+pub const CAM_CX: f64 = 960.0; // principal point at image center (1920/2)
+pub const CAM_CY: f64 = 600.0; // principal point at image center (1200/2)
 pub const TAG_SIZE_M: f64 = 0.16; // meters
 
 // Image darkening gamma

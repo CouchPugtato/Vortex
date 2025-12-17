@@ -1,3 +1,0 @@
-[env]
-# Link apriltag statically (portable in Docker/Linux; optional on Windows)
-APRILTAG_STATIC = '1'
