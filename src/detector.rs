@@ -1,38 +1,54 @@
 use anyhow::Result;
-use apriltag::{DetectorBuilder, families::Family, Image as AprilImage, Detector};
-use image::GrayImage;
-use std::collections::HashSet;
-use std::io::Write;
-use tempfile::NamedTempFile;
+use apriltag::{DetectorBuilder, families::Family, Detector, Image as AprilImage};
 
-pub fn build_detector() -> Result<Detector> {
-    let family = Family::tag_36h11();
-    let bits: usize = 3;
-    Ok(
-        DetectorBuilder::new()
-            .add_family_bits(family, bits)
-            .build()?
-    )
+#[repr(C)]
+struct RawDetector {
+    nthreads: i32,
+    quad_decimate: f32,
+    quad_sigma: f32,
+    refine_edges: i32,
+    decode_sharpening: f64,
+    debug: i32,
 }
 
-pub fn detect_corners(detector: &mut Detector, gray: &GrayImage, scale_factor: f32) -> Result<Vec<[(f64, f64); 4]>> {
-    let at_img: AprilImage = gray_to_april_image(gray)?;
+pub fn build_detector(nthreads: i32) -> Result<Detector> {
+    let family = Family::tag_36h11();
+    let bits: usize = 3;
+    let detector = DetectorBuilder::new()
+            .add_family_bits(family, bits)
+            .build()?;
 
-    let gray_eq = crate::preprocess::contrast_stretch(gray);
-    let at_img_eq: AprilImage = gray_to_april_image(&gray_eq)?;
+    // access the underlying C struct to set parameters not exposed by the wrapper
+    unsafe {
+        let ptr_ptr = &detector as *const Detector as *const *mut RawDetector;
+        let raw_ptr = *ptr_ptr;
+        
+        if !raw_ptr.is_null() {
+            (*raw_ptr).nthreads = nthreads;
+            (*raw_ptr).quad_decimate = 3.0;
+            (*raw_ptr).quad_sigma = 0.0;
+            (*raw_ptr).refine_edges = 1;
+        }
+    }
 
-    let sf = if scale_factor < 1.0 { 1.0 } else { scale_factor };
-    let new_w = (gray_eq.width() as f32 * sf).round() as u32;
-    let new_h = (gray_eq.height() as f32 * sf).round() as u32;
-    let gray_scaled_eq = image::imageops::resize(&gray_eq, new_w, new_h, image::imageops::FilterType::Lanczos3);
-    let at_img_scaled_eq: AprilImage = gray_to_april_image(&gray_scaled_eq)?;
+    Ok(detector)
+}
 
-    let mut detections = detector.detect(&at_img);
-    let mut det_eq = detector.detect(&at_img_eq);
-    let det_scaled_eq = detector.detect(&at_img_scaled_eq);
-    detections.append(&mut det_eq);
-    let mut ids: HashSet<usize> = detections.iter().map(|d| d.id()).collect();
+pub fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<[(f64, f64); 4]>> {
+    // new_uinit is unsafe because it returns uninitialized memory
+    let mut img = unsafe { AprilImage::new_uinit(width, height)? };
+    
+    let dst = img.as_mut();
+    
+    if dst.len() == gray_data.len() {
+        dst.copy_from_slice(gray_data);
+    } else {
+        let copy_len = std::cmp::min(dst.len(), gray_data.len());
+        dst[..copy_len].copy_from_slice(&gray_data[..copy_len]);
+    }
 
+    let detections = detector.detect(&img);
+    
     let mut corners_list: Vec<[(f64, f64); 4]> = Vec::new();
     for det in detections.iter() {
         let corners = det.corners();
@@ -40,29 +56,5 @@ pub fn detect_corners(detector: &mut Detector, gray: &GrayImage, scale_factor: f
         corners_list.push([to_f(corners[0]), to_f(corners[1]), to_f(corners[2]), to_f(corners[3])]);
     }
 
-    for det in det_scaled_eq.iter() {
-        if ids.insert(det.id()) {
-            let corners = det.corners();
-            let to_f_scaled = |p: [f64; 2]| (p[0] / sf as f64, p[1] / sf as f64);
-            corners_list.push([
-                to_f_scaled(corners[0]),
-                to_f_scaled(corners[1]),
-                to_f_scaled(corners[2]),
-                to_f_scaled(corners[3]),
-            ]);
-        }
-    }
-
     Ok(corners_list)
-}
-
-fn gray_to_april_image(gray: &GrayImage) -> Result<AprilImage> {
-    let (w, h) = (gray.width() as usize, gray.height() as usize);
-    let mut f = NamedTempFile::new()?;
-    write!(f, "P5\n{} {}\n255\n", w, h)?;
-    f.write_all(gray.as_raw())?;
-    let path = f.into_temp_path();
-    let img = AprilImage::from_pnm_file(path.to_string_lossy().as_ref())?;
-    path.close()?;
-    Ok(img)
 }
