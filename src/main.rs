@@ -7,7 +7,9 @@ use nalgebra as _;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::mpsc;
 
 use v4l::{Device, FourCC};
 use v4l::buffer::Type;
@@ -19,25 +21,46 @@ use image::GrayImage as _;
 
 use crate::config::CameraConfig;
 
-fn main() -> anyhow::Result<()> {
-    let mut args = env::args();
-    let _prog = args.next();
-    let first = args.next();
-    let second = args.next();
-    
-    let (camera_index, output_dir) = match (first.as_deref(), second.as_deref()) {
-        (Some(s), Some(out)) if s.chars().all(|c| c.is_ascii_digit()) => {
-            (s.parse::<usize>().unwrap_or(0), PathBuf::from(out))
-        }
-        (Some(s), None) if s.chars().all(|c| c.is_ascii_digit()) => {
-            (s.parse::<usize>().unwrap_or(0), PathBuf::from("output"))
-        }
-        (Some(out), _) => (0, PathBuf::from(out)),
-        _ => (0, PathBuf::from("output")),
-    };
+#[derive(Debug)]
+struct PipelineStats {
+    camera_index: usize,
+    detections: usize,
+    timestamp: Instant,
+}
 
-    println!("Starting application (V4L2 + Multithreaded Detector)...");
-    fs::create_dir_all(&output_dir)?;
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    
+    // parse camera indices from args
+    // examples: "0", "0,1", "0 2", "0, 2"
+    let mut camera_indices: Vec<usize> = Vec::new();
+    let mut output_dir_base = PathBuf::from("output");
+
+    // skip program name
+    for arg in args.iter().skip(1) {
+        if arg.chars().all(|c| c.is_ascii_digit() || c == ',') {
+            for part in arg.split(',') {
+                if let Ok(idx) = part.trim().parse::<usize>() {
+                    if !camera_indices.contains(&idx) {
+                        camera_indices.push(idx);
+                    }
+                }
+            }
+        } else {
+            // assume it's an output dir if not a number list
+            output_dir_base = PathBuf::from(arg);
+        }
+    }
+
+    if camera_indices.is_empty() {
+        camera_indices.push(0);
+    }
+
+    println!("Starting Multi-Camera AprilTag Detector");
+    println!("Cameras: {:?}", camera_indices);
+    println!("Output Dir: {:?}", output_dir_base);
+
+    fs::create_dir_all(&output_dir_base)?;
 
     let config_path = Path::new("config/distortion.json");
     let cam_config = match CameraConfig::load(config_path) {
@@ -47,57 +70,146 @@ fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Config load failed"));
         }
     };
-    println!("Loaded camera config: {:?}", cam_config);
 
-    run_capture_loop(camera_index, output_dir, cam_config)?;
+    // dynamic thread allocation
+    // jetson orin nano has 6 cores. reserve 2 for system/capture/decode, 4 for detection?
+    // or just oversubscribe slightly.
+    // let's try to target 6 total detector threads.
+    let total_detector_threads = 6;
+    let threads_per_cam = std::cmp::max(1, total_detector_threads / camera_indices.len() as i32);
+    
+    println!("Allocating {} detector threads per camera", threads_per_cam);
 
-    Ok(())
+    let (tx_stats, rx_stats) = mpsc::channel();
+
+    for &idx in &camera_indices {
+        spawn_camera_pipeline(idx, threads_per_cam, tx_stats.clone());
+    }
+
+    // monitor loop
+    let mut cam_stats: HashMap<usize, (u64, Instant)> = HashMap::new(); // (frame_count, last_report)
+    let mut cam_fps: HashMap<usize, f64> = HashMap::new();
+    
+    // init stats
+    let start_time = Instant::now();
+    for &idx in &camera_indices {
+        cam_stats.insert(idx, (0, start_time));
+        cam_fps.insert(idx, 0.0);
+    }
+
+    loop {
+        if let Ok(stat) = rx_stats.recv() {
+            if let Some((count, last_time)) = cam_stats.get_mut(&stat.camera_index) {
+                *count += 1;
+                
+                let now = Instant::now();
+                let duration = now.duration_since(*last_time);
+                
+                if duration.as_secs() >= 1 {
+                    let fps = *count as f64 / duration.as_secs_f64();
+                    cam_fps.insert(stat.camera_index, fps);
+                    *count = 0;
+                    *last_time = now;
+                    
+                    // print summary
+                    print!("\x1B[2J\x1B[1;1H"); // clear screen
+                    println!("=== Multi-Camera Status ===");
+                    for &idx in &camera_indices {
+                        println!("Camera {}: {:.2} FPS | Last Detections: {}", 
+                            idx, 
+                            cam_fps.get(&idx).unwrap_or(&0.0),
+                            stat.detections // this is just the most recent one, acceptable for now
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn run_capture_loop(camera_index: usize, _output_dir: PathBuf, cam_config: CameraConfig) -> anyhow::Result<()> {
-    println!("Opening camera {}...", camera_index);
-    
-    // original detector initialization is kept for the main thread usage
-    // let mut detector = detector::build_detector()?;
-    
-    let mut frame_count = 0;
-    let mut last_report = Instant::now();
+fn spawn_camera_pipeline(
+    camera_index: usize, 
+    detector_threads: i32, 
+    tx_stats: mpsc::Sender<PipelineStats>
+) {
+    println!("Spawning pipeline for Camera {}...", camera_index);
 
-    // pipelining:
-    // thread 1: captures frames -> channel a
-    // thread 2: decodes frames -> channel b
-    // thread 3: detects tags -> channel c
-    // thread 4: network sender (sim)
-    
-    let (tx_capture, rx_capture) = std::sync::mpsc::sync_channel(1); 
-    let (tx_decode, rx_decode) = std::sync::mpsc::sync_channel(1);
-    let (tx_network, rx_network) = std::sync::mpsc::sync_channel(10); // buffer detections
+    let (tx_capture, rx_capture) = mpsc::sync_channel(1); 
+    let (tx_decode, rx_decode) = mpsc::sync_channel(1);
 
     // 1. capture thread
     std::thread::spawn(move || {
-        let dev = Device::new(camera_index).unwrap();
-        let mut fmt = dev.format().unwrap();
+        let dev = match Device::new(camera_index) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error opening camera {}: {}", camera_index, e);
+                return;
+            }
+        };
+
+        let mut fmt = match dev.format() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Error getting format for camera {}: {}", camera_index, e);
+                return;
+            }
+        };
+        
         fmt.width = 1920;
         fmt.height = 1080;
         fmt.fourcc = FourCC::new(b"MJPG");
-        dev.set_format(&fmt).unwrap();
         
-        let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4).unwrap();
+        if let Err(e) = dev.set_format(&fmt) {
+            eprintln!("Error setting format for camera {}: {}", camera_index, e);
+            return;
+        }
+        
+        let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error creating stream for camera {}: {}", camera_index, e);
+                return;
+            }
+        };
         
         loop {
-            if let Ok((buf, _meta)) = stream.next() {
-                let buf_vec = buf.to_vec();
-                if tx_capture.send(buf_vec).is_err() { break; }
+            match stream.next() {
+                Ok((buf, _meta)) => {
+                    let buf_vec = buf.to_vec();
+                    // Use try_send to drop frames if the pipeline is backed up (latency optimization)
+                    match tx_capture.try_send(buf_vec) {
+                        Ok(_) => {},
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            // buffer full, drop frame
+                        },
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+                Err(e) => {
+                    // eprintln!("Stream error cam {}: {}", camera_index, e);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
     });
 
     // 2. decode thread
     std::thread::spawn(move || {
-        let mut decompressor = Decompressor::new().unwrap();
+        let mut decompressor = match Decompressor::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error creating decompressor for cam {}: {}", camera_index, e);
+                return;
+            }
+        };
+
         loop {
             if let Ok(buf) = rx_capture.recv() {
-                let header = decompressor.read_header(&buf).unwrap();
+                let header = match decompressor.read_header(&buf) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                
                 let width = header.width;
                 let height = header.height;
                 let mut pixels = vec![0u8; width * height];
@@ -110,48 +222,41 @@ fn run_capture_loop(camera_index: usize, _output_dir: PathBuf, cam_config: Camer
                 };
                 
                 if decompressor.decompress(&buf, image).is_ok() {
-                    if tx_decode.send((pixels, width, height)).is_err() { break; }
+                    match tx_decode.try_send((pixels, width, height)) {
+                        Ok(_) => {},
+                        Err(mpsc::TrySendError::Full(_)) => {}, // drop if detector is busy
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
             }
         }
     });
 
-    // 4. network sender thread (simulated)
+    // 3. detect thread
     std::thread::spawn(move || {
-        println!("Network Sender started...");
+        let mut detector = match detector::build_detector(detector_threads) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error building detector for cam {}: {}", camera_index, e);
+                return;
+            }
+        };
+
         loop {
-            if let Ok(detections) = rx_network.recv() {
-                // simulate networktables / udp overhead (<1ms in theory)
-                let _len: usize = detections; 
-                // std::thread::sleep(std::time::Duration::from_micros(100)); 
+            if let Ok((pixels, width, height)) = rx_decode.recv() {
+                let corners = match detector::detect_corners(&mut detector, &pixels, width, height) {
+                    Ok(c) => c,
+                    Err(_) => vec![],
+                };
+                
+                let stat = PipelineStats {
+                    camera_index,
+                    detections: corners.len(),
+                    timestamp: Instant::now(),
+                };
+
+                if tx_stats.send(stat).is_err() { break; }
             }
         }
     });
-
-    // 3. detect loop (main thread)
-    println!("Starting Pipelined Detection...");
-    
-    // for 1 camera, use 6 threads. for 4 cameras, you'd set this to 1 or 2.
-    let mut detector = detector::build_detector(6)?; 
-    
-    loop {
-        if let Ok((pixels, width, height)) = rx_decode.recv() {
-            let corners = detector::detect_corners(&mut detector, &pixels, width, height)?;
-            
-            // send to network thread
-            let _ = tx_network.send(corners.len());
-
-            frame_count += 1;
-            let now = Instant::now();
-            if now.duration_since(last_report).as_secs() >= 1 {
-                let fps = frame_count as f64 / now.duration_since(last_report).as_secs_f64();
-                println!("FPS: {:.2} | Detections: {}", fps, corners.len());
-                if !corners.is_empty() {
-                    println!("  Tag 0 corners: {:?}", corners[0]);
-                }
-                frame_count = 0;
-                last_report = now;
-            }
-        }
-    }
 }
