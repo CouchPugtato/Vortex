@@ -11,7 +11,29 @@ struct RawDetector {
     debug: i32,
 }
 
-pub fn build_detector(nthreads: i32) -> Result<Detector> {
+#[derive(Debug, Clone)]
+pub struct RawDetection {
+    pub id: usize,
+    pub center: [f64; 2],
+    pub corners: [[f64; 2]; 4],
+}
+
+pub struct CpuDetector {
+    inner: Detector,
+}
+
+impl CpuDetector {
+    pub fn new(nthreads: i32) -> Result<Self> {
+        let detector = build_inner_detector(nthreads)?;
+        Ok(Self { inner: detector })
+    }
+
+    pub fn detect(&mut self, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<RawDetection>> {
+        detect_corners(&mut self.inner, gray_data, width, height)
+    }
+}
+
+fn build_inner_detector(nthreads: i32) -> Result<Detector> {
     let family = Family::tag_36h11();
     let bits: usize = 3;
     let detector = DetectorBuilder::new()
@@ -34,8 +56,7 @@ pub fn build_detector(nthreads: i32) -> Result<Detector> {
     Ok(detector)
 }
 
-pub fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<[(f64, f64); 4]>> {
-    // new_uinit is unsafe because it returns uninitialized memory
+fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<RawDetection>> {
     let mut img = unsafe { AprilImage::new_uinit(width, height)? };
     
     let dst = img.as_mut();
@@ -49,12 +70,25 @@ pub fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, h
 
     let detections = detector.detect(&img);
     
-    let mut corners_list: Vec<[(f64, f64); 4]> = Vec::new();
+    let mut results: Vec<RawDetection> = Vec::new();
     for det in detections.iter() {
         let corners = det.corners();
-        let to_f = |p: [f64; 2]| (p[0], p[1]);
-        corners_list.push([to_f(corners[0]), to_f(corners[1]), to_f(corners[2]), to_f(corners[3])]);
+        let c_arr = [
+            [corners[0][0], corners[0][1]],
+            [corners[1][0], corners[1][1]],
+            [corners[2][0], corners[2][1]],
+            [corners[3][0], corners[3][1]],
+        ];
+        
+        let center = det.center();
+        let center_arr = [center[0], center[1]];
+
+        results.push(RawDetection {
+            id: det.id(),
+            center: center_arr,
+            corners: c_arr,
+        });
     }
 
-    Ok(corners_list)
+    Ok(results)
 }

@@ -15,6 +15,21 @@ pub struct CameraConfig {
     pub p2: f64,
     pub k3: f64,
     pub tag_size_m: f64,
+    
+    // camera to robot center
+    #[serde(default)]
+    pub x_offset: f64,
+    #[serde(default)]
+    pub y_offset: f64,
+    #[serde(default)]
+    pub z_offset: f64,
+    
+    #[serde(default)]
+    pub pitch_deg: f64,
+    #[serde(default)]
+    pub yaw_deg: f64,
+    #[serde(default)]
+    pub roll_deg: f64,
 }
 
 impl CameraConfig {
