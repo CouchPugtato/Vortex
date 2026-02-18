@@ -1,5 +1,5 @@
 // minimal C++ tool to convert an ONNX model to a TensorRT engine
-// Usage: ./build_engine <model.onnx> <output.engine>
+// usage: ./build_engine <model.onnx> <output.engine>
 
 #include <iostream>
 #include <fstream>

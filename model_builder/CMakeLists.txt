@@ -1,18 +1,16 @@
-cmake_minimum_required(VERSION 3.10)
-project(build_engine)
+cmake_minimum_required(VERSION 3.17)
+project(build_engine LANGUAGES CXX)
 
-find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
-# TensorRT Paths (Adjust if needed, usually in /usr/lib/aarch64-linux-gnu/ on Jetson)
-# We assume standard JetPack install
-include_directories(/usr/include/aarch64-linux-gnu)
-link_directories(/usr/lib/aarch64-linux-gnu)
+find_library(NVINFER_LIB nvinfer REQUIRED)
+find_library(NVONNX_LIB nvonnxparser REQUIRED)
 
 add_executable(build_engine build_engine.cpp)
 
-# Link against TensorRT and NVONNXParser
 target_link_libraries(build_engine 
-    nvinfer 
-    nvonnxparser 
-    ${CUDA_LIBRARIES}
+    PRIVATE
+    ${NVINFER_LIB}
+    ${NVONNX_LIB}
+    CUDA::cudart
 )
