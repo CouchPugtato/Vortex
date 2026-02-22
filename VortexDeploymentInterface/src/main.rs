@@ -257,9 +257,13 @@ fn deploy(
         }
     }
 
-    for entry in WalkDir::new(&local_path) {
+    for entry in WalkDir::new(&local_path).into_iter().filter_entry(|e| !is_target_dir(e.path())) {
         let entry = entry?;
         let path = entry.path();
+
+        if has_target_component(path) {
+            continue;
+        }
         
         let relative_path = path.strip_prefix(&local_path)?;
         let relative_path_str = relative_path.to_str().ok_or("Invalid path")?.replace("\\", "/");
@@ -292,4 +296,12 @@ fn deploy(
     }
 
     Ok(())
+}
+
+fn has_target_component(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "target")
+}
+
+fn is_target_dir(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "target")
 }
