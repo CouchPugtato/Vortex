@@ -26,7 +26,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::capability::Flags;
 use turbojpeg::{Decompressor, Compressor, Image, PixelFormat, Subsamp};
 
-use crate::config::CameraConfig;
+use crate::config::{CameraConfig, ProcessingConfig, RuntimeConfig};
 use crate::detector::Detection;
 
 
@@ -103,8 +103,8 @@ fn main() -> anyhow::Result<()> {
 
     fs::create_dir_all(&output_dir_base)?;
 
-    let config_path = Path::new("config/distortion.json");
-    let cam_config = match CameraConfig::load(config_path) {
+    let config_path = Path::new("config/config.json");
+    let runtime_config = match RuntimeConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to load config from {:?}: {}", config_path, e);
@@ -138,7 +138,13 @@ fn main() -> anyhow::Result<()> {
     let (tx_stats, rx_stats) = mpsc::channel();
 
     for &idx in &camera_indices {
-        spawn_camera_pipeline(idx, threads_per_cam, tx_stats.clone(), cam_config.clone());
+        spawn_camera_pipeline(
+            idx,
+            threads_per_cam,
+            tx_stats.clone(),
+            runtime_config.camera,
+            runtime_config.processing,
+        );
     }
 
     // monitor loop
@@ -149,7 +155,7 @@ fn main() -> anyhow::Result<()> {
     // simple exponential smoothing for pose
     // store last known pose for each tag id per camera
     let mut pose_filters: HashMap<(usize, usize), (f64, f64, f64)> = HashMap::new(); // (cam_idx, tag_id) -> (x, y, z)
-    let alpha = 0.1; // Reduced from 0.3 to 0.1 for stronger smoothing
+    let alpha = runtime_config.processing.smoothing_alpha;
 
     // init stats
     let start_time = Instant::now();
@@ -259,7 +265,8 @@ fn spawn_camera_pipeline(
     camera_index: usize, 
     detector_threads: i32, 
     tx_stats: mpsc::Sender<PipelineStats>,
-    config: CameraConfig
+    camera_config: CameraConfig,
+    processing_config: ProcessingConfig,
 ) {
     println!("Spawning pipeline for Camera {}...", camera_index);
 
@@ -305,8 +312,6 @@ fn spawn_camera_pipeline(
                 }
             };
             
-            fmt.width = 1920;
-            fmt.height = 1080;
             fmt.fourcc = FourCC::new(b"MJPG");
             
             if let Err(e) = dev.set_format(&fmt) {
@@ -424,9 +429,27 @@ fn spawn_camera_pipeline(
                 }
             }
 
-            fn detect(&mut self, data: &[u8], width: usize, height: usize) -> anyhow::Result<Vec<crate::detector::Detection>> {
+            fn detect(
+                &mut self,
+                data: &[u8],
+                width: usize,
+                height: usize,
+                processing_config: &ProcessingConfig,
+            ) -> anyhow::Result<Vec<crate::detector::Detection>> {
                 match self {
-                    DetectorWrapper::Cpu(d) => d.detect(data, width, height),
+                    DetectorWrapper::Cpu(d) => {
+                        let scale = processing_config.resolution_scale_factor.clamp(0.1, 1.0);
+                        if (scale - 1.0).abs() < f32::EPSILON {
+                            return d.detect(data, width, height);
+                        }
+
+                        let scaled_width = ((width as f32) * scale).round().max(1.0) as usize;
+                        let scaled_height = ((height as f32) * scale).round().max(1.0) as usize;
+                        let scaled = resize_gray_nearest(data, width, height, scaled_width, scaled_height);
+                        let mut out = d.detect(&scaled, scaled_width, scaled_height)?;
+                        rescale_apriltag_detections(&mut out, 1.0 / scale as f64);
+                        Ok(out)
+                    }
                     #[cfg(feature = "gpu")]
                     DetectorWrapper::Gpu(d) => d.detect(data, width, height),
                     #[cfg(feature = "tensorrt")]
@@ -498,8 +521,8 @@ fn spawn_camera_pipeline(
 
                     #[cfg(feature = "gpu")]
                     {
-                        let scale_factor = 1.0; // 1.0 as full resolution
-                        if let Ok(d) = gpu_detector::GpuDetector::new(width, height, &config, scale_factor) {
+                        let scale_factor = processing_config.resolution_scale_factor;
+                        if let Ok(d) = gpu_detector::GpuDetector::new(width, height, &camera_config, scale_factor) {
                             println!("Initialized GPU Detector for Camera {} (Scale: {})", camera_index, scale_factor);
                             detectors.push(DetectorWrapper::Gpu(d));
                             tag_initialized = true;
@@ -537,7 +560,7 @@ fn spawn_camera_pipeline(
                 let mut processed_detections = Vec::new();
 
                 for detector in &mut detectors {
-                    let raw_dets = match detector.detect(&pixels, width, height) {
+                    let raw_dets = match detector.detect(&pixels, width, height, &processing_config) {
                         Ok(d) => d,
                         Err(e) => {
                             eprintln!("Detector {} failed on cam {}: {}", detector.name(), camera_index, e);
@@ -545,7 +568,7 @@ fn spawn_camera_pipeline(
                         }
                     };
 
-                    let effective_config = detector.get_effective_config(&config);
+                    let effective_config = detector.get_effective_config(&camera_config);
                     let needs_undistort = detector.requires_undistort();
 
                     for det in raw_dets {
@@ -564,7 +587,7 @@ fn spawn_camera_pipeline(
                                     corners_raw
                                 };
 
-                                let tag_size = 0.1651; // m
+                                let tag_size = effective_config.tag_size_m;
 
                                 let (x, y, z) = if let Some(pose) = pose::estimate_pose(
                                     &corners,
@@ -611,14 +634,8 @@ fn spawn_camera_pipeline(
                                 };
 
                                 // approximate object depth from known nominal object size and detected bbox size, tune with YOLO_OBJ_WIDTH_M / YOLO_OBJ_HEIGHT_M
-                                let obj_w_m = std::env::var("YOLO_OBJ_WIDTH_M")
-                                    .ok()
-                                    .and_then(|v| v.parse::<f64>().ok())
-                                    .unwrap_or(0.30);
-                                let obj_h_m = std::env::var("YOLO_OBJ_HEIGHT_M")
-                                    .ok()
-                                    .and_then(|v| v.parse::<f64>().ok())
-                                    .unwrap_or(0.30);
+                                let obj_w_m = processing_config.yolo_obj_width_m;
+                                let obj_h_m = processing_config.yolo_obj_height_m;
 
                                 let mut z_candidates = Vec::new();
                                 if bbox[2] > 1.0 {
@@ -673,4 +690,43 @@ fn transform_camera_to_robot(p_cam: Vector3<f64>, config: &CameraConfig) -> Vect
     let r_roll = Rotation3::from_axis_angle(&Vector3::z_axis(), config.roll_deg.to_radians());
     let rotation = r_yaw * r_pitch * r_roll;
     rotation * p_cam + Vector3::new(config.x_offset, config.y_offset, config.z_offset)
+}
+
+fn resize_gray_nearest(
+    input: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst_width: usize,
+    dst_height: usize,
+) -> Vec<u8> {
+    if src_width == dst_width && src_height == dst_height {
+        return input.to_vec();
+    }
+
+    let mut out = vec![0u8; dst_width * dst_height];
+    for y in 0..dst_height {
+        let src_y = ((y as f64 + 0.5) * src_height as f64 / dst_height as f64)
+            .floor()
+            .clamp(0.0, (src_height - 1) as f64) as usize;
+        for x in 0..dst_width {
+            let src_x = ((x as f64 + 0.5) * src_width as f64 / dst_width as f64)
+                .floor()
+                .clamp(0.0, (src_width - 1) as f64) as usize;
+            out[y * dst_width + x] = input[src_y * src_width + src_x];
+        }
+    }
+    out
+}
+
+fn rescale_apriltag_detections(detections: &mut [Detection], scale_back: f64) {
+    for det in detections {
+        if let Detection::AprilTag(apr) = det {
+            apr.center[0] *= scale_back;
+            apr.center[1] *= scale_back;
+            for corner in &mut apr.corners {
+                corner[0] *= scale_back;
+                corner[1] *= scale_back;
+            }
+        }
+    }
 }

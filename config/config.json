@@ -1,0 +1,26 @@
+{
+  "camera": {
+    "fx": 709.5,
+    "fy": 709.5,
+    "cx": 960.0,
+    "cy": 600.0,
+    "k1": 0.001087463941290891,
+    "k2": -0.061242319310482934,
+    "p1": -0.0012477045620045125,
+    "p2": -0.0015944157516858115,
+    "k3": 0.01684902183689297,
+    "tag_size_m": 0.16,
+    "x_offset": 0.0,
+    "y_offset": 0.0,
+    "z_offset": 0.0,
+    "pitch_deg": 0.0,
+    "yaw_deg": 0.0,
+    "roll_deg": 0.0
+  },
+  "processing": {
+    "smoothing_alpha": 0.1,
+    "resolution_scale_factor": 1.0,
+    "yolo_obj_width_m": 0.3,
+    "yolo_obj_height_m": 0.3
+  }
+}

@@ -97,9 +97,8 @@ impl GpuDetector {
             println!("DEBUG: vpiCreateAprilTagDetector success. Payload: {:?}", payload); std::io::stdout().flush().ok();
 
             // optimizing lens distortion + downscaling
-            // target resolution: 50% (960x540)
             // runs on vic (video image compositor)
-            let scale_factor = 0.5;
+            let scale_factor = scale_factor.clamp(0.1, 1.0);
             let scaled_width = (width as f32 * scale_factor) as i32;
             let scaled_height = (height as f32 * scale_factor) as i32;
             

@@ -1,9 +1,10 @@
-use serde::Deserialize;
-use std::path::Path;
 use std::fs::File;
 use std::io::BufReader;
+use std::path::Path;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CameraConfig {
     pub fx: f64,
     pub fy: f64,
@@ -32,7 +33,29 @@ pub struct CameraConfig {
     pub roll_deg: f64,
 }
 
-impl CameraConfig {
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ProcessingConfig {
+    #[serde(default = "default_smoothing_alpha")]
+    pub smoothing_alpha: f64,
+    #[serde(
+        default = "default_resolution_scale_factor",
+        alias = "gpu_scale_factor"
+    )]
+    pub resolution_scale_factor: f32,
+    #[serde(default = "default_yolo_obj_width_m")]
+    pub yolo_obj_width_m: f64,
+    #[serde(default = "default_yolo_obj_height_m")]
+    pub yolo_obj_height_m: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct RuntimeConfig {
+    pub camera: CameraConfig,
+    #[serde(default)]
+    pub processing: ProcessingConfig,
+}
+
+impl RuntimeConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -40,3 +63,15 @@ impl CameraConfig {
         Ok(config)
     }
 }
+
+impl Default for ProcessingConfig {
+    fn default() -> Self {
+        Self {
+            smoothing_alpha: 0.1,
+            resolution_scale_factor: 1.0,
+            yolo_obj_width_m: 0.3,
+            yolo_obj_height_m: 0.3,
+        }
+    }
+}
+
