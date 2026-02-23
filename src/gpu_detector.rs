@@ -15,8 +15,8 @@ type VPIImage = *mut std::ffi::c_void;
 type VPIWarpMap = *mut std::ffi::c_void;
 
 #[cfg(feature = "gpu")]
-use std::ffi::c_void;
-use crate::detector::RawDetection;
+use std::ffi::{c_void, CStr};
+use crate::detector::{Detection, AprilTagDetection};
 use crate::config::CameraConfig;
 
 pub struct GpuDetector {
@@ -177,8 +177,7 @@ impl GpuDetector {
             scaled_config.cx *= scale_factor as f64;
             scaled_config.cy *= scale_factor as f64;
             scaled_config.k1 = 0.0; scaled_config.k2 = 0.0; scaled_config.p1 = 0.0;
-            scaled_config.p2 = 0.0; scaled_config.k3 = 0.0; scaled_config.k4 = 0.0;
-            scaled_config.k5 = 0.0; scaled_config.k6 = 0.0;
+            scaled_config.p2 = 0.0; scaled_config.k3 = 0.0;
 
             let mut output_array: VPIArray = std::ptr::null_mut();
             println!("DEBUG: Calling vpiArrayCreate..."); std::io::stdout().flush().ok();
@@ -223,7 +222,7 @@ impl GpuDetector {
     }
 
     #[cfg(feature = "gpu")]
-    pub fn detect(&mut self, image_data: &[u8], width: usize, height: usize) -> Result<Vec<RawDetection>> {
+    pub fn detect(&mut self, image_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
         if width as i32 != self.width || height as i32 != self.height {
             return Err(anyhow!("Resolution changed, GpuDetector needs recreation"));
         }
@@ -363,11 +362,11 @@ impl GpuDetector {
                             [det.corners[3].x as f64, det.corners[3].y as f64],
                         ];
                         
-                        detections.push(RawDetection {
+                        detections.push(Detection::AprilTag(AprilTagDetection {
                             id: det.id as usize,
                             center,
                             corners,
-                        });
+                        }));
                     }
                     vpi::vpiArrayUnlock(self.output_array);
                 }
@@ -379,7 +378,7 @@ impl GpuDetector {
     }
 
     #[cfg(not(feature = "gpu"))]
-    pub fn detect(&mut self, _image_data: &[u8], _width: usize, _height: usize) -> Result<Vec<RawDetection>> {
+    pub fn detect(&mut self, _image_data: &[u8], _width: usize, _height: usize) -> Result<Vec<Detection>> {
         Err(anyhow!("GPU feature not enabled"))
     }
 }

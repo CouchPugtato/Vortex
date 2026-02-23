@@ -9,7 +9,7 @@ pub fn undistort_points(corners: &[(f64, f64); 4], cam: &CameraConfig) -> [(f64,
     out
 }
 
-fn undistort_point(p: (f64, f64), cam: &CameraConfig) -> (f64, f64) {
+pub fn undistort_point(p: (f64, f64), cam: &CameraConfig) -> (f64, f64) {
     let u0 = p.0;
     let v0 = p.1;
 

@@ -694,6 +694,7 @@ dependencies = [
  "futures",
  "image",
  "libc",
+ "libloading",
  "nalgebra",
  "parking_lot",
  "serde",

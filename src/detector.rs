@@ -12,10 +12,24 @@ struct RawDetector {
 }
 
 #[derive(Debug, Clone)]
-pub struct RawDetection {
+pub struct AprilTagDetection {
     pub id: usize,
     pub center: [f64; 2],
     pub corners: [[f64; 2]; 4],
+}
+
+#[derive(Debug, Clone)]
+pub struct YoloDetection {
+    pub class_name: String,
+    pub confidence: f64,
+    // [x, y, w, h]
+    pub bbox: [f64; 4],
+}
+
+#[derive(Debug, Clone)]
+pub enum Detection {
+    AprilTag(AprilTagDetection),
+    Yolo(YoloDetection),
 }
 
 pub struct CpuDetector {
@@ -28,7 +42,7 @@ impl CpuDetector {
         Ok(Self { inner: detector })
     }
 
-    pub fn detect(&mut self, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<RawDetection>> {
+    pub fn detect(&mut self, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
         detect_corners(&mut self.inner, gray_data, width, height)
     }
 }
@@ -56,7 +70,7 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
     Ok(detector)
 }
 
-fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<RawDetection>> {
+fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
     let mut img = unsafe { AprilImage::new_uinit(width, height)? };
     
     let dst = img.as_mut();
@@ -70,7 +84,7 @@ fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, heigh
 
     let detections = detector.detect(&img);
     
-    let mut results: Vec<RawDetection> = Vec::new();
+    let mut results: Vec<Detection> = Vec::new();
     for det in detections.iter() {
         let corners = det.corners();
         let c_arr = [
@@ -83,11 +97,11 @@ fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, heigh
         let center = det.center();
         let center_arr = [center[0], center[1]];
 
-        results.push(RawDetection {
+        results.push(Detection::AprilTag(AprilTagDetection {
             id: det.id(),
             center: center_arr,
             corners: c_arr,
-        });
+        }));
     }
 
     Ok(results)
