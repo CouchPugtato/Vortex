@@ -118,10 +118,11 @@ fn write_atomic(path: &str, bytes: &[u8]) {
 }
 
 fn main() -> Result<()> {
-    let camera_index = std::env::var("VORTEX_BRIDGE_CAMERA")
+    let requested_camera = std::env::var("VORTEX_BRIDGE_CAMERA")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    let requested_camera = if requested_camera > 5 { 0 } else { requested_camera };
     let frame_path = std::env::var("VORTEX_BRIDGE_FRAME")
         .unwrap_or_else(|_| "/tmp/vortex_bridge_frame.jpg".to_string());
     let state_path = std::env::var("VORTEX_BRIDGE_STATE")
@@ -134,11 +135,33 @@ fn main() -> Result<()> {
     #[cfg(feature = "tensorrt")]
     let mut yolo = yolo_detector::YoloDetector::new().ok();
 
-    let dev = Device::new(camera_index)?;
-    let caps = dev.query_caps()?;
-    if !caps.capabilities.contains(Flags::VIDEO_CAPTURE) {
-        anyhow::bail!("camera {} is not video capture", camera_index);
+    let mut selected_camera = None;
+    let mut selected_dev = None;
+    for step in 0..=5 {
+        let idx = (requested_camera + step) % 6;
+        let dev = match Device::new(idx) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let caps = match dev.query_caps() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if caps.capabilities.contains(Flags::VIDEO_CAPTURE) {
+            selected_camera = Some(idx);
+            selected_dev = Some(dev);
+            break;
+        }
     }
+    let camera_index =
+        selected_camera.ok_or_else(|| anyhow::anyhow!("no valid video capture camera found in indexes 0..5"))?;
+    if camera_index != requested_camera {
+        eprintln!(
+            "Requested camera {} unavailable; using next valid camera {}",
+            requested_camera, camera_index
+        );
+    }
+    let dev = selected_dev.expect("selected camera must have a device");
     let mut fmt = dev.format()?;
     fmt.fourcc = FourCC::new(b"MJPG");
     dev.set_format(&fmt)?;

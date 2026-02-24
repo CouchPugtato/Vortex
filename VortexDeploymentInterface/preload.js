@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld("vortexApi", {
   monitorStop: () => ipcRenderer.invoke("monitor-stop"),
   previewStart: (settings) => ipcRenderer.invoke("preview-start", settings),
   previewStop: () => ipcRenderer.invoke("preview-stop"),
+  listRemoteCameras: (settings) => ipcRenderer.invoke("list-remote-cameras", settings),
   applyMonitorPreset: (appConfig, preset) =>
     ipcRenderer.invoke("apply-monitor-preset", appConfig, preset),
   onLog: makeSubscriber("log"),
@@ -27,5 +28,6 @@ contextBridge.exposeInMainWorld("vortexApi", {
   onMonitorState: makeSubscriber("monitor-state"),
   onPreviewState: makeSubscriber("preview-state"),
   onPreviewFrame: makeSubscriber("preview-frame"),
-  onDeployProgress: makeSubscriber("deploy-progress")
+  onDeployProgress: makeSubscriber("deploy-progress"),
+  onMonitorStartProgress: makeSubscriber("monitor-start-progress")
 });

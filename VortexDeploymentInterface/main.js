@@ -72,6 +72,11 @@ function emitDeployProgress(progress) {
   if (win) win.webContents.send("deploy-progress", progress);
 }
 
+function emitMonitorStartProgress(progress) {
+  const win = getWindow();
+  if (win) win.webContents.send("monitor-start-progress", progress);
+}
+
 function isDetectionLine(line) {
   const s = String(line || "").trim();
   if (!s) return false;
@@ -92,7 +97,6 @@ function defaultAppConfig() {
     monitor_start_cmd: "",
     monitor_stop_cmd: "pkill -f orin_bridge || true",
     startup_service_name: "",
-    preview_camera_index: 0,
     preview_remote_path: "/tmp/vortex_preview.jpg",
     preview_capture_cmd: ""
   };
@@ -553,9 +557,11 @@ const monitorManager = {
     this.settings = settings;
     this.stopping = false;
     try {
+      emitMonitorStartProgress({ status: "starting", percent: 10, text: "Connecting..." });
       this.conn = await connectSsh(settings);
 
       if (settings.startup_service_name) {
+        emitMonitorStartProgress({ status: "starting", percent: 20, text: "Stopping service..." });
         const stopSvc = await execCommand(
           this.conn,
           `sudo systemctl stop ${settings.startup_service_name}`
@@ -567,10 +573,13 @@ const monitorManager = {
         }
       }
 
+      emitMonitorStartProgress({ status: "starting", percent: 55, text: "Resolving monitor..." });
       const resolvedStart = await resolveMonitorCommand(this.conn, settings);
+      emitMonitorStartProgress({ status: "starting", percent: 85, text: "Launching monitor..." });
       const cmd = `bash -lc "${String(resolvedStart).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
       this.channel = await execCommand(this.conn, cmd, { stream: true });
       emitMonitorState(true);
+      emitMonitorStartProgress({ status: "done", percent: 100, text: "✓ Monitor started" });
       emitLog(`Monitor started: ${resolvedStart}`);
 
       let pending = "";
@@ -605,6 +614,7 @@ const monitorManager = {
         }
         this.cleanup();
         emitMonitorState(false);
+        emitMonitorStartProgress({ status: "hidden", percent: 0, text: "" });
         if (!this.stopping) {
           const exitCode = typeof code === "number" ? code : "unknown";
           emitLog(`Monitor stream ended (exit=${exitCode}${signal ? `, signal=${signal}` : ""}).`);
@@ -613,6 +623,7 @@ const monitorManager = {
     } catch (err) {
       this.cleanup();
       emitMonitorState(false);
+      emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
       throw err;
     }
   },
@@ -630,6 +641,7 @@ const monitorManager = {
     } finally {
       this.cleanup();
       emitMonitorState(false);
+      emitMonitorStartProgress({ status: "hidden", percent: 0, text: "" });
     }
   },
   cleanup() {
@@ -690,6 +702,7 @@ const previewManager = {
 
 ipcMain.handle("bootstrap", async () => {
   const appCfg = { ...defaultAppConfig(), ...(await readJson(APP_CONFIG_PATH, {})) };
+  delete appCfg.preview_camera_index;
   appCfg.local_path = path.resolve(__dirname, appCfg.local_path || "..");
   const runtimeConfigPath = appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH;
   const runtimeConfig = await readJson(runtimeConfigPath, {});
@@ -705,7 +718,9 @@ ipcMain.handle("choose-folder", async () => {
 });
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
-  await writeJson(APP_CONFIG_PATH, appConfig);
+  const sanitized = { ...(appConfig || {}) };
+  delete sanitized.preview_camera_index;
+  await writeJson(APP_CONFIG_PATH, sanitized);
   return { ok: true };
 });
 
@@ -731,6 +746,7 @@ ipcMain.handle("deploy-start", async (_evt, settings) => {
 });
 
 ipcMain.handle("monitor-start", async (_evt, settings) => {
+  emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });
   try {
     await monitorManager.start(settings);
     return { ok: true };
@@ -740,6 +756,7 @@ ipcMain.handle("monitor-start", async (_evt, settings) => {
     if (msg.includes("All configured authentication methods failed")) {
       emitLog("Authentication failed. Update credentials in vortex_config.json.");
     }
+    emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
     return { ok: false, error: msg };
   }
 });
@@ -763,6 +780,27 @@ ipcMain.handle("preview-start", async (_evt, settings) => {
 ipcMain.handle("preview-stop", async () => {
   previewManager.stop();
   return { ok: true };
+});
+
+ipcMain.handle("list-remote-cameras", async (_evt, settings) => {
+  const conn = await connectSsh(settings);
+  try {
+    const out = await execCommand(
+      conn,
+      "bash -lc \"ls -1 /dev/video* 2>/dev/null | sed -E 's#.*/video##' | grep -E '^[0-9]+$' | sort -n | uniq\""
+    );
+    const cameras = String(out.stdout || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n));
+    return { ok: true, cameras };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err), cameras: [] };
+  } finally {
+    conn.end();
+  }
 });
 
 ipcMain.handle("apply-monitor-preset", async (_evt, appConfig, preset) => {

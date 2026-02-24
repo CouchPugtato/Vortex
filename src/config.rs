@@ -4,6 +4,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+fn default_smoothing_alpha() -> f64 { 0.1 }
+fn default_resolution_scale_factor() -> f32 { 1.0 }
+fn default_yolo_obj_width_m() -> f64 { 0.3 }
+fn default_yolo_obj_height_m() -> f64 { 0.3 }
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CameraConfig {
     pub fx: f64,
@@ -74,4 +79,3 @@ impl Default for ProcessingConfig {
         }
     }
 }
-

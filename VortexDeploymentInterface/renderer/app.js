@@ -3,6 +3,7 @@ const state = {
   runtimePath: "",
   runtimeConfig: {},
   cameras: new Map(),
+  remoteCameras: [],
   selectedCamera: null,
   currentLineCamera: null,
   viewMode: "apriltag",
@@ -19,6 +20,9 @@ const el = {
   deployProgressWrap: document.querySelector("#deployProgressWrap"),
   deployProgress: document.querySelector("#deployProgress"),
   deployProgressText: document.querySelector("#deployProgressText"),
+  monitorProgressWrap: document.querySelector("#monitorProgressWrap"),
+  monitorProgress: document.querySelector("#monitorProgress"),
+  monitorProgressText: document.querySelector("#monitorProgressText"),
   togglePipeline: document.querySelector("#togglePipeline"),
   nextCamera: document.querySelector("#nextCamera"),
   viewMode: document.querySelector("#viewMode"),
@@ -40,6 +44,7 @@ function appendLog(msg) {
 }
 
 let deployFadeTimer = null;
+let monitorFadeTimer = null;
 
 function setDeployIndicator(stateKind, text, percent = null) {
   if (deployFadeTimer) {
@@ -68,18 +73,46 @@ function setDeployIndicator(stateKind, text, percent = null) {
   }
 }
 
+function setMonitorIndicator(stateKind, text, percent = null) {
+  if (monitorFadeTimer) {
+    clearTimeout(monitorFadeTimer);
+    monitorFadeTimer = null;
+  }
+  const wrap = el.monitorProgressWrap;
+  wrap.classList.remove("is-hidden", "is-done", "is-error");
+
+  if (stateKind === "hidden") {
+    wrap.classList.add("is-hidden");
+    return;
+  }
+  if (stateKind === "done") wrap.classList.add("is-done");
+  if (stateKind === "error") wrap.classList.add("is-error");
+
+  if (typeof percent === "number") {
+    el.monitorProgress.value = Math.max(0, Math.min(100, percent));
+  }
+  if (text) el.monitorProgressText.textContent = text;
+
+  if (stateKind === "done" || stateKind === "error") {
+    monitorFadeTimer = setTimeout(() => {
+      setMonitorIndicator("hidden", "");
+    }, 1400);
+  }
+}
+
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
   if (state.selectedCamera == null) {
-    const raw = Number(cfg.preview_camera_index);
-    state.selectedCamera = Number.isFinite(raw) && raw >= 0 && raw <= 7 ? raw : 0;
+    state.selectedCamera = 0;
   }
 }
 
 function readAppConfigFromUI() {
+  const cam = Number(state.selectedCamera || 0);
+  const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
   return {
     ...state.appConfig,
-    preview_camera_index: Number(state.selectedCamera || 0)
+    preview_camera_index: normalizedCam
   };
 }
 
@@ -151,9 +184,36 @@ function getActiveCameras() {
     .sort((a, b) => a - b);
 }
 
-function refreshCameraControls() {
+function getCameraCandidates() {
   const active = getActiveCameras();
-  el.nextCamera.disabled = !state.pipelineRunning || active.length < 2;
+  const remote = [...(state.remoteCameras || [])].sort((a, b) => a - b);
+  if (remote.length >= 2) return remote;
+  if (active.length >= 2) return active;
+  if (remote.length === 1) return remote;
+  if (active.length === 1) return active;
+  return [];
+}
+
+function refreshCameraControls() {
+  const cams = getCameraCandidates();
+  el.nextCamera.disabled = !state.pipelineRunning || cams.length < 2;
+}
+
+async function refreshRemoteCameras() {
+  try {
+    const cfg = readAppConfigFromUI();
+    const r = await window.vortexApi.listRemoteCameras(cfg);
+    if (r?.ok && Array.isArray(r.cameras)) {
+      state.remoteCameras = r.cameras
+        .map((n) => Number(n))
+        .filter((n) => Number.isFinite(n) && n >= 0 && n <= 5)
+        .sort((a, b) => a - b);
+      return state.remoteCameras;
+    }
+  } catch (_err) {
+    // ignore
+  }
+  return state.remoteCameras || [];
 }
 
 function previewSourceDims() {
@@ -184,6 +244,7 @@ function parseMonitorLine(line) {
     obj.objects = [];
     obj.lastSeen = Date.now();
     state.currentLineCamera = cam;
+    state.selectedCamera = cam;
     ensureCameraOption(cam);
     if (state.selectedCamera == null || !state.cameras.has(Number(state.selectedCamera))) {
       state.selectedCamera = cam;
@@ -340,9 +401,11 @@ async function init() {
     let cfg = readAppConfigFromUI();
     if (!state.pipelineRunning) {
       try {
+        setMonitorIndicator("active", "Starting...", 5);
         cfg = await window.vortexApi.applyMonitorPreset(cfg, "main_cam_0");
         state.appConfig = cfg;
         await window.vortexApi.saveAppConfig(cfg);
+        await refreshRemoteCameras();
         const m = await window.vortexApi.monitorStart(cfg);
         if (!m?.ok) throw new Error(m?.error || "monitor start failed");
         const p = await window.vortexApi.previewStart(cfg);
@@ -352,6 +415,7 @@ async function init() {
         refreshCameraControls();
       } catch (err) {
         const msg = String(err?.message || err);
+        setMonitorIndicator("error", "✕ Start failed", 0);
         if (msg.includes("authentication methods failed")) {
           appendLog(`Start failed: ${msg}. Check vortex_config.json credentials.`);
         } else {
@@ -360,6 +424,7 @@ async function init() {
       }
     } else {
       try {
+        setMonitorIndicator("hidden", "");
         await window.vortexApi.previewStop();
         await window.vortexApi.monitorStop();
       } catch (err) {
@@ -372,7 +437,8 @@ async function init() {
   });
 
   el.nextCamera.addEventListener("click", async () => {
-    const cams = getActiveCameras();
+    await refreshRemoteCameras();
+    const cams = getCameraCandidates();
     if (cams.length === 0) {
       refreshCameraControls();
       return;
@@ -380,15 +446,26 @@ async function init() {
     const current = Number(state.selectedCamera);
     const idx = cams.indexOf(current);
     state.selectedCamera = cams[(idx + 1 + cams.length) % cams.length];
-    state.appConfig.preview_camera_index = Number(state.selectedCamera || 0);
     await window.vortexApi.saveAppConfig(state.appConfig).catch(() => {});
     if (state.pipelineRunning) {
       try {
+        let cfg = readAppConfigFromUI();
+        cfg = await window.vortexApi.applyMonitorPreset(cfg, "main_cam_0");
+        state.appConfig = cfg;
+        await window.vortexApi.saveAppConfig(cfg).catch(() => {});
         await window.vortexApi.previewStop();
-        const r = await window.vortexApi.previewStart(readAppConfigFromUI());
-        if (!r?.ok) appendLog(`Preview restart failed: ${r?.error || "unknown error"}`);
+        await window.vortexApi.monitorStop();
+        const m = await window.vortexApi.monitorStart(cfg);
+        if (!m?.ok) {
+          appendLog(`Monitor restart failed: ${m?.error || "unknown error"}`);
+        } else {
+          const p = await window.vortexApi.previewStart(cfg);
+          if (!p?.ok) appendLog(`Preview restart failed: ${p?.error || "unknown error"}`);
+          state.pipelineRunning = true;
+          el.togglePipeline.textContent = "Stop Monitor";
+        }
       } catch (err) {
-        appendLog(`Preview restart error: ${err.message}`);
+        appendLog(`Camera switch error: ${err.message}`);
       }
     }
     renderDetectionTable();
@@ -408,6 +485,10 @@ async function init() {
   });
   window.vortexApi.onMonitorState((running) => {
     el.monitorStatus.textContent = `Monitor: ${running ? "Running" : "Stopped"}`;
+    if (running) {
+      state.pipelineRunning = true;
+      el.togglePipeline.textContent = "Stop Monitor";
+    }
     if (!running) {
       state.pipelineRunning = false;
       el.togglePipeline.textContent = "Start Monitor";
@@ -436,8 +517,24 @@ async function init() {
       setDeployIndicator("active", msg, percent);
     }
   });
+  window.vortexApi.onMonitorStartProgress((p) => {
+    const status = String(p?.status || "");
+    const percent = Number(p?.percent || 0);
+    const text = String(p?.text || `${percent}%`);
+    if (status === "done") {
+      setMonitorIndicator("done", text, 100);
+    } else if (status === "error") {
+      setMonitorIndicator("error", text, percent);
+    } else if (status === "hidden") {
+      setMonitorIndicator("hidden", "");
+    } else {
+      setMonitorIndicator("active", text, percent);
+    }
+  });
 
   setDeployIndicator("hidden", "");
+  setMonitorIndicator("hidden", "");
+  await refreshRemoteCameras();
   refreshCameraControls();
 
   el.previewImage.onload = () => drawOverlay();

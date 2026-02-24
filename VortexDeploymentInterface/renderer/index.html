@@ -28,6 +28,12 @@
             <button id="togglePipeline" class="accent">Start Monitor</button>
             <button id="nextCamera">Next Camera</button>
             <button id="deployBtn">Deploy</button>
+          </div>
+          <div class="row wrap progress-row">
+            <div id="monitorProgressWrap" class="monitor-progress is-hidden">
+              <progress id="monitorProgress" max="100" value="0"></progress>
+              <span id="monitorProgressText">0%</span>
+            </div>
             <div id="deployProgressWrap" class="deploy-progress is-hidden">
               <progress id="deployProgress" max="100" value="0"></progress>
               <span id="deployProgressText">0%</span>
