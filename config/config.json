@@ -18,8 +18,13 @@
     "roll_deg": 0
   },
   "processing": {
-    "smoothing_alpha": 0.3,
-    "resolution_scale_factor": 1,
+    "smoothing_alpha": 0,
+    "black_level_offset": 51,
+    "sensor_gain": 0.56,
+    "red_balance": 2571,
+    "blue_balance": 1504
+  },
+  "object_detection": {
     "yolo_obj_width_m": 0.3,
     "yolo_obj_height_m": 0.3
   }

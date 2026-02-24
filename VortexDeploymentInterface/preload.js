@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld("vortexApi", {
   loadRuntimeConfig: (runtimePath) => ipcRenderer.invoke("load-runtime-config", runtimePath),
   saveRuntimeConfig: (runtimePath, config) =>
     ipcRenderer.invoke("save-runtime-config", runtimePath, config),
+  syncRuntimeConfigRemote: (settings, config) =>
+    ipcRenderer.invoke("sync-runtime-config-remote", settings, config),
   deployStart: (settings) => ipcRenderer.invoke("deploy-start", settings),
   monitorStart: (settings) => ipcRenderer.invoke("monitor-start", settings),
   monitorStop: () => ipcRenderer.invoke("monitor-stop"),

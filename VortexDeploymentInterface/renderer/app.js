@@ -10,6 +10,7 @@ const state = {
   pipelineRunning: false
 };
 const CAMERA_ACTIVE_MS = 4000;
+const TAG_OVERLAY_STICKY_MS = 450;
 
 const el = {
   runtimePath: document.querySelector("#runtimePath"),
@@ -45,6 +46,7 @@ function appendLog(msg) {
 
 let deployFadeTimer = null;
 let monitorFadeTimer = null;
+let runtimeSyncTimer = null;
 
 function setDeployIndicator(stateKind, text, percent = null) {
   if (deployFadeTimer) {
@@ -123,13 +125,35 @@ function renderRuntimeForm(config) {
     "tag_size_m", "x_offset", "y_offset", "z_offset", "pitch_deg", "yaw_deg", "roll_deg"
   ];
   const orderedProcessing = [
-    "smoothing_alpha", "resolution_scale_factor", "yolo_obj_width_m", "yolo_obj_height_m"
+    "smoothing_alpha",
+    "black_level_offset",
+    "sensor_gain",
+    "red_balance",
+    "blue_balance"
+  ];
+  const orderedObjectDetection = [
+    "yolo_obj_width_m",
+    "yolo_obj_height_m"
   ];
 
   const sections = [
     { key: "camera", title: "Camera Constants", fields: orderedCamera },
-    { key: "processing", title: "Processing Constants", fields: orderedProcessing }
+    { key: "processing", title: "Processing Constants", fields: orderedProcessing },
+    { key: "object_detection", title: "Object Detection Constants", fields: orderedObjectDetection }
   ];
+  const controlSpec = {
+    "processing.smoothing_alpha": { type: "range", min: 0, max: 1, step: 0.01 },
+    "processing.black_level_offset": { type: "range", min: 0, max: 64, step: 1 },
+    "processing.sensor_gain": { type: "range", min: 0.01, max: 2, step: 0.01 },
+    "processing.red_balance": { type: "range", min: 0, max: 4096, step: 1 },
+    "processing.blue_balance": { type: "range", min: 0, max: 4096, step: 1 },
+    "object_detection.yolo_obj_width_m": { type: "text" },
+    "object_detection.yolo_obj_height_m": { type: "text" }
+  };
+  const labelMap = {
+    "object_detection.yolo_obj_width_m": "obj_width_m",
+    "object_detection.yolo_obj_height_m": "obj_height_m"
+  };
 
   for (const section of sections) {
     const details = document.createElement("details");
@@ -145,11 +169,45 @@ function renderRuntimeForm(config) {
 
     for (const key of section.fields) {
       const wrap = document.createElement("label");
-      wrap.textContent = key;
+      wrap.dataset.section = section.key;
+      wrap.dataset.key = key;
+      const fullKey = `${section.key}.${key}`;
+      wrap.textContent = labelMap[fullKey] || key;
+      const spec = controlSpec[`${section.key}.${key}`];
       const input = document.createElement("input");
       input.dataset.section = section.key;
       input.dataset.key = key;
-      input.value = config?.[section.key]?.[key] ?? "";
+      const value = config?.[section.key]?.[key];
+      if (spec?.type === "checkbox") {
+        input.type = "checkbox";
+        input.className = "toggle-input";
+        input.checked = Boolean(value);
+        input.addEventListener("change", () => {
+          scheduleLiveRuntimeSync();
+        });
+      } else if (spec?.type === "range") {
+        input.type = "range";
+        input.className = "slider-input";
+        input.min = String(spec.min);
+        input.max = String(spec.max);
+        input.step = String(spec.step);
+        input.value = String(value ?? spec.min);
+        const valueEl = document.createElement("span");
+        valueEl.className = "slider-value";
+        valueEl.textContent = input.value;
+        input.addEventListener("input", () => {
+          valueEl.textContent = input.value;
+          scheduleLiveRuntimeSync();
+        });
+        wrap.appendChild(input);
+        wrap.appendChild(valueEl);
+        grid.appendChild(wrap);
+        continue;
+      } else {
+        input.type = "text";
+        input.value = value ?? "";
+        input.addEventListener("change", () => scheduleLiveRuntimeSync());
+      }
       wrap.appendChild(input);
       grid.appendChild(wrap);
     }
@@ -160,16 +218,37 @@ function renderRuntimeForm(config) {
 }
 
 function readRuntimeConfigFromForm() {
-  const result = { camera: {}, processing: {} };
+  const result = { camera: {}, processing: {}, object_detection: {} };
   const inputs = el.runtimeForm.querySelectorAll("input");
   for (const input of inputs) {
     const section = input.dataset.section;
     const key = input.dataset.key;
+    if (input.type === "checkbox") {
+      result[section][key] = input.checked;
+      continue;
+    }
     const raw = input.value.trim();
+    if (input.type !== "range" && (raw.toLowerCase() === "true" || raw.toLowerCase() === "false")) {
+      result[section][key] = raw.toLowerCase() === "true";
+      continue;
+    }
     const num = Number(raw);
     result[section][key] = Number.isFinite(num) && raw !== "" ? num : raw;
   }
   return result;
+}
+
+function scheduleLiveRuntimeSync() {
+  if (runtimeSyncTimer) clearTimeout(runtimeSyncTimer);
+  runtimeSyncTimer = setTimeout(async () => {
+    state.runtimeConfig = readRuntimeConfigFromForm();
+    await window.vortexApi.saveRuntimeConfig(el.runtimePath.value.trim(), state.runtimeConfig).catch(() => {});
+    if (state.pipelineRunning) {
+      await window.vortexApi
+        .syncRuntimeConfigRemote(readAppConfigFromUI(), state.runtimeConfig)
+        .catch(() => {});
+    }
+  }, 180);
 }
 
 function ensureCameraOption(cam) {
@@ -236,12 +315,17 @@ function parseMonitorLine(line) {
     const cam = Number(header[1]);
     const fps = Number(header[2]);
     if (!state.cameras.has(cam)) {
-      state.cameras.set(cam, { fps: null, apriltags: [], objects: [], lastSeen: 0 });
+      state.cameras.set(cam, {
+        fps: null,
+        apriltags: [],
+        objects: [],
+        lastSeen: 0,
+        tagFrameHistory: [],
+        lastTagById: new Map()
+      });
     }
     const obj = state.cameras.get(cam);
     obj.fps = fps;
-    obj.apriltags = [];
-    obj.objects = [];
     obj.lastSeen = Date.now();
     state.currentLineCamera = cam;
     state.selectedCamera = cam;
@@ -298,10 +382,36 @@ function renderDetectionTable() {
   el.fps.textContent = `FPS: ${data.fps != null ? data.fps.toFixed(2) : "-"}`;
   const mode = el.viewMode.value;
   if (mode === "apriltag") {
-    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Distance (m)</th><th>X (m)</th><th>Y (m)</th></tr>";
-    el.detectionTableBody.innerHTML = data.apriltags
-      .map((r) => `<tr><td>${r.id}</td><td>${r.dist.toFixed(2)}</td><td>${r.x.toFixed(2)}</td><td>${r.y.toFixed(2)}</td></tr>`)
-      .join("") || "<tr><td colspan='4'>No AprilTags</td></tr>";
+    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Distance (m)</th><th>X (m)</th><th>Y (m)</th><th>Seen / sec</th></tr>";
+    const fpsValue = Number.isFinite(data.fps) && data.fps > 0 ? data.fps : 1;
+    const windowSize = Math.max(1, Math.round(fpsValue));
+    const recentFrames = (data.tagFrameHistory || []).slice(-windowSize);
+    const counts = new Map();
+    for (const frameIds of recentFrames) {
+      const unique = new Set(frameIds || []);
+      for (const id of unique) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+    const ids = [...counts.keys()].sort((a, b) => a - b);
+    if (ids.length === 0) {
+      el.detectionTableBody.innerHTML = "<tr><td colspan='5'>No AprilTags</td></tr>";
+    } else {
+      let totalSeenPerSec = 0;
+      const rows = ids.map((id) => {
+        const seenCount = counts.get(id) || 0;
+        const seenPerSec = seenCount * (fpsValue / Math.max(1, recentFrames.length));
+        const seenPct = (seenCount / Math.max(1, recentFrames.length)) * 100;
+        totalSeenPerSec += seenPerSec;
+        const last = data.lastTagById?.get(id);
+        const dist = Number.isFinite(last?.dist) ? last.dist.toFixed(2) : "-";
+        const x = Number.isFinite(last?.x) ? last.x.toFixed(2) : "-";
+        const y = Number.isFinite(last?.y) ? last.y.toFixed(2) : "-";
+        return `<tr><td>${id}</td><td>${dist}</td><td>${x}</td><td>${y}</td><td>${seenPerSec.toFixed(2)} (${seenPct.toFixed(0)}%)</td></tr>`;
+      });
+      const avgSeenPerSec = totalSeenPerSec / ids.length;
+      const avgSeenPct = (avgSeenPerSec / Math.max(1e-6, fpsValue)) * 100;
+      rows.push(`<tr><td><b>Avg</b></td><td>-</td><td>-</td><td>-</td><td><b>${avgSeenPerSec.toFixed(2)} (${avgSeenPct.toFixed(0)}%)</b></td></tr>`);
+      el.detectionTableBody.innerHTML = rows.join("");
+    }
   } else {
     el.detectionTableHead.innerHTML = "<tr><th>Class</th><th>Conf</th><th>Distance (m)</th><th>X (m)</th><th>Y (m)</th><th>BBox</th></tr>";
     el.detectionTableBody.innerHTML = data.objects
@@ -341,7 +451,18 @@ function drawOverlay() {
     ctx.strokeStyle = "#00ff66";
     ctx.lineWidth = 2.5;
     const tags = data.apriltags || [];
-    for (const t of tags) {
+    const now = Date.now();
+    const drawList = [];
+    for (const t of tags) drawList.push({ corners: t.corners });
+    if (drawList.length === 0 && data.lastTagById instanceof Map) {
+      for (const entry of data.lastTagById.values()) {
+        if (!entry || !Array.isArray(entry.corners)) continue;
+        if (now - Number(entry.lastSeenTs || 0) <= TAG_OVERLAY_STICKY_MS) {
+          drawList.push({ corners: entry.corners });
+        }
+      }
+    }
+    for (const t of drawList) {
       if (!Array.isArray(t.corners) || t.corners.length !== 4) continue;
       const p = t.corners.map((c) => [Number(c[0]) * sx, Number(c[1]) * sy]);
       if (!p.every((xy) => Number.isFinite(xy[0]) && Number.isFinite(xy[1]))) continue;
@@ -404,6 +525,12 @@ async function init() {
     state.runtimePath = el.runtimePath.value.trim();
     state.runtimeConfig = readRuntimeConfigFromForm();
     await window.vortexApi.saveRuntimeConfig(state.runtimePath, state.runtimeConfig);
+    if (state.pipelineRunning) {
+      const sync = await window.vortexApi.syncRuntimeConfigRemote(readAppConfigFromUI(), state.runtimeConfig);
+      if (!sync?.ok) {
+        appendLog(`Remote config sync failed: ${sync?.error || "unknown error"}`);
+      }
+    }
     appendLog(`Saved runtime config: ${state.runtimePath}`);
   });
 
@@ -527,7 +654,14 @@ async function init() {
     const cam = Number(bridge?.camera_index);
     if (!Number.isFinite(cam)) return;
     if (!state.cameras.has(cam)) {
-      state.cameras.set(cam, { fps: null, apriltags: [], objects: [], lastSeen: 0 });
+      state.cameras.set(cam, {
+        fps: null,
+        apriltags: [],
+        objects: [],
+        lastSeen: 0,
+        tagFrameHistory: [],
+        lastTagById: new Map()
+      });
     }
     const row = state.cameras.get(cam);
     row.lastSeen = Date.now();
@@ -540,6 +674,20 @@ async function init() {
         y: Number(t?.y ?? 0),
         corners: Array.isArray(t?.corners) ? t.corners : []
       }));
+      const idsThisFrame = row.apriltags.map((t) => t.id).filter((id) => Number.isFinite(id));
+      row.tagFrameHistory = row.tagFrameHistory || [];
+      row.tagFrameHistory.push(idsThisFrame);
+      if (row.tagFrameHistory.length > 300) row.tagFrameHistory.splice(0, row.tagFrameHistory.length - 300);
+      row.lastTagById = row.lastTagById || new Map();
+      for (const t of row.apriltags) {
+        row.lastTagById.set(t.id, {
+          dist: t.dist,
+          x: t.x,
+          y: t.y,
+          corners: t.corners,
+          lastSeenTs: Date.now()
+        });
+      }
     }
     if (Array.isArray(bridge?.objects)) {
       row.objects = bridge.objects.map((o) => ({

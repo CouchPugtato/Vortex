@@ -226,6 +226,15 @@ function sftpReadFile(sftp, remotePath) {
   });
 }
 
+function sftpWriteFile(sftp, remotePath, bytes) {
+  return new Promise((resolve, reject) => {
+    const ws = sftp.createWriteStream(remotePath, { flags: "w", mode: 0o644 });
+    ws.on("error", reject);
+    ws.on("close", resolve);
+    ws.end(bytes);
+  });
+}
+
 async function walkFiles(rootDir) {
   const out = [];
   async function walk(current) {
@@ -749,6 +758,27 @@ ipcMain.handle("load-runtime-config", async (_evt, runtimePath) => {
 ipcMain.handle("save-runtime-config", async (_evt, runtimePath, config) => {
   await writeJson(runtimePath, config);
   return { ok: true };
+});
+
+ipcMain.handle("sync-runtime-config-remote", async (_evt, settings, config) => {
+  const conn = await connectSsh(settings);
+  try {
+    const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+    const remoteConfigPath = `${remoteTarget}/config/config.json`;
+    const remoteParent = path.posix.dirname(remoteConfigPath);
+    await execCommand(conn, `mkdir -p '${remoteParent}'`);
+    const sftp = await getSftp(conn);
+    const payload = Buffer.from(`${JSON.stringify(config, null, 2)}\n`, "utf8");
+    await sftpWriteFile(sftp, remoteConfigPath, payload);
+    emitLog(`Runtime config synced to remote: ${remoteConfigPath}`);
+    return { ok: true, remoteConfigPath };
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitLog(`Runtime config remote sync failed: ${msg}`);
+    return { ok: false, error: msg };
+  } finally {
+    conn.end();
+  }
 });
 
 ipcMain.handle("deploy-start", async (_evt, settings) => {

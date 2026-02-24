@@ -26,7 +26,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::capability::Flags;
 use turbojpeg::{Decompressor, Compressor, Image, PixelFormat, Subsamp};
 
-use crate::config::{CameraConfig, ProcessingConfig, RuntimeConfig};
+use crate::config::{CameraConfig, ObjectDetectionConfig, ProcessingConfig, RuntimeConfig};
 use crate::detector::Detection;
 
 
@@ -144,6 +144,7 @@ fn main() -> anyhow::Result<()> {
             tx_stats.clone(),
             runtime_config.camera,
             runtime_config.processing,
+            runtime_config.object_detection,
         );
     }
 
@@ -267,6 +268,7 @@ fn spawn_camera_pipeline(
     tx_stats: mpsc::Sender<PipelineStats>,
     camera_config: CameraConfig,
     processing_config: ProcessingConfig,
+    object_detection_config: ObjectDetectionConfig,
 ) {
     println!("Spawning pipeline for Camera {}...", camera_index);
 
@@ -634,8 +636,8 @@ fn spawn_camera_pipeline(
                                 };
 
                                 // approximate object depth from known nominal object size and detected bbox size, tune with YOLO_OBJ_WIDTH_M / YOLO_OBJ_HEIGHT_M
-                                let obj_w_m = processing_config.yolo_obj_width_m;
-                                let obj_h_m = processing_config.yolo_obj_height_m;
+                                let obj_w_m = object_detection_config.yolo_obj_width_m;
+                                let obj_h_m = object_detection_config.yolo_obj_height_m;
 
                                 let mut z_candidates = Vec::new();
                                 if bbox[2] > 1.0 {

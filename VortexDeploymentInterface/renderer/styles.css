@@ -191,6 +191,82 @@ button:focus {
   font-size: 0.85rem;
 }
 
+#runtimeForm .slider-input {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+}
+
+#runtimeForm .slider-value {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 0.76rem;
+  color: #c8c8c8;
+}
+
+#runtimeForm .toggle-input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 2px;
+  vertical-align: middle;
+  border: 1px solid #5a5a5a;
+  border-radius: 4px;
+  background: #141414;
+  position: relative;
+  cursor: pointer;
+}
+
+#runtimeForm .toggle-input:checked {
+  background: #8e1d1d;
+  border-color: #b43737;
+}
+
+#runtimeForm .toggle-input:checked::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid #ffffff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+#runtimeForm .slider-input::-webkit-slider-runnable-track {
+  height: 6px;
+  background: #2a2a2a;
+  border-radius: 999px;
+}
+
+#runtimeForm .slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #c73535;
+  border: 1px solid #7a1e1e;
+  margin-top: -5px;
+}
+
+#runtimeForm .slider-input::-moz-range-track {
+  height: 6px;
+  background: #2a2a2a;
+  border-radius: 999px;
+}
+
+#runtimeForm .slider-input::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #c73535;
+  border: 1px solid #7a1e1e;
+}
+
 .row {
   display: flex;
   gap: 8px;

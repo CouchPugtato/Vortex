@@ -10,6 +10,7 @@ mod undistort;
 mod yolo_detector;
 
 use std::fs;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,8 @@ struct TagOut {
     y: f64,
     z: f64,
     corners: [[f64; 2]; 4],
+    seen_fps: f64,
+    seen_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -110,6 +113,18 @@ fn draw_rect(img: &mut [u8], w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i3
     draw_line(img, w, h, x, y + rh, x, y);
 }
 
+fn apply_processing(gray: &mut [u8], cfg: &config::ProcessingConfig) {
+    let gain = cfg.sensor_gain.max(0.01);
+    let black_offset = cfg.black_level_offset;
+    for p in gray.iter_mut() {
+        let mut v = (*p as f64) / 255.0;
+        v *= gain;
+        v += black_offset / 255.0;
+        v = v.clamp(0.0, 1.0);
+        *p = (v * 255.0).clamp(0.0, 255.0) as u8;
+    }
+}
+
 fn write_atomic(path: &str, bytes: &[u8]) {
     let tmp = format!("{}.tmp", path);
     if fs::write(&tmp, bytes).is_ok() {
@@ -130,7 +145,9 @@ fn main() -> Result<()> {
     let cfg_path = std::env::var("VORTEX_BRIDGE_CONFIG")
         .unwrap_or_else(|_| "config/config.json".to_string());
 
-    let runtime_config = RuntimeConfig::load(Path::new(&cfg_path))?;
+    let mut runtime_config = RuntimeConfig::load(Path::new(&cfg_path))?;
+    let mut cfg_last_modified = fs::metadata(&cfg_path).and_then(|m| m.modified()).ok();
+    let mut cfg_last_check = Instant::now();
     let mut cpu = CpuDetector::new(2)?;
     #[cfg(feature = "tensorrt")]
     let mut yolo = yolo_detector::YoloDetector::new().ok();
@@ -171,10 +188,28 @@ fn main() -> Result<()> {
     compressor.set_subsamp(Subsamp::Gray);
 
     let mut fps_count = 0u64;
+    let mut tag_seen_counts: HashMap<usize, u64> = HashMap::new();
     let mut fps_last = Instant::now();
     let mut fps = 0.0f64;
 
     loop {
+        if cfg_last_check.elapsed() >= Duration::from_millis(500) {
+            cfg_last_check = Instant::now();
+            let modified = fs::metadata(&cfg_path).and_then(|m| m.modified()).ok();
+            let changed = match (cfg_last_modified, modified) {
+                (Some(old), Some(new)) => new > old,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if changed {
+                if let Ok(new_cfg) = RuntimeConfig::load(Path::new(&cfg_path)) {
+                    runtime_config = new_cfg;
+                    cfg_last_modified = modified;
+                    eprintln!("Runtime config reloaded: {}", cfg_path);
+                }
+            }
+        }
+
         let (buf, _) = match stream.next() {
             Ok(v) => v,
             Err(_) => continue,
@@ -197,6 +232,7 @@ fn main() -> Result<()> {
         if decompressor.decompress(&bytes, img).is_err() {
             continue;
         }
+        apply_processing(&mut gray, &runtime_config.processing);
 
         let mut tags = Vec::new();
         let mut objects = Vec::new();
@@ -237,12 +273,20 @@ fn main() -> Result<()> {
                         b.1 as i32,
                     );
                 }
+                let frame_count_for_metrics = fps_count + 1;
+                let c = tag_seen_counts.entry(apr.id).or_insert(0);
+                *c += 1;
+                let elapsed_for_metrics = fps_last.elapsed().as_secs_f64().max(1e-6);
+                let seen_fps = (*c as f64) / elapsed_for_metrics;
+                let seen_pct = ((*c as f64) / (frame_count_for_metrics as f64)) * 100.0;
                 tags.push(TagOut {
                     id: apr.id,
                     x,
                     y,
                     z,
                     corners: apr.corners,
+                    seen_fps,
+                    seen_pct,
                 });
             }
         }
@@ -264,8 +308,8 @@ fn main() -> Result<()> {
                     );
                     let u = bbox[0] + bbox[2] / 2.0;
                     let v = bbox[1] + bbox[3] / 2.0;
-                    let obj_w_m = runtime_config.processing.yolo_obj_width_m;
-                    let obj_h_m = runtime_config.processing.yolo_obj_height_m;
+                    let obj_w_m = runtime_config.object_detection.yolo_obj_width_m;
+                    let obj_h_m = runtime_config.object_detection.yolo_obj_height_m;
                     let mut z_candidates = Vec::new();
                     if bbox[2] > 1.0 {
                         z_candidates.push((runtime_config.camera.fx * obj_w_m) / bbox[2]);
@@ -296,6 +340,7 @@ fn main() -> Result<()> {
         if elapsed >= 1.0 {
             fps = fps_count as f64 / elapsed;
             fps_count = 0;
+            tag_seen_counts.clear();
             fps_last = Instant::now();
         }
 
