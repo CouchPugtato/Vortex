@@ -329,28 +329,48 @@ function drawOverlay() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, rect.width, rect.height);
 
-  if (el.viewMode.value !== "object") return;
   const cam = Number(state.selectedCamera ?? 0);
   const data = state.cameras.get(cam);
-  if (!data || !data.objects) return;
+  if (!data) return;
 
   const src = previewSourceDims();
   const sx = rect.width / Math.max(1, src.w);
   const sy = rect.height / Math.max(1, src.h);
 
-  ctx.strokeStyle = "#00ff88";
-  ctx.fillStyle = "#00ff88";
-  ctx.lineWidth = 2;
-  ctx.font = "12px Segoe UI";
+  if (el.viewMode.value === "apriltag") {
+    ctx.strokeStyle = "#00ff66";
+    ctx.lineWidth = 2.5;
+    const tags = data.apriltags || [];
+    for (const t of tags) {
+      if (!Array.isArray(t.corners) || t.corners.length !== 4) continue;
+      const p = t.corners.map((c) => [Number(c[0]) * sx, Number(c[1]) * sy]);
+      if (!p.every((xy) => Number.isFinite(xy[0]) && Number.isFinite(xy[1]))) continue;
+      ctx.beginPath();
+      ctx.moveTo(p[0][0], p[0][1]);
+      ctx.lineTo(p[1][0], p[1][1]);
+      ctx.lineTo(p[2][0], p[2][1]);
+      ctx.lineTo(p[3][0], p[3][1]);
+      ctx.closePath();
+      ctx.stroke();
+    }
+    return;
+  }
 
-  for (const o of data.objects) {
-    const x = o.x * sx;
-    const y = o.y * sy;
-    const w = o.bboxWidth * sx;
-    const h = o.bboxHeight * sy;
-    if (![x, y, w, h].every(Number.isFinite)) continue;
-    ctx.strokeRect(x, y, w, h);
-    ctx.fillText(`${o.className} ${o.conf.toFixed(2)}`, x + 4, Math.max(12, y - 4));
+  if (el.viewMode.value === "object") {
+    ctx.strokeStyle = "#00ff88";
+    ctx.fillStyle = "#00ff88";
+    ctx.lineWidth = 2;
+    ctx.font = "12px Segoe UI";
+
+    for (const o of data.objects || []) {
+      const x = o.x * sx;
+      const y = o.y * sy;
+      const w = o.bboxWidth * sx;
+      const h = o.bboxHeight * sy;
+      if (![x, y, w, h].every(Number.isFinite)) continue;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillText(`${o.className} ${o.conf.toFixed(2)}`, x + 4, Math.max(12, y - 4));
+    }
   }
 }
 
@@ -501,6 +521,40 @@ async function init() {
   });
   window.vortexApi.onPreviewFrame((dataUrl) => {
     el.previewImage.src = dataUrl;
+    drawOverlay();
+  });
+  window.vortexApi.onBridgeState((bridge) => {
+    const cam = Number(bridge?.camera_index);
+    if (!Number.isFinite(cam)) return;
+    if (!state.cameras.has(cam)) {
+      state.cameras.set(cam, { fps: null, apriltags: [], objects: [], lastSeen: 0 });
+    }
+    const row = state.cameras.get(cam);
+    row.lastSeen = Date.now();
+    if (Number.isFinite(Number(bridge?.fps))) row.fps = Number(bridge.fps);
+    if (Array.isArray(bridge?.apriltags)) {
+      row.apriltags = bridge.apriltags.map((t) => ({
+        id: Number(t?.id),
+        dist: Number(t?.z ?? 0),
+        x: Number(t?.x ?? 0),
+        y: Number(t?.y ?? 0),
+        corners: Array.isArray(t?.corners) ? t.corners : []
+      }));
+    }
+    if (Array.isArray(bridge?.objects)) {
+      row.objects = bridge.objects.map((o) => ({
+        className: String(o?.class_name ?? ""),
+        conf: Number(o?.confidence ?? 0),
+        dist: Number(o?.z ?? 0),
+        x: Number(Array.isArray(o?.bbox) ? o.bbox[0] : 0),
+        y: Number(Array.isArray(o?.bbox) ? o.bbox[1] : 0),
+        bbox: `BBox: [${Array.isArray(o?.bbox) ? o.bbox.join(",") : ""}]`,
+        bboxWidth: Number(Array.isArray(o?.bbox) ? o.bbox[2] : 0),
+        bboxHeight: Number(Array.isArray(o?.bbox) ? o.bbox[3] : 0)
+      }));
+    }
+    if (state.selectedCamera == null) state.selectedCamera = cam;
+    renderDetectionTable();
     drawOverlay();
   });
   window.vortexApi.onDeployProgress((p) => {

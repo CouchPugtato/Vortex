@@ -67,6 +67,11 @@ function emitPreviewFrame(dataUrl) {
   if (win) win.webContents.send("preview-frame", dataUrl);
 }
 
+function emitBridgeState(state) {
+  const win = getWindow();
+  if (win) win.webContents.send("bridge-state", state);
+}
+
 function emitDeployProgress(progress) {
   const win = getWindow();
   if (win) win.webContents.send("deploy-progress", progress);
@@ -98,6 +103,7 @@ function defaultAppConfig() {
     monitor_stop_cmd: "pkill -f orin_bridge || true",
     startup_service_name: "",
     preview_remote_path: "/tmp/vortex_preview.jpg",
+    preview_state_path: "/tmp/vortex_bridge_state.json",
     preview_capture_cmd: ""
   };
 }
@@ -672,6 +678,16 @@ const previewManager = {
         const bytes = await sftpReadFile(sftp, settings.preview_remote_path);
         const mime = bytes[0] === 0x89 ? "image/png" : "image/jpeg";
         emitPreviewFrame(`data:${mime};base64,${bytes.toString("base64")}`);
+        try {
+          const stateBytes = await sftpReadFile(
+            sftp,
+            settings.preview_state_path || "/tmp/vortex_bridge_state.json"
+          );
+          const parsed = JSON.parse(stateBytes.toString("utf8"));
+          emitBridgeState(parsed);
+        } catch (_stateErr) {
+          // state file may not exist yet, ignore and keep preview alive
+        }
       } catch (err) {
         const msg = err?.message || String(err);
         emitLog(`Preview error: ${msg}`);
@@ -816,5 +832,6 @@ ipcMain.handle("apply-monitor-preset", async (_evt, appConfig, preset) => {
   }
   out.monitor_stop_cmd = "pkill -f orin_bridge || true";
   out.preview_remote_path = "/tmp/vortex_bridge_frame.jpg";
+  out.preview_state_path = "/tmp/vortex_bridge_state.json";
   return out;
 });

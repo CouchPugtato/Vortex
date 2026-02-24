@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld("vortexApi", {
   onMonitorState: makeSubscriber("monitor-state"),
   onPreviewState: makeSubscriber("preview-state"),
   onPreviewFrame: makeSubscriber("preview-frame"),
+  onBridgeState: makeSubscriber("bridge-state"),
   onDeployProgress: makeSubscriber("deploy-progress"),
   onMonitorStartProgress: makeSubscriber("monitor-start-progress")
 });
