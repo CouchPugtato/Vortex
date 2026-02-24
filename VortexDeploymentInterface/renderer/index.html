@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vortex Deployment Interface</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <section class="left-panel">
+        <section class="card block">
+          <h2>Runtime Config</h2>
+          <label>Config Path</label>
+          <div class="row">
+            <input id="runtimePath" />
+            <button id="loadRuntime">Load</button>
+            <button id="saveRuntime" class="accent wide-btn">Save Config</button>
+          </div>
+          <div id="runtimeForm"></div>
+        </section>
+      </section>
+
+      <main class="right-panel">
+        <section class="card block">
+          <h2>Pipeline + Camera Feed</h2>
+          <div class="row wrap status-row">
+            <button id="togglePipeline" class="accent">Start Monitor</button>
+            <button id="nextCamera">Next Camera</button>
+            <button id="deployBtn">Deploy</button>
+            <div id="deployProgressWrap" class="deploy-progress is-hidden">
+              <progress id="deployProgress" max="100" value="0"></progress>
+              <span id="deployProgressText">0%</span>
+            </div>
+          </div>
+          <div class="row wrap">
+            <label class="inline-control">View
+              <select id="viewMode">
+                <option value="apriltag">AprilTags</option>
+                <option value="object">Objects</option>
+              </select>
+            </label>
+            <div id="cameraPill" class="pill">Camera: 0</div>
+            <div id="fps" class="pill">FPS: -</div>
+            <div id="monitorStatus" class="pill">Monitor: Stopped</div>
+            <div id="previewStatus" class="pill">Feed: Stopped</div>
+          </div>
+          <div class="table-wrap">
+            <table id="detectionTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="feed-frame">
+            <img id="previewImage" alt="Camera preview" />
+            <canvas id="previewOverlay"></canvas>
+          </div>
+        </section>
+
+        <section class="card block">
+          <h2>Logs</h2>
+          <pre id="logs"></pre>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
