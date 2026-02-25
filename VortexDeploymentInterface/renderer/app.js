@@ -1003,7 +1003,7 @@ async function init() {
         const msg = String(err?.message || err);
         setMonitorIndicator("error", "✕ Start failed", 0);
         if (msg.includes("authentication methods failed")) {
-          appendLog(`Start failed: ${msg}. Check vortex_config.json credentials.`);
+          appendLog(`Start failed: ${msg}. SSH credentials are fixed to vortex/redstorm on port 22.`);
         } else {
           appendLog(`Start failed: ${msg}`);
         }

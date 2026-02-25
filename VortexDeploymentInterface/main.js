@@ -4,8 +4,15 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const { Client } = require("ssh2");
 
-const APP_CONFIG_PATH = path.join(__dirname, "vortex_config.json");
+const APP_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
+const LEGACY_APP_CONFIG_PATH = path.join(__dirname, "vortex_config.json");
+const LEGACY_USERDATA_CONFIG_PATH = path.join(app.getPath("userData"), "vortex_config.json");
 const DEFAULT_RUNTIME_CONFIG_PATH = path.resolve(__dirname, "..", "config", "config.json");
+const FIXED_SSH = Object.freeze({
+  port: "22",
+  user: "vortex",
+  pass: "redstorm"
+});
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -103,12 +110,12 @@ function isDetectionLine(line) {
 function defaultAppConfig() {
   return {
     host: "192.168.55.1",
-    port: "22",
-    user: "jetson",
-    pass: "",
-    remote_path: "/home/jetson/deployments",
+    port: FIXED_SSH.port,
+    user: FIXED_SSH.user,
+    pass: FIXED_SSH.pass,
+    remote_path: "/home/vortex/deployments",
     local_path: path.resolve(__dirname, ".."),
-    tag_map_path: path.resolve(__dirname, "..", "config", "apriltag_map.json"),
+    tag_map_path: path.join("..", "config", "2026-rebuilt-welded.json"),
     onnx_model_path: "",
     monitor_start_cmd: "",
     monitor_stop_cmd: "pkill -f orin_bridge || true",
@@ -118,6 +125,48 @@ function defaultAppConfig() {
     preview_capture_cmd: "",
     jetson_max_watts: 15
   };
+}
+
+function withFixedSshConfig(cfg) {
+  return {
+    ...(cfg || {}),
+    port: FIXED_SSH.port,
+    user: FIXED_SSH.user,
+    pass: FIXED_SSH.pass
+  };
+}
+
+function resolvePathFromAppDir(candidatePath, fallback = "") {
+  const raw = String(candidatePath || "").trim();
+  if (!raw) return fallback;
+  const resolved = path.resolve(__dirname, raw);
+  if (!fsSync.existsSync(resolved)) return fallback;
+  return resolved;
+}
+
+function portablePathFromAppDir(candidatePath) {
+  const raw = String(candidatePath || "").trim();
+  if (!raw) return "";
+  const abs = path.resolve(__dirname, raw);
+  const rel = path.relative(__dirname, abs);
+  if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
+  return abs;
+}
+
+async function readPersistedAppConfig() {
+  const userCfg = await readJson(APP_CONFIG_PATH, null);
+  if (userCfg) return userCfg;
+  const legacyUserCfg = await readJson(LEGACY_USERDATA_CONFIG_PATH, null);
+  if (legacyUserCfg) {
+    await writeJson(APP_CONFIG_PATH, legacyUserCfg);
+    return legacyUserCfg;
+  }
+  const legacyCfg = await readJson(LEGACY_APP_CONFIG_PATH, null);
+  if (legacyCfg) {
+    await writeJson(APP_CONFIG_PATH, legacyCfg);
+    return legacyCfg;
+  }
+  return {};
 }
 
 async function readJson(filePath, fallback) {
@@ -252,6 +301,7 @@ function parseNvpmodelModesFromQuery(queryText) {
 }
 
 async function setJetsonPowerLimit(settings, requestedWatts) {
+  const cfg = withFixedSshConfig(settings);
   const conn = await connectSsh(settings);
   try {
     const req = Number(requestedWatts);
@@ -275,7 +325,7 @@ async function setJetsonPowerLimit(settings, requestedWatts) {
     for (const mode of numeric) {
       if (mode.watts <= req) chosen = mode;
     }
-    const pw = shSingle(settings.pass || "");
+    const pw = shSingle(cfg.pass || "");
     const applyLog = `/tmp/vortex_nvp_apply_${Date.now()}.log`;
     const apply = await execCommand(
       conn,
@@ -311,14 +361,15 @@ async function setJetsonPowerLimit(settings, requestedWatts) {
 function connectSsh(settings) {
   return new Promise((resolve, reject) => {
     const conn = new Client();
+    const cfg = withFixedSshConfig(settings);
     conn
       .on("ready", () => resolve(conn))
       .on("error", (err) => reject(err))
       .connect({
-        host: settings.host,
-        port: Number(settings.port || 22),
-        username: settings.user,
-        password: settings.pass,
+        host: cfg.host,
+        port: Number(cfg.port || 22),
+        username: cfg.user,
+        password: cfg.pass,
         readyTimeout: 8000
       });
   });
@@ -404,9 +455,10 @@ async function walkFiles(rootDir) {
 }
 
 async function deployProject(settings) {
+  const cfg = withFixedSshConfig(settings);
   const conn = await connectSsh(settings);
   try {
-    emitLog(`Connected to ${settings.host}:${settings.port}`);
+    emitLog(`Connected to ${cfg.host}:${cfg.port}`);
     const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
     const normalizedTarget = String(remoteTarget).replace(/\/+$/, "");
     if (!normalizedTarget || normalizedTarget === "/" || normalizedTarget.split("/").length < 3) {
@@ -563,6 +615,7 @@ function withBridgeEnv(cmdTail, binary) {
 }
 
 async function resolveMonitorCommand(conn, settings) {
+  const cfg = withFixedSshConfig(settings);
   const raw = String(settings.monitor_start_cmd || "").trim();
   const { cwd, tail } = splitMonitorCommand(raw);
   const invoked = String(tail || raw);
@@ -618,9 +671,9 @@ async function resolveMonitorCommand(conn, settings) {
     cwd,
     derived,
     settings.remote_path,
-    `/home/${settings.user}`,
-    `/home/${settings.user}/deployments`,
-    `/home/${settings.user}/deployments/Vortex`
+    `/home/${cfg.user}`,
+    `/home/${cfg.user}/deployments`,
+    `/home/${cfg.user}/deployments/Vortex`
   ]
     .map((v) => stripOuterQuotes(v))
     .filter(Boolean)
@@ -695,7 +748,7 @@ async function resolveMonitorCommand(conn, settings) {
   }
 
   async function ensureBridgeBuildDeps() {
-    const pw = shSingle(settings.pass || "");
+    const pw = shSingle(cfg.pass || "");
     emitLog("Ensuring remote build dependencies for orin_bridge...");
     const depInstall = await execCommand(
       conn,
@@ -754,7 +807,7 @@ async function resolveMonitorCommand(conn, settings) {
   try {
     const scan = await execCommand(
       conn,
-      `find '/home/${settings.user}' -maxdepth 6 -type f -name '${binary}' 2>/dev/null | head -n 1`
+      `find '/home/${cfg.user}' -maxdepth 6 -type f -name '${binary}' 2>/dev/null | head -n 1`
     );
     const found = String(scan.stdout || "").trim();
     if (found) {
@@ -783,7 +836,7 @@ async function resolveMonitorCommand(conn, settings) {
   if (sawMissingCargo) {
     emitLog("Cargo not found. Attempting remote install via apt...");
     try {
-      const pw = shSingle(settings.pass || "");
+      const pw = shSingle(cfg.pass || "");
       const install = await execCommand(
         conn,
         `bash -lc "echo ${pw} | sudo -S -p '' apt-get update && echo ${pw} | sudo -S -p '' apt-get install -y cargo"`
@@ -835,7 +888,7 @@ async function resolveMonitorCommand(conn, settings) {
   if (sawOldCargo) {
     emitLog("Remote Cargo is too old. Attempting rustup stable install...");
     try {
-      const pw = shSingle(settings.pass || "");
+      const pw = shSingle(cfg.pass || "");
       // Ensure curl exists for rustup bootstrap
       await execCommand(
         conn,
@@ -1008,7 +1061,7 @@ async function syncTagMapRemote(conn, settings) {
     const targets = [
       inferRemoteDeployFolder(settings.remote_path, settings.local_path),
       settings.remote_path,
-      `/home/${settings.user}/deployments/Vortex`
+      `/home/${withFixedSshConfig(settings).user}/deployments/Vortex`
     ]
       .map((p) => String(p || "").replace(/\/+$/, ""))
       .filter(Boolean)
@@ -1066,7 +1119,7 @@ const previewManager = {
           sftp = null;
         }
         if (msg.includes("All configured authentication methods failed")) {
-          emitLog("Authentication failed. Update credentials in vortex_config.json.");
+          emitLog("Authentication failed. Fixed credentials are vortex/redstorm on port 22.");
           this.running = false;
         }
         await new Promise((r) => setTimeout(r, 450));
@@ -1086,17 +1139,17 @@ const previewManager = {
 };
 
 ipcMain.handle("bootstrap", async () => {
-  const appCfg = { ...defaultAppConfig(), ...(await readJson(APP_CONFIG_PATH, {})) };
+  const appCfg = withFixedSshConfig({ ...defaultAppConfig(), ...(await readPersistedAppConfig()) });
   delete appCfg.preview_camera_index;
-  appCfg.local_path = path.resolve(__dirname, appCfg.local_path || "..");
-  appCfg.tag_map_path = path.resolve(
-    __dirname,
-    appCfg.tag_map_path || path.join("..", "config", "apriltag_map.json")
+  appCfg.local_path = resolvePathFromAppDir(appCfg.local_path, path.resolve(__dirname, ".."));
+  appCfg.tag_map_path = resolvePathFromAppDir(
+    appCfg.tag_map_path,
+    resolvePathFromAppDir(path.join("..", "config", "2026-rebuilt-welded.json"), "")
   );
   if (appCfg.onnx_model_path) {
-    appCfg.onnx_model_path = path.resolve(String(appCfg.onnx_model_path));
+    appCfg.onnx_model_path = resolvePathFromAppDir(appCfg.onnx_model_path, "");
   }
-  const runtimeConfigPath = appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH;
+  const runtimeConfigPath = path.resolve(__dirname, appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH);
   const runtimeConfig = await readJson(runtimeConfigPath, {});
   return { appConfig: appCfg, runtimeConfigPath, runtimeConfig };
 });
@@ -1228,8 +1281,14 @@ ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath)
 });
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
-  const sanitized = { ...(appConfig || {}) };
+  const sanitized = withFixedSshConfig({ ...(appConfig || {}) });
   delete sanitized.preview_camera_index;
+  sanitized.local_path = portablePathFromAppDir(sanitized.local_path);
+  sanitized.tag_map_path = portablePathFromAppDir(sanitized.tag_map_path);
+  sanitized.onnx_model_path = portablePathFromAppDir(sanitized.onnx_model_path);
+  if (sanitized.runtime_config_path) {
+    sanitized.runtime_config_path = portablePathFromAppDir(sanitized.runtime_config_path);
+  }
   await writeJson(APP_CONFIG_PATH, sanitized);
   return { ok: true };
 });
@@ -1299,7 +1358,7 @@ ipcMain.handle("monitor-start", async (_evt, settings) => {
     const msg = err?.message || String(err);
     emitLog(`Monitor start failed: ${msg}`);
     if (msg.includes("All configured authentication methods failed")) {
-      emitLog("Authentication failed. Update credentials in vortex_config.json.");
+      emitLog("Authentication failed. Fixed credentials are vortex/redstorm on port 22.");
     }
     emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
     return { ok: false, error: msg };

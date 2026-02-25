@@ -28,7 +28,6 @@
       "main.js",
       "preload.js",
       "renderer/**/*",
-      "vortex_config.json",
       "package.json"
     ],
     "win": {
