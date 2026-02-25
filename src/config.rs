@@ -13,6 +13,7 @@ fn default_blue_balance() -> f64 { 1976.0 }
 fn default_yolo_obj_width_m() -> f64 { 0.3 }
 fn default_yolo_obj_height_m() -> f64 { 0.3 }
 fn default_confidence_threshold() -> f64 { 0.25 }
+fn default_use_nn() -> bool { true }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CameraConfig {
@@ -62,6 +63,8 @@ pub struct ProcessingConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct ObjectDetectionConfig {
+    #[serde(default = "default_use_nn")]
+    pub use_nn: bool,
     #[serde(default = "default_yolo_obj_width_m", alias = "processing_yolo_obj_width_m")]
     pub yolo_obj_width_m: f64,
     #[serde(default = "default_yolo_obj_height_m", alias = "processing_yolo_obj_height_m")]
@@ -115,6 +118,7 @@ impl Default for ProcessingConfig {
 impl Default for ObjectDetectionConfig {
     fn default() -> Self {
         Self {
+            use_nn: true,
             yolo_obj_width_m: 0.3,
             yolo_obj_height_m: 0.3,
             confidence_threshold: 0.25,

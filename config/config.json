@@ -18,13 +18,14 @@
     "roll_deg": 0
   },
   "processing": {
-    "smoothing_alpha": 0.33,
+    "smoothing_alpha": 0.79,
     "black_level_offset": 12,
     "sensor_gain": 0.63,
     "red_balance": 3910,
     "blue_balance": 3638
   },
   "object_detection": {
+    "use_nn": false,
     "yolo_obj_width_m": 0.3,
     "yolo_obj_height_m": 0.3,
     "confidence_threshold": 0.89

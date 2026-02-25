@@ -650,11 +650,15 @@ fn spawn_camera_pipeline(
 
                     #[cfg(feature = "tensorrt")]
                     {
-                        if let Ok(d) = yolo_detector::YoloDetector::new() {
-                            println!("Initialized YoloDetector for Camera {}", camera_index);
-                            detectors.push(DetectorWrapper::Yolo(d));
+                        if object_detection_config.use_nn {
+                            if let Ok(d) = yolo_detector::YoloDetector::new() {
+                                println!("Initialized YoloDetector for Camera {}", camera_index);
+                                detectors.push(DetectorWrapper::Yolo(d));
+                            } else {
+                                eprintln!("Error building YoloDetector for cam {}: Skipping YOLO detection.", camera_index);
+                            }
                         } else {
-                            eprintln!("Error building YoloDetector for cam {}: Skipping YOLO detection.", camera_index);
+                            println!("YOLO disabled by config for Camera {}", camera_index);
                         }
                     }
 

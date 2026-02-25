@@ -186,6 +186,7 @@ function renderRuntimeForm(config) {
     "blue_balance"
   ];
   const orderedObjectDetection = [
+    "use_nn",
     "yolo_obj_width_m",
     "yolo_obj_height_m",
     "confidence_threshold"
@@ -203,11 +204,13 @@ function renderRuntimeForm(config) {
     "processing.sensor_gain": { type: "range", min: 0.01, max: 2, step: 0.01 },
     "processing.red_balance": { type: "range", min: 0, max: 4096, step: 1 },
     "processing.blue_balance": { type: "range", min: 0, max: 4096, step: 1 },
+    "object_detection.use_nn": { type: "checkbox", defaultValue: true },
     "object_detection.yolo_obj_width_m": { type: "text" },
     "object_detection.yolo_obj_height_m": { type: "text" },
     "object_detection.confidence_threshold": { type: "range", min: 0, max: 1, step: 0.01 }
   };
   const labelMap = {
+    "object_detection.use_nn": "use_nn",
     "object_detection.yolo_obj_width_m": "obj_width_m",
     "object_detection.yolo_obj_height_m": "obj_height_m",
     "object_detection.confidence_threshold": "confidence_threshold"
@@ -239,7 +242,7 @@ function renderRuntimeForm(config) {
       if (spec?.type === "checkbox") {
         input.type = "checkbox";
         input.className = "toggle-input";
-        input.checked = Boolean(value);
+        input.checked = value == null ? Boolean(spec.defaultValue) : Boolean(value);
         input.addEventListener("change", () => {
           scheduleLiveRuntimeSync();
         });

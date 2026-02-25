@@ -370,15 +370,20 @@ fn main() -> Result<()> {
     let mut cfg_last_check = Instant::now();
     let mut cpu = CpuDetector::new(2)?;
     #[cfg(feature = "tensorrt")]
-    let mut yolo = match yolo_detector::YoloDetector::new() {
-        Ok(det) => {
-            eprintln!("orin_bridge: TensorRT YOLO enabled");
-            Some(det)
+    let mut yolo = if runtime_config.object_detection.use_nn {
+        match yolo_detector::YoloDetector::new() {
+            Ok(det) => {
+                eprintln!("orin_bridge: TensorRT YOLO enabled");
+                Some(det)
+            }
+            Err(err) => {
+                eprintln!("orin_bridge: TensorRT YOLO unavailable: {}", err);
+                None
+            }
         }
-        Err(err) => {
-            eprintln!("orin_bridge: TensorRT YOLO unavailable: {}", err);
-            None
-        }
+    } else {
+        eprintln!("orin_bridge: TensorRT YOLO disabled by config");
+        None
     };
     #[cfg(not(feature = "tensorrt"))]
     eprintln!("orin_bridge: built without tensorrt feature; object detection disabled");
@@ -435,6 +440,28 @@ fn main() -> Result<()> {
             };
             if changed {
                 if let Ok(new_cfg) = RuntimeConfig::load(Path::new(&cfg_path)) {
+                    #[cfg(feature = "tensorrt")]
+                    {
+                        let prev_use_nn = runtime_config.object_detection.use_nn;
+                        let next_use_nn = new_cfg.object_detection.use_nn;
+                        if prev_use_nn != next_use_nn {
+                            if next_use_nn {
+                                match yolo_detector::YoloDetector::new() {
+                                    Ok(det) => {
+                                        yolo = Some(det);
+                                        eprintln!("orin_bridge: TensorRT YOLO enabled by config reload");
+                                    }
+                                    Err(err) => {
+                                        yolo = None;
+                                        eprintln!("orin_bridge: TensorRT YOLO enable failed: {}", err);
+                                    }
+                                }
+                            } else {
+                                yolo = None;
+                                eprintln!("orin_bridge: TensorRT YOLO disabled by config reload");
+                            }
+                        }
+                    }
                     runtime_config = new_cfg;
                     cfg_last_modified = modified;
                     eprintln!("Runtime config reloaded: {}", cfg_path);
@@ -550,7 +577,8 @@ fn main() -> Result<()> {
         }
 
         #[cfg(feature = "tensorrt")]
-        if let Some(y) = &mut yolo {
+        if runtime_config.object_detection.use_nn {
+            if let Some(y) = &mut yolo {
             let yolo_dets = y.detect(&gray, width, height).unwrap_or_default();
             let conf_threshold = runtime_config
                 .object_detection
@@ -597,6 +625,7 @@ fn main() -> Result<()> {
                         z,
                     });
                 }
+            }
             }
         }
 
