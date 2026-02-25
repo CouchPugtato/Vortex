@@ -626,6 +626,10 @@ fn spawn_camera_pipeline(
                                 }));
                             }
                             Detection::Yolo(yolo_det) => {
+                                let conf_threshold = object_detection_config.confidence_threshold.clamp(0.0, 1.0);
+                                if yolo_det.confidence < conf_threshold {
+                                    continue;
+                                }
                                 let bbox = yolo_det.bbox;
                                 let u_raw = bbox[0] + bbox[2] / 2.0;
                                 let v_raw = bbox[1] + bbox[3] / 2.0;

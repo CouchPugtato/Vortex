@@ -54,14 +54,41 @@ impl YoloDetector {
     #[cfg(feature = "tensorrt")]
     pub fn new() -> Result<Self> {
         use std::ffi::CString;
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
 
-        let engine_path = std::env::var("YOLO_ENGINE")
+        let requested_engine = std::env::var("YOLO_ENGINE")
             .unwrap_or_else(|_| "models/rockpaperscizzors.engine".to_string());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut candidates = vec![
+            PathBuf::from(&requested_engine),
+            cwd.join(&requested_engine),
+            cwd.join("models/rockpaperscizzors.engine"),
+            PathBuf::from("/home/vortex/Vortex/models/rockpaperscizzors.engine"),
+            PathBuf::from("/home/jetson/Vortex/models/rockpaperscizzors.engine"),
+        ];
+        candidates.dedup();
 
-        if !Path::new(&engine_path).exists() {
-            return Err(anyhow!("YOLO engine not found at {}. Build it from the ONNX model first.", engine_path));
-        }
+        let engine_path = candidates
+            .iter()
+            .find(|p| Path::new(p).is_file())
+            .cloned();
+        let engine_path = match engine_path {
+            Some(p) => p,
+            None => {
+                let looked = candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "YOLO engine not found. cwd={} requested={} looked=[{}]",
+                    cwd.display(),
+                    requested_engine,
+                    looked
+                ));
+            }
+        };
+        println!("YOLO engine path: {}", engine_path.display());
 
         let class_names = std::env::var("YOLO_CLASSES")
             .ok()
@@ -87,7 +114,7 @@ impl YoloDetector {
         let mut input_dims = trt::YoloTrtDims { nb_dims: 0, dims: [0; 8] };
         let mut output_dims = trt::YoloTrtDims { nb_dims: 0, dims: [0; 8] };
 
-        let c_path = CString::new(engine_path)?;
+        let c_path = CString::new(engine_path.to_string_lossy().to_string())?;
         let handle = unsafe { trt::yolo_trt_create(c_path.as_ptr(), &mut input_dims, &mut output_dims) };
         if handle.is_null() {
             return Err(anyhow!("Failed to create TensorRT YOLO engine"));

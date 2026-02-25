@@ -313,6 +313,13 @@ function splitMonitorCommand(monitorStartCmd) {
   return { cwd: m[2], tail: m[3] };
 }
 
+function withBridgeEnv(cmdTail, binary) {
+  const tail = String(cmdTail || "").trim();
+  if (binary !== "orin_bridge") return tail;
+  if (/\bYOLO_ENGINE=/.test(tail)) return tail;
+  return `YOLO_ENGINE='models/rockpaperscizzors.engine' ${tail}`;
+}
+
 async function resolveMonitorCommand(conn, settings) {
   const raw = String(settings.monitor_start_cmd || "").trim();
   const { cwd, tail } = splitMonitorCommand(raw);
@@ -320,10 +327,49 @@ async function resolveMonitorCommand(conn, settings) {
   const binaryMatch = invoked.match(/\.\/([^\s]+)/);
   const binaryRelPath = binaryMatch ? binaryMatch[1] : "dumapril-taglocalization";
   const binary = path.posix.basename(binaryRelPath);
-  const likelyTail = tail || raw;
+  const likelyTail = withBridgeEnv(tail || raw, binary);
   const hasBinaryRef = likelyTail.includes(binary);
 
   if (!hasBinaryRef) return raw;
+
+  async function ensureYoloEngineInDir(dir) {
+    if (binary !== "orin_bridge") return;
+    try {
+      const hasEngine = await execCommand(
+        conn,
+        `test -f '${dir}/models/rockpaperscizzors.engine' && echo OK || echo NO`
+      );
+      if (String(hasEngine.stdout || "").includes("OK")) return;
+
+      const hasOnnx = await execCommand(
+        conn,
+        `test -f '${dir}/models/rockpaperscizzors.onnx' && echo OK || echo NO`
+      );
+      if (!String(hasOnnx.stdout || "").includes("OK")) {
+        emitLog("YOLO engine missing and ONNX source not found; object detection disabled.");
+        return;
+      }
+
+      const hasTrtExec = await execCommand(conn, "bash -lc \"command -v trtexec >/dev/null 2>&1 && echo OK || echo NO\"");
+      if (!String(hasTrtExec.stdout || "").includes("OK")) {
+        emitLog("YOLO engine missing and trtexec not found on remote; object detection disabled.");
+        return;
+      }
+
+      const trtLog = `/tmp/vortex_trtexec_${Date.now()}.log`;
+      emitLog("Building TensorRT engine from models/rockpaperscizzors.onnx...");
+      const build = await execCommand(
+        conn,
+        `bash -lc "cd '${dir}' && trtexec --onnx=models/rockpaperscizzors.onnx --saveEngine=models/rockpaperscizzors.engine --fp16 --workspace=2048 > '${trtLog}' 2>&1; code=\\$?; tail -n 120 '${trtLog}'; exit \\$code"`
+      );
+      const out = String((build.stdout || "") + "\n" + (build.stderr || "")).trim();
+      if (out) emitLog(tailForLog(out));
+      if (build.code === 0) emitLog("TensorRT engine created: models/rockpaperscizzors.engine");
+      else emitLog("TensorRT engine build failed; object detection may remain disabled.");
+    } catch (_err) {
+      emitLog("Failed to prepare TensorRT engine automatically.");
+    }
+  }
 
   const derived = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
   const candidates = [
@@ -341,6 +387,7 @@ async function resolveMonitorCommand(conn, settings) {
   for (const dir of candidates) {
     try {
       if (await commandExistsInDir(conn, dir, binaryRelPath)) {
+        await ensureYoloEngineInDir(dir);
         const resolved = `cd '${dir}' && ${likelyTail}`;
         emitLog(`Resolved monitor dir: ${dir}`);
         return resolved;
@@ -352,26 +399,57 @@ async function resolveMonitorCommand(conn, settings) {
 
   async function buildBridgeInDir(dir, cargoCmd = "cargo") {
     const logPath = `/tmp/vortex_orin_bridge_build_${Date.now()}.log`;
-    const first = await execCommand(
-      conn,
-      `bash -lc "cd '${dir}' && ${cargoCmd} build --release --bin orin_bridge > '${logPath}' 2>&1; code=\\$?; tail -n 180 '${logPath}'; exit \\$code"`
-    );
-    if (first.code === 0) return { ok: true, output: first };
+    const variants = [
+      { label: "GPU+TensorRT", features: "gpu,tensorrt" },
+      { label: "TensorRT", features: "tensorrt" },
+      { label: "GPU", features: "gpu" },
+      { label: "CPU", features: "" }
+    ];
 
-    const out1 = String((first.stdout || "") + "\n" + (first.stderr || "")).trim();
-    const lockErr =
-      out1.includes("lock file version 4") ||
-      out1.includes("failed to parse lock file") ||
-      out1.includes("feature `edition2024` is required");
-    if (!lockErr) return { ok: false, output: first };
+    const runBuild = async (features, pre = "") => {
+      const featureArgs = features ? ` --features ${features}` : "";
+      return execCommand(
+        conn,
+        `bash -lc "cd '${dir}' && ${pre}${cargoCmd} build --release --bin orin_bridge${featureArgs} > '${logPath}' 2>&1; code=\\$?; tail -n 180 '${logPath}'; exit \\$code"`
+      );
+    };
 
-    emitLog(`Lockfile incompatible on remote in ${dir}; retrying without Cargo.lock...`);
-    const second = await execCommand(
-      conn,
-      `bash -lc "cd '${dir}' && rm -f Cargo.lock && ${cargoCmd} build --release --bin orin_bridge > '${logPath}' 2>&1; code=\\$?; tail -n 180 '${logPath}'; exit \\$code"`
-    );
-    if (second.code === 0) return { ok: true, output: second };
-    return { ok: false, output: second };
+    const isLockErr = (text) =>
+      text.includes("lock file version 4") ||
+      text.includes("failed to parse lock file") ||
+      text.includes("feature `edition2024` is required");
+
+    let sawLockErr = false;
+    let last = null;
+
+    for (const v of variants) {
+      emitLog(`Trying orin_bridge build variant: ${v.label}${v.features ? ` (${v.features})` : ""}`);
+      const out = await runBuild(v.features);
+      last = out;
+      if (out.code === 0) {
+        emitLog(`Built orin_bridge variant: ${v.label}`);
+        return { ok: true, output: out };
+      }
+      const text = String((out.stdout || "") + "\n" + (out.stderr || "")).trim();
+      sawLockErr = sawLockErr || isLockErr(text);
+      if (text) emitLog(tailForLog(text));
+    }
+
+    if (!sawLockErr) return { ok: false, output: last };
+
+    emitLog(`Lockfile incompatible on remote in ${dir}; retrying build variants without Cargo.lock...`);
+    for (const v of variants) {
+      emitLog(`Retrying orin_bridge build variant: ${v.label}${v.features ? ` (${v.features})` : ""}`);
+      const out = await runBuild(v.features, "rm -f Cargo.lock && ");
+      last = out;
+      if (out.code === 0) {
+        emitLog(`Built orin_bridge variant after lock reset: ${v.label}`);
+        return { ok: true, output: out };
+      }
+      const text = String((out.stdout || "") + "\n" + (out.stderr || "")).trim();
+      if (text) emitLog(tailForLog(text));
+    }
+    return { ok: false, output: last };
   }
 
   async function ensureBridgeBuildDeps() {
@@ -417,10 +495,12 @@ async function resolveMonitorCommand(conn, settings) {
         continue;
       }
       if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
+        await ensureYoloEngineInDir(dir);
         const suffix = likelyTail.includes(binary)
           ? likelyTail.split(binary).slice(1).join(binary)
           : "";
-        const resolved = `cd '${dir}' && ./target/release/${binary}${suffix}`;
+        const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
+        const resolved = `cd '${dir}' && ${cmdTail}`;
         emitLog(`Resolved monitor dir after build: ${dir}`);
         return resolved;
       }
@@ -449,7 +529,8 @@ async function resolveMonitorCommand(conn, settings) {
         runCmd = `./target/release/${binary}${suffix}`;
       }
 
-      const resolved = `cd '${runDir}' && ${runCmd}`;
+      await ensureYoloEngineInDir(runDir);
+      const resolved = `cd '${runDir}' && ${withBridgeEnv(runCmd, binary)}`;
       emitLog(`Resolved monitor dir by scan: ${runDir}`);
       return resolved;
     }
@@ -485,10 +566,12 @@ async function resolveMonitorCommand(conn, settings) {
             continue;
           }
           if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
+            await ensureYoloEngineInDir(dir);
             const suffix = likelyTail.includes(binary)
               ? likelyTail.split(binary).slice(1).join(binary)
               : "";
-            const resolved = `cd '${dir}' && ./target/release/${binary}${suffix}`;
+            const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
+            const resolved = `cd '${dir}' && ${cmdTail}`;
             emitLog(`Resolved monitor dir after auto-install: ${dir}`);
             return resolved;
           }
@@ -540,10 +623,12 @@ async function resolveMonitorCommand(conn, settings) {
             continue;
           }
           if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
+            await ensureYoloEngineInDir(dir);
             const suffix = likelyTail.includes(binary)
               ? likelyTail.split(binary).slice(1).join(binary)
               : "";
-            const resolved = `cd '${dir}' && ./target/release/${binary}${suffix}`;
+            const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
+            const resolved = `cd '${dir}' && ${cmdTail}`;
             emitLog(`Resolved monitor dir after rustup upgrade: ${dir}`);
             return resolved;
           }

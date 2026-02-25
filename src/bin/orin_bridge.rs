@@ -150,7 +150,18 @@ fn main() -> Result<()> {
     let mut cfg_last_check = Instant::now();
     let mut cpu = CpuDetector::new(2)?;
     #[cfg(feature = "tensorrt")]
-    let mut yolo = yolo_detector::YoloDetector::new().ok();
+    let mut yolo = match yolo_detector::YoloDetector::new() {
+        Ok(det) => {
+            eprintln!("orin_bridge: TensorRT YOLO enabled");
+            Some(det)
+        }
+        Err(err) => {
+            eprintln!("orin_bridge: TensorRT YOLO unavailable: {}", err);
+            None
+        }
+    };
+    #[cfg(not(feature = "tensorrt"))]
+    eprintln!("orin_bridge: built without tensorrt feature; object detection disabled");
 
     let mut selected_camera = None;
     let mut selected_dev = None;
@@ -294,8 +305,15 @@ fn main() -> Result<()> {
         #[cfg(feature = "tensorrt")]
         if let Some(y) = &mut yolo {
             let yolo_dets = y.detect(&gray, width, height).unwrap_or_default();
+            let conf_threshold = runtime_config
+                .object_detection
+                .confidence_threshold
+                .clamp(0.0, 1.0);
             for det in yolo_dets {
                 if let Detection::Yolo(o) = det {
+                    if o.confidence < conf_threshold {
+                        continue;
+                    }
                     let bbox = o.bbox;
                     draw_rect(
                         &mut gray,

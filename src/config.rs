@@ -12,6 +12,7 @@ fn default_red_balance() -> f64 { 1200.0 }
 fn default_blue_balance() -> f64 { 1976.0 }
 fn default_yolo_obj_width_m() -> f64 { 0.3 }
 fn default_yolo_obj_height_m() -> f64 { 0.3 }
+fn default_confidence_threshold() -> f64 { 0.25 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CameraConfig {
@@ -65,6 +66,8 @@ pub struct ObjectDetectionConfig {
     pub yolo_obj_width_m: f64,
     #[serde(default = "default_yolo_obj_height_m", alias = "processing_yolo_obj_height_m")]
     pub yolo_obj_height_m: f64,
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -114,6 +117,7 @@ impl Default for ObjectDetectionConfig {
         Self {
             yolo_obj_width_m: 0.3,
             yolo_obj_height_m: 0.3,
+            confidence_threshold: 0.25,
         }
     }
 }

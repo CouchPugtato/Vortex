@@ -133,7 +133,8 @@ function renderRuntimeForm(config) {
   ];
   const orderedObjectDetection = [
     "yolo_obj_width_m",
-    "yolo_obj_height_m"
+    "yolo_obj_height_m",
+    "confidence_threshold"
   ];
 
   const sections = [
@@ -148,11 +149,13 @@ function renderRuntimeForm(config) {
     "processing.red_balance": { type: "range", min: 0, max: 4096, step: 1 },
     "processing.blue_balance": { type: "range", min: 0, max: 4096, step: 1 },
     "object_detection.yolo_obj_width_m": { type: "text" },
-    "object_detection.yolo_obj_height_m": { type: "text" }
+    "object_detection.yolo_obj_height_m": { type: "text" },
+    "object_detection.confidence_threshold": { type: "range", min: 0, max: 1, step: 0.01 }
   };
   const labelMap = {
     "object_detection.yolo_obj_width_m": "obj_width_m",
-    "object_detection.yolo_obj_height_m": "obj_height_m"
+    "object_detection.yolo_obj_height_m": "obj_height_m",
+    "object_detection.confidence_threshold": "confidence_threshold"
   };
 
   for (const section of sections) {
