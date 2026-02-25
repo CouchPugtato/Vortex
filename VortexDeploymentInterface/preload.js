@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld("vortexApi", {
   chooseFolder: () => ipcRenderer.invoke("choose-folder"),
   chooseFile: (opts) => ipcRenderer.invoke("choose-file", opts),
   loadTagMap: (mapPath) => ipcRenderer.invoke("load-tag-map", mapPath),
+  uploadOnnxBuild: (settings, onnxPath) =>
+    ipcRenderer.invoke("upload-onnx-build-engine", settings, onnxPath),
   saveAppConfig: (config) => ipcRenderer.invoke("save-app-config", config),
   loadRuntimeConfig: (runtimePath) => ipcRenderer.invoke("load-runtime-config", runtimePath),
   saveRuntimeConfig: (runtimePath, config) =>
@@ -34,5 +36,6 @@ contextBridge.exposeInMainWorld("vortexApi", {
   onPreviewFrame: makeSubscriber("preview-frame"),
   onBridgeState: makeSubscriber("bridge-state"),
   onDeployProgress: makeSubscriber("deploy-progress"),
-  onMonitorStartProgress: makeSubscriber("monitor-start-progress")
+  onMonitorStartProgress: makeSubscriber("monitor-start-progress"),
+  onOnnxUploadProgress: makeSubscriber("onnx-upload-progress")
 });

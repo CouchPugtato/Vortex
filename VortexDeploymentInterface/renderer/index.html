@@ -21,7 +21,19 @@
           <div class="row">
             <input id="tagMapPath" />
             <button id="browseTagMap">Browse</button>
-            <button id="loadTagMap">Load Map</button>
+            <button id="loadTagMap" class="accent">Load Map</button>
+          </div>
+          <label>ONNX Model</label>
+          <div class="row">
+            <input id="onnxPath" />
+            <button id="browseOnnx">Browse</button>
+            <button id="uploadOnnxBuild" class="accent">Upload & Build</button>
+          </div>
+          <div class="row">
+            <div id="onnxProgressWrap" class="onnx-progress is-hidden">
+              <progress id="onnxProgress" max="100" value="0"></progress>
+              <span id="onnxProgressText">0%</span>
+            </div>
           </div>
           <div id="runtimeForm"></div>
         </section>
@@ -33,7 +45,7 @@
 
       <main class="right-panel">
         <section class="card block">
-          <h2>Pipeline + Camera Feed</h2>
+          <h2>Pipeline & Camera Feed</h2>
           <div class="row wrap status-row">
             <button id="togglePipeline" class="accent">Start Monitor</button>
             <button id="nextCamera">Next Camera</button>

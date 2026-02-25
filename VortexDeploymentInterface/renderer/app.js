@@ -2,6 +2,7 @@ const state = {
   appConfig: null,
   runtimePath: "",
   tagMapPath: "",
+  onnxPath: "",
   tagMap: null,
   robotPose: null,
   hoveredTagId: null,
@@ -19,8 +20,14 @@ const TAG_OVERLAY_STICKY_MS = 450;
 const el = {
   runtimePath: document.querySelector("#runtimePath"),
   tagMapPath: document.querySelector("#tagMapPath"),
+  onnxPath: document.querySelector("#onnxPath"),
   browseTagMap: document.querySelector("#browseTagMap"),
   loadTagMap: document.querySelector("#loadTagMap"),
+  browseOnnx: document.querySelector("#browseOnnx"),
+  uploadOnnxBuild: document.querySelector("#uploadOnnxBuild"),
+  onnxProgressWrap: document.querySelector("#onnxProgressWrap"),
+  onnxProgress: document.querySelector("#onnxProgress"),
+  onnxProgressText: document.querySelector("#onnxProgressText"),
   loadRuntime: document.querySelector("#loadRuntime"),
   saveRuntime: document.querySelector("#saveRuntime"),
   runtimeForm: document.querySelector("#runtimeForm"),
@@ -55,6 +62,7 @@ function appendLog(msg) {
 
 let deployFadeTimer = null;
 let monitorFadeTimer = null;
+let onnxFadeTimer = null;
 let runtimeSyncTimer = null;
 
 function setDeployIndicator(stateKind, text, percent = null) {
@@ -111,10 +119,39 @@ function setMonitorIndicator(stateKind, text, percent = null) {
   }
 }
 
+function setOnnxIndicator(stateKind, text, percent = null) {
+  if (onnxFadeTimer) {
+    clearTimeout(onnxFadeTimer);
+    onnxFadeTimer = null;
+  }
+  const wrap = el.onnxProgressWrap;
+  wrap.classList.remove("is-hidden", "is-done", "is-error");
+
+  if (stateKind === "hidden") {
+    wrap.classList.add("is-hidden");
+    return;
+  }
+  if (stateKind === "done") wrap.classList.add("is-done");
+  if (stateKind === "error") wrap.classList.add("is-error");
+
+  if (typeof percent === "number") {
+    el.onnxProgress.value = Math.max(0, Math.min(100, percent));
+  }
+  if (text) el.onnxProgressText.textContent = text;
+
+  if (stateKind === "done" || stateKind === "error") {
+    onnxFadeTimer = setTimeout(() => {
+      setOnnxIndicator("hidden", "");
+    }, 1600);
+  }
+}
+
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
   state.tagMapPath = String(cfg?.tag_map_path || state.tagMapPath || "");
+  state.onnxPath = String(cfg?.onnx_model_path || state.onnxPath || "");
   if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
+  if (el.onnxPath) el.onnxPath.value = state.onnxPath;
   if (state.selectedCamera == null) {
     state.selectedCamera = 0;
   }
@@ -124,18 +161,22 @@ function readAppConfigFromUI() {
   const cam = Number(state.selectedCamera || 0);
   const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
   const tagMapPath = String(el.tagMapPath?.value || state.tagMapPath || "").trim();
+  const onnxPath = String(el.onnxPath?.value || state.onnxPath || "").trim();
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
-    tag_map_path: tagMapPath
+    tag_map_path: tagMapPath,
+    onnx_model_path: onnxPath
   };
 }
 
 function renderRuntimeForm(config) {
   el.runtimeForm.innerHTML = "";
-  const orderedCamera = [
-    "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3",
-    "tag_size_m", "x_offset", "y_offset", "z_offset", "pitch_deg", "yaw_deg", "roll_deg"
+  const orderedCameraIntrinsics = [
+    "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "tag_size_m"
+  ];
+  const orderedCameraTranslation = [
+    "x_offset", "y_offset", "z_offset", "pitch_deg", "yaw_deg", "roll_deg"
   ];
   const orderedProcessing = [
     "smoothing_alpha",
@@ -151,7 +192,8 @@ function renderRuntimeForm(config) {
   ];
 
   const sections = [
-    { key: "camera", title: "Camera Constants", fields: orderedCamera },
+    { key: "camera", title: "Camera Intrinsics Profile", fields: orderedCameraIntrinsics },
+    { key: "camera", title: "Camera Translation", fields: orderedCameraTranslation },
     { key: "processing", title: "Processing Constants", fields: orderedProcessing },
     { key: "object_detection", title: "Object Detection Constants", fields: orderedObjectDetection }
   ];
@@ -716,7 +758,9 @@ async function init() {
   state.runtimePath = boot.runtimeConfigPath;
   el.runtimePath.value = state.runtimePath;
   state.tagMapPath = String(state.appConfig?.tag_map_path || "");
+  state.onnxPath = String(state.appConfig?.onnx_model_path || "");
   if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
+  if (el.onnxPath) el.onnxPath.value = state.onnxPath;
   state.runtimeConfig = boot.runtimeConfig;
   renderRuntimeForm(state.runtimeConfig);
   await loadTagMapFromPath(state.tagMapPath, { log: false });
@@ -770,6 +814,35 @@ async function init() {
     state.appConfig = { ...state.appConfig, tag_map_path: p };
     await window.vortexApi.saveAppConfig(readAppConfigFromUI());
     await loadTagMapFromPath(p);
+  });
+
+  el.browseOnnx.addEventListener("click", async () => {
+    const picked = await window.vortexApi.chooseFile({
+      filters: [{ name: "ONNX", extensions: ["onnx"] }]
+    });
+    if (!picked) return;
+    el.onnxPath.value = picked;
+    state.onnxPath = picked;
+    state.appConfig = { ...state.appConfig, onnx_model_path: picked };
+    await window.vortexApi.saveAppConfig(readAppConfigFromUI());
+  });
+
+  el.uploadOnnxBuild.addEventListener("click", async () => {
+    const onnx = String(el.onnxPath.value || "").trim();
+    if (!onnx) {
+      appendLog("Select an ONNX file first.");
+      return;
+    }
+    setOnnxIndicator("active", "Starting...", 5);
+    state.onnxPath = onnx;
+    state.appConfig = { ...state.appConfig, onnx_model_path: onnx };
+    await window.vortexApi.saveAppConfig(readAppConfigFromUI());
+    const res = await window.vortexApi.uploadOnnxBuild(readAppConfigFromUI(), onnx);
+    if (!res?.ok) {
+      appendLog(`ONNX upload/build failed: ${res?.error || "unknown error"}`);
+    } else {
+      appendLog(`ONNX upload/build complete: ${res.remoteEngine}`);
+    }
   });
 
   el.deployBtn.addEventListener("click", async () => {
@@ -984,9 +1057,24 @@ async function init() {
       setMonitorIndicator("active", text, percent);
     }
   });
+  window.vortexApi.onOnnxUploadProgress((p) => {
+    const status = String(p?.status || "");
+    const percent = Number(p?.percent || 0);
+    const text = String(p?.text || `${percent}%`);
+    if (status === "done") {
+      setOnnxIndicator("done", text, 100);
+    } else if (status === "error") {
+      setOnnxIndicator("error", text, percent);
+    } else if (status === "hidden") {
+      setOnnxIndicator("hidden", "");
+    } else {
+      setOnnxIndicator("active", text, percent);
+    }
+  });
 
   setDeployIndicator("hidden", "");
   setMonitorIndicator("hidden", "");
+  setOnnxIndicator("hidden", "");
   await refreshRemoteCameras();
   refreshCameraControls();
   renderRobotPose();

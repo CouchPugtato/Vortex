@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, Menu } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
@@ -25,6 +25,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   createWindow();
 
   app.on("activate", () => {
@@ -81,6 +82,10 @@ function emitMonitorStartProgress(progress) {
   const win = getWindow();
   if (win) win.webContents.send("monitor-start-progress", progress);
 }
+function emitOnnxUploadProgress(progress) {
+  const win = getWindow();
+  if (win) win.webContents.send("onnx-upload-progress", progress);
+}
 
 function isDetectionLine(line) {
   const s = String(line || "").trim();
@@ -100,6 +105,7 @@ function defaultAppConfig() {
     remote_path: "/home/jetson/deployments",
     local_path: path.resolve(__dirname, ".."),
     tag_map_path: path.resolve(__dirname, "..", "config", "apriltag_map.json"),
+    onnx_model_path: "",
     monitor_start_cmd: "",
     monitor_stop_cmd: "pkill -f orin_bridge || true",
     startup_service_name: "",
@@ -208,9 +214,9 @@ function sftpMkdir(sftp, remotePath) {
   });
 }
 
-function sftpFastPut(sftp, localPath, remotePath) {
+function sftpFastPut(sftp, localPath, remotePath, options = {}) {
   return new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (err) => {
+    sftp.fastPut(localPath, remotePath, options, (err) => {
       if (err) reject(err);
       else resolve();
     });
@@ -854,6 +860,9 @@ ipcMain.handle("bootstrap", async () => {
     __dirname,
     appCfg.tag_map_path || path.join("..", "config", "apriltag_map.json")
   );
+  if (appCfg.onnx_model_path) {
+    appCfg.onnx_model_path = path.resolve(String(appCfg.onnx_model_path));
+  }
   const runtimeConfigPath = appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH;
   const runtimeConfig = await readJson(runtimeConfigPath, {});
   return { appConfig: appCfg, runtimeConfigPath, runtimeConfig };
@@ -881,6 +890,108 @@ ipcMain.handle("load-tag-map", async (_evt, filePath) => {
   const data = await readJson(mapPath, null);
   if (!data) throw new Error(`Failed to load tag map: ${mapPath}`);
   return data;
+});
+
+ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath) => {
+  const conn = await connectSsh(settings);
+  try {
+    emitOnnxUploadProgress({ status: "starting", percent: 5, text: "Connecting..." });
+    const localPath = path.resolve(String(localOnnxPath || ""));
+    if (!localPath || !fsSync.existsSync(localPath)) {
+      throw new Error(`ONNX file not found: ${localPath}`);
+    }
+    if (path.extname(localPath).toLowerCase() !== ".onnx") {
+      throw new Error("Selected file is not .onnx");
+    }
+
+    const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+    const fileName = path.basename(localPath);
+    const stem = fileName.replace(/\.onnx$/i, "");
+    const remoteModelsDir = `${remoteTarget}/models`;
+    const remoteOnnx = `${remoteModelsDir}/${fileName}`;
+    const remoteEngine = `${remoteModelsDir}/${stem}.engine`;
+    const canonicalOnnx = `${remoteModelsDir}/rockpaperscizzors.onnx`;
+    const canonicalEngine = `${remoteModelsDir}/rockpaperscizzors.engine`;
+
+    const hasProject = await execCommand(conn, `test -d '${remoteTarget}/model_builder' && echo OK || echo NO`);
+    if (!String(hasProject.stdout || "").includes("OK")) {
+      throw new Error(
+        `Remote project not found at ${remoteTarget}. Deploy first so model_builder exists on the target.`
+      );
+    }
+
+    emitLog(`Uploading ONNX: ${fileName}`);
+    await execCommand(conn, `mkdir -p '${remoteModelsDir}'`);
+    const sftp = await getSftp(conn);
+    const localSize = Number(fsSync.statSync(localPath)?.size || 0);
+    let lastPercent = -1;
+    emitOnnxUploadProgress({ status: "uploading", percent: 10, text: "Uploading 0%" });
+    await sftpFastPut(sftp, localPath, remoteOnnx, {
+      step: (transferred, _chunk, total) => {
+        const denom = Number(total) || localSize || 1;
+        const frac = Math.max(0, Math.min(1, Number(transferred || 0) / denom));
+        const stage = Math.round(frac * 100);
+        const percent = 10 + Math.round(frac * 60);
+        if (percent !== lastPercent) {
+          lastPercent = percent;
+          emitOnnxUploadProgress({
+            status: "uploading",
+            percent,
+            text: `Uploading ${stage}%`
+          });
+        }
+      }
+    });
+    if (remoteOnnx !== canonicalOnnx) {
+      await execCommand(conn, `cp '${remoteOnnx}' '${canonicalOnnx}'`);
+      emitLog(`Canonical ONNX updated: ${canonicalOnnx}`);
+    }
+    emitLog(`Remote ONNX: ${remoteOnnx}`);
+
+    const builderBin = `${remoteTarget}/model_builder/build/build_engine`;
+    const hasBuilder = await execCommand(conn, `test -x '${builderBin}' && echo OK || echo NO`);
+    if (!String(hasBuilder.stdout || "").includes("OK")) {
+      emitLog("Building model_builder/build_engine on remote...");
+      emitOnnxUploadProgress({ status: "building", percent: 75, text: "Building model builder..." });
+      const build = await execCommand(
+        conn,
+        `bash -lc "cd '${remoteTarget}/model_builder' && mkdir -p build && cd build && cmake .. && make -j4"`
+      );
+      if (build.code !== 0) {
+        const out = String((build.stdout || "") + "\n" + (build.stderr || "")).trim();
+        if (out) emitLog(tailForLog(out));
+        throw new Error("Failed to build model_builder/build_engine on remote");
+      }
+    }
+
+    emitLog(`Generating engine: ${stem}.engine`);
+    emitOnnxUploadProgress({ status: "building", percent: 85, text: "Generating engine..." });
+    const gen = await execCommand(
+      conn,
+      `bash -lc "cd '${remoteTarget}' && ./model_builder/build/build_engine '${remoteOnnx}' '${remoteEngine}'"`
+    );
+    const genOut = String((gen.stdout || "") + "\n" + (gen.stderr || "")).trim();
+    if (genOut) emitLog(tailForLog(genOut));
+    if (gen.code !== 0) {
+      throw new Error("ONNX -> engine conversion failed");
+    }
+
+    if (remoteEngine !== canonicalEngine) {
+      await execCommand(conn, `cp '${remoteEngine}' '${canonicalEngine}'`);
+      emitLog(`Canonical engine updated: ${canonicalEngine}`);
+    }
+
+    emitLog(`Engine generated: ${remoteEngine}`);
+    emitOnnxUploadProgress({ status: "done", percent: 100, text: "✓ Upload & build complete" });
+    return { ok: true, remoteOnnx, remoteEngine, canonicalOnnx, canonicalEngine };
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitLog(`ONNX upload/build failed: ${msg}`);
+    emitOnnxUploadProgress({ status: "error", percent: 0, text: "✕ Upload/build failed" });
+    return { ok: false, error: msg };
+  } finally {
+    conn.end();
+  }
 });
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
