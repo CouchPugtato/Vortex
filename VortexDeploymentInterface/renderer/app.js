@@ -1,6 +1,10 @@
 const state = {
   appConfig: null,
   runtimePath: "",
+  tagMapPath: "",
+  tagMap: null,
+  robotPose: null,
+  hoveredTagId: null,
   runtimeConfig: {},
   cameras: new Map(),
   remoteCameras: [],
@@ -14,6 +18,9 @@ const TAG_OVERLAY_STICKY_MS = 450;
 
 const el = {
   runtimePath: document.querySelector("#runtimePath"),
+  tagMapPath: document.querySelector("#tagMapPath"),
+  browseTagMap: document.querySelector("#browseTagMap"),
+  loadTagMap: document.querySelector("#loadTagMap"),
   loadRuntime: document.querySelector("#loadRuntime"),
   saveRuntime: document.querySelector("#saveRuntime"),
   runtimeForm: document.querySelector("#runtimeForm"),
@@ -35,7 +42,9 @@ const el = {
   previewStatus: document.querySelector("#previewStatus"),
   previewImage: document.querySelector("#previewImage"),
   previewOverlay: document.querySelector("#previewOverlay"),
-  logs: document.querySelector("#logs")
+  logs: document.querySelector("#logs"),
+  robotPoseText: document.querySelector("#robotPoseText"),
+  fieldMapCanvas: document.querySelector("#fieldMapCanvas")
 };
 
 function appendLog(msg) {
@@ -104,6 +113,8 @@ function setMonitorIndicator(stateKind, text, percent = null) {
 
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
+  state.tagMapPath = String(cfg?.tag_map_path || state.tagMapPath || "");
+  if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
   if (state.selectedCamera == null) {
     state.selectedCamera = 0;
   }
@@ -112,9 +123,11 @@ function hydrateAppConfig(cfg) {
 function readAppConfigFromUI() {
   const cam = Number(state.selectedCamera || 0);
   const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  const tagMapPath = String(el.tagMapPath?.value || state.tagMapPath || "").trim();
   return {
     ...state.appConfig,
-    preview_camera_index: normalizedCam
+    preview_camera_index: normalizedCam,
+    tag_map_path: tagMapPath
   };
 }
 
@@ -305,6 +318,179 @@ function previewSourceDims() {
   return { w: 1920, h: 1080 };
 }
 
+function normalizeTagMap(raw) {
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+  const outTags = [];
+  for (const t of tags) {
+    const id = Number(t?.ID ?? t?.id);
+    const tx = Number(t?.pose?.translation?.x);
+    const ty = Number(t?.pose?.translation?.y);
+    const tz = Number(t?.pose?.translation?.z);
+    if (!Number.isFinite(id) || !Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+    outTags.push({ id, x: tx, y: ty, z: Number.isFinite(tz) ? tz : 0 });
+  }
+  const length = Number(raw?.field?.length);
+  const width = Number(raw?.field?.width);
+  return {
+    tags: outTags,
+    field: {
+      length: Number.isFinite(length) ? length : 16.541,
+      width: Number.isFinite(width) ? width : 8.069
+    }
+  };
+}
+
+async function loadTagMapFromPath(mapPath, { log = true } = {}) {
+  const p = String(mapPath || "").trim();
+  if (!p) return;
+  try {
+    const raw = await window.vortexApi.loadTagMap(p);
+    state.tagMap = normalizeTagMap(raw);
+    if (log) appendLog(`Loaded tag map: ${p}`);
+  } catch (err) {
+    if (log) appendLog(`Tag map load failed: ${err.message}`);
+  }
+  drawFieldMap();
+}
+
+function drawFieldMap() {
+  const canvas = el.fieldMapCanvas;
+  if (!canvas) return;
+  const mapForSize = state.tagMap;
+  const fieldLength = Number(mapForSize?.field?.length) || 16.541;
+  const fieldWidth = Number(mapForSize?.field?.width) || 8.069;
+  const ratio = Math.max(0.25, Math.min(1.2, fieldWidth / Math.max(1e-6, fieldLength)));
+  const targetHeight = Math.round(
+    Math.max(220, Math.min(360, (canvas.clientWidth || 640) * ratio + 28))
+  );
+  canvas.style.height = `${targetHeight}px`;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const map = state.tagMap;
+  if (!map || !map.field) {
+    ctx.fillStyle = "#9a9a9a";
+    ctx.font = "13px Segoe UI";
+    ctx.fillText("No AprilTag map loaded.", 10, 20);
+    return;
+  }
+
+  const tags = [...(map.tags || [])].sort((a, b) => a.id - b.id);
+  const margin = 12;
+  const usableW = Math.max(1, rect.width - margin * 2);
+  const usableH = Math.max(1, rect.height - margin * 2);
+  const sx = usableW / Math.max(1e-6, map.field.length);
+  const sy = usableH / Math.max(1e-6, map.field.width);
+  const s = Math.min(sx, sy);
+  const fieldW = map.field.length * s;
+  const fieldH = map.field.width * s;
+  const ox = margin + (usableW - fieldW) * 0.5;
+  const oy = (rect.height - fieldH) * 0.5;
+  const toPx = (x, y) => [ox + x * s, oy + (map.field.width - y) * s];
+
+  ctx.strokeStyle = "#4a4a4a";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(ox, oy, fieldW, fieldH);
+
+  // draw numbered circles exactly at each tag's true field position
+  const baseR = 8;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const hoveredId = Number(state.hoveredTagId);
+  const drawTag = (t, isHover) => {
+    const [x, y] = toPx(t.x, t.y);
+    const r = isHover ? baseR + 7 : baseR;
+    ctx.fillStyle = "#151515";
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = isHover ? "#ffffff" : "#d8d8d8";
+    ctx.lineWidth = isHover ? 2 : 1.4;
+    ctx.stroke();
+    ctx.fillStyle = "#f3f3f3";
+    ctx.font = isHover ? "bold 12px Segoe UI" : "9px Segoe UI";
+    ctx.fillText(String(t.id), x, y + 0.5);
+  };
+  for (const t of tags) {
+    if (Number(t.id) === hoveredId) continue;
+    drawTag(t, false);
+  }
+  const hovered = tags.find((t) => Number(t.id) === hoveredId);
+  if (hovered) {
+    drawTag(hovered, true);
+  }
+
+  if (state.robotPose && Number.isFinite(state.robotPose.x) && Number.isFinite(state.robotPose.y)) {
+    const [rx, ry] = toPx(state.robotPose.x, state.robotPose.y);
+    ctx.fillStyle = "#39d353";
+    ctx.beginPath();
+    ctx.arc(rx, ry, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#39d353";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(rx - 7, ry - 7, 14, 14);
+  }
+}
+
+function updateHoveredTagFromPointer(evt) {
+  const canvas = el.fieldMapCanvas;
+  const map = state.tagMap;
+  if (!canvas || !map || !Array.isArray(map.tags)) {
+    state.hoveredTagId = null;
+    drawFieldMap();
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) {
+    state.hoveredTagId = null;
+    return;
+  }
+
+  const mx = evt.clientX - rect.left;
+  const my = evt.clientY - rect.top;
+  const fieldLength = Number(map?.field?.length) || 16.541;
+  const fieldWidth = Number(map?.field?.width) || 8.069;
+  const margin = 12;
+  const usableW = Math.max(1, rect.width - margin * 2);
+  const usableH = Math.max(1, rect.height - margin * 2);
+  const sx = usableW / Math.max(1e-6, fieldLength);
+  const sy = usableH / Math.max(1e-6, fieldWidth);
+  const s = Math.min(sx, sy);
+  const fieldW = fieldLength * s;
+  const fieldH = fieldWidth * s;
+  const ox = margin + (usableW - fieldW) * 0.5;
+  const oy = (rect.height - fieldH) * 0.5;
+  const toPx = (x, y) => [ox + x * s, oy + (fieldWidth - y) * s];
+
+  let nearestId = null;
+  let nearestD2 = Infinity;
+  for (const t of map.tags) {
+    const tx = Number(t?.x);
+    const ty = Number(t?.y);
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+    const [px, py] = toPx(tx, ty);
+    const dx = px - mx;
+    const dy = py - my;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < nearestD2) {
+      nearestD2 = d2;
+      nearestId = t.id;
+    }
+  }
+  const hoverThresholdPx = 34;
+  const nextHover = nearestD2 <= hoverThresholdPx * hoverThresholdPx ? nearestId : null;
+  if (nextHover !== state.hoveredTagId) {
+    state.hoveredTagId = nextHover;
+    drawFieldMap();
+  }
+}
+
 function parseBBoxPart(bboxText, idx) {
   const m = String(bboxText).match(/\[([^\]]+)\]/);
   if (!m) return NaN;
@@ -345,13 +531,24 @@ function parseMonitorLine(line) {
   if (!state.cameras.has(activeCamera)) return;
   const current = state.cameras.get(activeCamera);
 
-  const tag = line.match(/Tag ID:\s*(\d+)\s*\|\s*Dist:\s*([\d.-]+)m\s*\|\s*X:\s*([\d.-]+)m\s*\|\s*Y:\s*([\d.-]+)m/);
-  if (tag) {
+  const tagLegacy = line.match(/Tag ID:\s*(\d+)\s*\|\s*Dist:\s*([\d.-]+)m\s*\|\s*X:\s*([\d.-]+)m\s*\|\s*Y:\s*([\d.-]+)m/);
+  if (tagLegacy) {
     current.apriltags.push({
-      id: Number(tag[1]),
-      dist: Number(tag[2]),
-      x: Number(tag[3]),
-      y: Number(tag[4])
+      id: Number(tagLegacy[1]),
+      dist: Number(tagLegacy[2]),
+      x: Number(tagLegacy[3]),
+      y: Number(tagLegacy[4])
+    });
+    return;
+  }
+
+  const tagField = line.match(/Tag ID:\s*(\d+)\s*\|\s*Field X:\s*([\d.-]+)m\s*\|\s*Field Y:\s*([\d.-]+)m\s*\|\s*FloorErr:\s*([\d.-]+)m/);
+  if (tagField) {
+    current.apriltags.push({
+      id: Number(tagField[1]),
+      dist: Number(tagField[4]),
+      x: Number(tagField[2]),
+      y: Number(tagField[3])
     });
     return;
   }
@@ -385,7 +582,7 @@ function renderDetectionTable() {
   el.fps.textContent = `FPS: ${data.fps != null ? data.fps.toFixed(2) : "-"}`;
   const mode = el.viewMode.value;
   if (mode === "apriltag") {
-    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Distance (m)</th><th>X (m)</th><th>Y (m)</th><th>Seen / sec</th></tr>";
+    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Field X (m)</th><th>Field Y (m)</th><th>Floor Err (m)</th><th>Seen / sec</th></tr>";
     const fpsValue = Number.isFinite(data.fps) && data.fps > 0 ? data.fps : 1;
     const windowSize = Math.max(1, Math.round(fpsValue));
     const recentFrames = (data.tagFrameHistory || []).slice(-windowSize);
@@ -405,10 +602,10 @@ function renderDetectionTable() {
         const seenPct = (seenCount / Math.max(1, recentFrames.length)) * 100;
         totalSeenPerSec += seenPerSec;
         const last = data.lastTagById?.get(id);
-        const dist = Number.isFinite(last?.dist) ? last.dist.toFixed(2) : "-";
+        const dist = Number.isFinite(last?.dist) ? last.dist.toFixed(3) : "-";
         const x = Number.isFinite(last?.x) ? last.x.toFixed(2) : "-";
         const y = Number.isFinite(last?.y) ? last.y.toFixed(2) : "-";
-        return `<tr><td>${id}</td><td>${dist}</td><td>${x}</td><td>${y}</td><td>${seenPerSec.toFixed(2)} (${seenPct.toFixed(0)}%)</td></tr>`;
+        return `<tr><td>${id}</td><td>${x}</td><td>${y}</td><td>${dist}</td><td>${seenPerSec.toFixed(2)} (${seenPct.toFixed(0)}%)</td></tr>`;
       });
       const avgSeenPerSec = totalSeenPerSec / ids.length;
       const avgSeenPct = (avgSeenPerSec / Math.max(1e-6, fpsValue)) * 100;
@@ -422,7 +619,22 @@ function renderDetectionTable() {
       .join("") || "<tr><td colspan='6'>No objects</td></tr>";
   }
   drawOverlay();
+  renderRobotPose();
   refreshCameraControls();
+}
+
+function renderRobotPose() {
+  if (!el.robotPoseText) return;
+  const p = state.robotPose;
+  if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+    el.robotPoseText.textContent = "Robot Pose:";
+    drawFieldMap();
+    return;
+  }
+  const tags = Number(p.tags_used || 0);
+  const zErr = Number.isFinite(p.floor_z_error_avg) ? p.floor_z_error_avg : 0;
+  el.robotPoseText.textContent = `Robot Pose: x=${p.x.toFixed(2)} m, y=${p.y.toFixed(2)} m | tags=${tags} | floor z err=${zErr.toFixed(3)} m`;
+  drawFieldMap();
 }
 
 function drawOverlay() {
@@ -503,8 +715,11 @@ async function init() {
   hydrateAppConfig(boot.appConfig);
   state.runtimePath = boot.runtimeConfigPath;
   el.runtimePath.value = state.runtimePath;
+  state.tagMapPath = String(state.appConfig?.tag_map_path || "");
+  if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
   state.runtimeConfig = boot.runtimeConfig;
   renderRuntimeForm(state.runtimeConfig);
+  await loadTagMapFromPath(state.tagMapPath, { log: false });
 
   if (state.appConfig.monitor_start_cmd === "") {
     const applied = await window.vortexApi.applyMonitorPreset(readAppConfigFromUI(), "main_cam_0");
@@ -535,6 +750,26 @@ async function init() {
       }
     }
     appendLog(`Saved runtime config: ${state.runtimePath}`);
+  });
+
+  el.browseTagMap.addEventListener("click", async () => {
+    const picked = await window.vortexApi.chooseFile({
+      filters: [{ name: "JSON", extensions: ["json"] }]
+    });
+    if (!picked) return;
+    el.tagMapPath.value = picked;
+    state.tagMapPath = picked;
+    state.appConfig = { ...state.appConfig, tag_map_path: picked };
+    await window.vortexApi.saveAppConfig(readAppConfigFromUI());
+    await loadTagMapFromPath(picked);
+  });
+
+  el.loadTagMap.addEventListener("click", async () => {
+    const p = String(el.tagMapPath.value || "").trim();
+    state.tagMapPath = p;
+    state.appConfig = { ...state.appConfig, tag_map_path: p };
+    await window.vortexApi.saveAppConfig(readAppConfigFromUI());
+    await loadTagMapFromPath(p);
   });
 
   el.deployBtn.addEventListener("click", async () => {
@@ -672,7 +907,7 @@ async function init() {
     if (Array.isArray(bridge?.apriltags)) {
       row.apriltags = bridge.apriltags.map((t) => ({
         id: Number(t?.id),
-        dist: Number(t?.z ?? 0),
+        dist: Number(t?.floor_z_error ?? t?.z ?? 0),
         x: Number(t?.x ?? 0),
         y: Number(t?.y ?? 0),
         corners: Array.isArray(t?.corners) ? t.corners : []
@@ -703,6 +938,19 @@ async function init() {
         bboxWidth: Number(Array.isArray(o?.bbox) ? o.bbox[2] : 0),
         bboxHeight: Number(Array.isArray(o?.bbox) ? o.bbox[3] : 0)
       }));
+    }
+    if (bridge?.robot_pose && Number.isFinite(Number(bridge.robot_pose.x)) && Number.isFinite(Number(bridge.robot_pose.y))) {
+      state.robotPose = {
+        x: Number(bridge.robot_pose.x),
+        y: Number(bridge.robot_pose.y),
+        tags_used: Number(bridge.robot_pose.tags_used || 0),
+        floor_z_error_avg: Number(bridge.robot_pose.floor_z_error_avg || 0)
+      };
+    } else {
+      state.robotPose = null;
+    }
+    if (!state.tagMap && Number.isFinite(Number(bridge?.field?.length)) && Number.isFinite(Number(bridge?.field?.width))) {
+      state.tagMap = { tags: [], field: { length: Number(bridge.field.length), width: Number(bridge.field.width) } };
     }
     if (state.selectedCamera == null) state.selectedCamera = cam;
     renderDetectionTable();
@@ -741,9 +989,22 @@ async function init() {
   setMonitorIndicator("hidden", "");
   await refreshRemoteCameras();
   refreshCameraControls();
+  renderRobotPose();
+  if (el.fieldMapCanvas) {
+    el.fieldMapCanvas.addEventListener("mousemove", updateHoveredTagFromPointer);
+    el.fieldMapCanvas.addEventListener("mouseleave", () => {
+      if (state.hoveredTagId != null) {
+        state.hoveredTagId = null;
+        drawFieldMap();
+      }
+    });
+  }
 
   el.previewImage.onload = () => drawOverlay();
-  window.addEventListener("resize", drawOverlay);
+  window.addEventListener("resize", () => {
+    drawOverlay();
+    drawFieldMap();
+  });
 }
 
 init().catch((err) => appendLog(`Bootstrap failed: ${err.message}`));

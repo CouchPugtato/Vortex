@@ -8,7 +8,7 @@ mod pose;
 mod yolo_detector;
 
 use nalgebra as _;
-use nalgebra::{Vector3, Rotation3};
+use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use v4l::video::Capture;
 use v4l::io::traits::CaptureStream;
 use v4l::capability::Flags;
 use turbojpeg::{Decompressor, Compressor, Image, PixelFormat, Subsamp};
+use serde::Deserialize;
 
 use crate::config::{CameraConfig, ObjectDetectionConfig, ProcessingConfig, RuntimeConfig};
 use crate::detector::Detection;
@@ -38,6 +39,7 @@ pub struct AprilTagPose {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    pub floor_z_error: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,54 @@ struct PipelineStats {
     camera_index: usize,
     detections: ProcessedDetections,
     timestamp: Instant,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMap {
+    tags: Vec<TagMapTag>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMapTag {
+    #[serde(rename = "ID", alias = "id")]
+    id: usize,
+    pose: TagMapPose,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMapPose {
+    translation: TagMapTranslation,
+    rotation: TagMapRotation,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMapTranslation {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMapRotation {
+    quaternion: TagMapQuaternion,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TagMapQuaternion {
+    #[serde(rename = "W", alias = "w")]
+    w: f64,
+    #[serde(rename = "X", alias = "x")]
+    x: f64,
+    #[serde(rename = "Y", alias = "y")]
+    y: f64,
+    #[serde(rename = "Z", alias = "z")]
+    z: f64,
+}
+
+#[derive(Clone, Debug)]
+struct FieldTagPose {
+    pos: Vector3<f64>,
+    rot_field_from_tag: Matrix3<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,6 +161,16 @@ fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Config load failed"));
         }
     };
+    let tag_map_path = resolve_tag_map_path();
+    let tag_map_by_id = tag_map_path
+        .as_ref()
+        .map(|p| load_tag_map(p.as_path()))
+        .unwrap_or_default();
+    if let Some(p) = &tag_map_path {
+        println!("Loaded {} field tags from {}", tag_map_by_id.len(), p.display());
+    } else {
+        println!("No apriltag_map.json found in known locations; running without field map.");
+    }
 
     // dynamic thread allocation
     // Jetson Orin Nano has 6 CPU cores.
@@ -145,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             runtime_config.camera,
             runtime_config.processing,
             runtime_config.object_detection,
+            tag_map_by_id.clone(),
         );
     }
 
@@ -152,6 +213,7 @@ fn main() -> anyhow::Result<()> {
     let mut cam_stats: HashMap<usize, (u64, Instant)> = HashMap::new(); // (frame_count, last_report)
     let mut cam_fps: HashMap<usize, f64> = HashMap::new();
     let mut cam_detections: HashMap<usize, Vec<ProcessedDetection>> = HashMap::new();
+    let mut filtered_robot_xy: HashMap<usize, (f64, f64)> = HashMap::new();
     
     // simple exponential smoothing for pose
     // store last known pose for each tag id per camera
@@ -191,6 +253,7 @@ fn main() -> anyhow::Result<()> {
                             x: s_x,
                             y: s_y,
                             z: s_z,
+                            floor_z_error: apr.floor_z_error,
                         }));
                     }
                     ProcessedDetection::Yolo(yolo) => {
@@ -233,11 +296,15 @@ fn main() -> anyhow::Result<()> {
                             detections.len()
                         );
                         println!("  - Counts: AprilTag={} YOLO={}", tag_count, yolo_count);
+                        let mut field_candidates: Vec<(f64, f64, f64, f64)> = Vec::new();
                         for det in detections {
                             match det {
                                 ProcessedDetection::AprilTag(a) => {
-                                    println!("  - Tag ID: {} | Dist: {:.2}m | X: {:.2}m | Y: {:.2}m", 
-                                        a.id, a.z, a.x, a.y);
+                                    field_candidates.push((a.x, a.y, a.floor_z_error, a.z.abs()));
+                                    println!(
+                                        "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m",
+                                        a.id, a.x, a.y, a.floor_z_error
+                                    );
                                 }
                                 ProcessedDetection::Yolo(y) => {
                                     println!(
@@ -255,6 +322,34 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        if let Some((raw_x, raw_y, used, avg_z_err)) = robust_fuse_field_pose(&field_candidates) {
+                            const MAX_STEP_M: f64 = 0.60;
+                            const SMOOTH_ALPHA: f64 = 0.18;
+                            let prev = filtered_robot_xy.get(&idx).copied();
+                            let (sx, sy) = if let Some((px, py)) = prev {
+                                let mut tx = raw_x;
+                                let mut ty = raw_y;
+                                let dx = tx - px;
+                                let dy = ty - py;
+                                let dist = dx.hypot(dy);
+                                if dist > MAX_STEP_M {
+                                    let scale = MAX_STEP_M / dist;
+                                    tx = px + dx * scale;
+                                    ty = py + dy * scale;
+                                }
+                                (
+                                    px + SMOOTH_ALPHA * (tx - px),
+                                    py + SMOOTH_ALPHA * (ty - py),
+                                )
+                            } else {
+                                (raw_x, raw_y)
+                            };
+                            filtered_robot_xy.insert(idx, (sx, sy));
+                            println!(
+                                "  - Robot Pose Avg | Field X: {:.2}m | Field Y: {:.2}m | Tags: {} | FloorErr: {:.3}m",
+                                sx, sy, used, avg_z_err
+                            );
+                        }
                     }
                 }
             }
@@ -269,6 +364,7 @@ fn spawn_camera_pipeline(
     camera_config: CameraConfig,
     processing_config: ProcessingConfig,
     object_detection_config: ObjectDetectionConfig,
+    tag_map_by_id: HashMap<usize, FieldTagPose>,
 ) {
     println!("Spawning pipeline for Camera {}...", camera_index);
 
@@ -486,7 +582,8 @@ fn spawn_camera_pipeline(
         let mut saved_debug_frame = false;
 
         loop {
-            if let Ok((pixels, width, height)) = rx_decode.recv() {
+            if let Ok((mut pixels, width, height)) = rx_decode.recv() {
+                apply_processing(&mut pixels, &processing_config);
                 if !saved_debug_frame {
                     match Compressor::new() {
                         Ok(mut compressor) => {
@@ -523,13 +620,21 @@ fn spawn_camera_pipeline(
 
                     #[cfg(feature = "gpu")]
                     {
-                        let scale_factor = processing_config.resolution_scale_factor;
-                        if let Ok(d) = gpu_detector::GpuDetector::new(width, height, &camera_config, scale_factor) {
-                            println!("Initialized GPU Detector for Camera {} (Scale: {})", camera_index, scale_factor);
-                            detectors.push(DetectorWrapper::Gpu(d));
-                            tag_initialized = true;
+                        let gpu_enabled = std::env::var("VORTEX_MAIN_GPU")
+                            .ok()
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if gpu_enabled {
+                            let scale_factor = processing_config.resolution_scale_factor;
+                            if let Ok(d) = gpu_detector::GpuDetector::new(width, height, &camera_config, scale_factor) {
+                                println!("Initialized GPU Detector for Camera {} (Scale: {})", camera_index, scale_factor);
+                                detectors.push(DetectorWrapper::Gpu(d));
+                                tag_initialized = true;
+                            } else {
+                                eprintln!("Error building GPU detector for cam {}: Falling back to CPU.", camera_index);
+                            }
                         } else {
-                            eprintln!("Error building GPU detector for cam {}: Falling back to CPU.", camera_index);
+                            eprintln!("GPU detector disabled for main pipeline (set VORTEX_MAIN_GPU=1 to enable). Using CPU.");
                         }
                     }
 
@@ -576,11 +681,13 @@ fn spawn_camera_pipeline(
                     for det in raw_dets {
                         match det {
                             Detection::AprilTag(apr_det) => {
+                                // Normalize corner order for pose solver: TL, BL, BR, TR
+                                let c = apr_det.corners;
                                 let corners_raw = [
-                                    (apr_det.corners[0][0], apr_det.corners[0][1]),
-                                    (apr_det.corners[1][0], apr_det.corners[1][1]),
-                                    (apr_det.corners[2][0], apr_det.corners[2][1]),
-                                    (apr_det.corners[3][0], apr_det.corners[3][1]),
+                                    (c[3][0], c[3][1]),
+                                    (c[0][0], c[0][1]),
+                                    (c[1][0], c[1][1]),
+                                    (c[2][0], c[2][1]),
                                 ];
 
                                 let corners = if needs_undistort {
@@ -590,13 +697,23 @@ fn spawn_camera_pipeline(
                                 };
 
                                 let tag_size = effective_config.tag_size_m;
-
-                                let (x, y, z) = if let Some(pose) = pose::estimate_pose(
+                                let (x, y, z, floor_z_error) = if let Some(pose) = pose::estimate_pose(
                                     &corners,
                                     tag_size,
                                     effective_config.fx, effective_config.fy, effective_config.cx, effective_config.cy
                                 ) {
-                                    (pose.translation.x, pose.translation.y, pose.translation.z)
+                                    if let Some(tag_field) = tag_map_by_id.get(&apr_det.id) {
+                                        let (p_field_robot, z_err) =
+                                            estimate_robot_field_from_tag(&pose, tag_field, &effective_config);
+                                        (p_field_robot.x, p_field_robot.y, 0.0, z_err)
+                                    } else {
+                                        // fallback: map missing this tag -> keep robot-frame estimate
+                                        let p_robot = transform_camera_to_robot(
+                                            pose.translation,
+                                            &effective_config
+                                        );
+                                        (p_robot.x, p_robot.y, p_robot.z, 0.0)
+                                    }
                                 } else {
                                     // fallback to simple estimation
                                     let side_len_px = (
@@ -611,18 +728,16 @@ fn spawn_camera_pipeline(
                                     let center_y = (corners[0].1 + corners[2].1) / 2.0;
                                     let x = (center_x - effective_config.cx) * z / effective_config.fx;
                                     let y = (center_y - effective_config.cy) * z / effective_config.fy;
-                                    (x, y, z)
+                                    let p_robot = transform_camera_to_robot(Vector3::new(x, y, z), &effective_config);
+                                    (p_robot.x, p_robot.y, p_robot.z, 0.0)
                                 };
-
-                                let p_robot = transform_camera_to_robot(Vector3::new(x, y, z), &effective_config);
-
-                                let (x, y, z) = (p_robot.x, p_robot.y, p_robot.z);
 
                                 processed_detections.push(ProcessedDetection::AprilTag(AprilTagPose {
                                     id: apr_det.id,
                                     x,
                                     y,
                                     z,
+                                    floor_z_error,
                                 }));
                             }
                             Detection::Yolo(yolo_det) => {
@@ -696,6 +811,165 @@ fn transform_camera_to_robot(p_cam: Vector3<f64>, config: &CameraConfig) -> Vect
     let r_roll = Rotation3::from_axis_angle(&Vector3::z_axis(), config.roll_deg.to_radians());
     let rotation = r_yaw * r_pitch * r_roll;
     rotation * p_cam + Vector3::new(config.x_offset, config.y_offset, config.z_offset)
+}
+
+fn camera_to_robot_rotation(config: &CameraConfig) -> Matrix3<f64> {
+    let r_yaw = Rotation3::from_axis_angle(&Vector3::y_axis(), config.yaw_deg.to_radians());
+    let r_pitch = Rotation3::from_axis_angle(&Vector3::x_axis(), config.pitch_deg.to_radians());
+    let r_roll = Rotation3::from_axis_angle(&Vector3::z_axis(), config.roll_deg.to_radians());
+    (r_yaw * r_pitch * r_roll).into_inner()
+}
+
+fn estimate_robot_field_from_tag(
+    pose: &pose::Pose,
+    tag_field: &FieldTagPose,
+    camera_cfg: &CameraConfig,
+) -> (Vector3<f64>, f64) {
+    // pose is tag->camera.
+    let r_ct = pose.rotation;
+    let r_tc = r_ct.transpose();
+    let p_tc = -r_tc * pose.translation;
+    let p_fc = tag_field.pos + tag_field.rot_field_from_tag * p_tc;
+    let r_fc = tag_field.rot_field_from_tag * r_tc;
+
+    let r_rc = camera_to_robot_rotation(camera_cfg);
+    let r_cr = r_rc.transpose();
+    let cam_offset_robot = Vector3::new(camera_cfg.x_offset, camera_cfg.y_offset, camera_cfg.z_offset);
+    let robot_origin_in_camera = -r_cr * cam_offset_robot;
+    let p_fr = p_fc + r_fc * robot_origin_in_camera;
+    let floor_z_error = p_fr.z.abs();
+    (p_fr, floor_z_error)
+}
+
+fn load_tag_map(path: &Path) -> HashMap<usize, FieldTagPose> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let parsed: TagMap = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for tag in parsed.tags {
+        let q = UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+            tag.pose.rotation.quaternion.w,
+            tag.pose.rotation.quaternion.x,
+            tag.pose.rotation.quaternion.y,
+            tag.pose.rotation.quaternion.z,
+        ));
+        out.insert(
+            tag.id,
+            FieldTagPose {
+                pos: Vector3::new(
+                    tag.pose.translation.x,
+                    tag.pose.translation.y,
+                    tag.pose.translation.z,
+                ),
+                // Match bridge behavior for current tag-map convention.
+                rot_field_from_tag: q.to_rotation_matrix().into_inner().transpose(),
+            },
+        );
+    }
+    out
+}
+
+fn resolve_tag_map_path() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = env::var("VORTEX_TAG_MAP") {
+        if !p.trim().is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    candidates.push(PathBuf::from("config/apriltag_map.json"));
+    candidates.push(PathBuf::from("../config/apriltag_map.json"));
+    candidates.push(PathBuf::from("/home/vortex/deployments/Vortex/config/apriltag_map.json"));
+    candidates.push(PathBuf::from("/home/jetson/deployments/Vortex/config/apriltag_map.json"));
+
+    candidates
+        .into_iter()
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+}
+
+fn robust_fuse_field_pose(candidates: &[(f64, f64, f64, f64)]) -> Option<(f64, f64, usize, f64)> {
+    // (x, y, floor_z_error, cam_depth)
+    const MAX_FLOOR_ERR_M: f64 = 3.0;
+    const HUBER_DELTA_M: f64 = 0.35;
+
+    let finite: Vec<(f64, f64, f64, f64)> = candidates
+        .iter()
+        .copied()
+        .filter(|(x, y, z_err, d)| x.is_finite() && y.is_finite() && z_err.is_finite() && d.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return None;
+    }
+
+    let mut kept: Vec<(f64, f64, f64, f64)> = finite
+        .iter()
+        .copied()
+        .filter(|(_, _, z_err, _)| *z_err <= MAX_FLOOR_ERR_M)
+        .collect();
+    if kept.is_empty() {
+        kept = finite;
+    }
+
+    let mut weights = Vec::with_capacity(kept.len());
+    for (_x, _y, z_err, depth) in &kept {
+        let z_w = 1.0 / (1.0 + 4.0 * z_err.max(0.0));
+        let d_w = 1.0 / (0.3 + depth.abs().max(0.05));
+        weights.push((z_w * d_w).max(1e-6));
+    }
+
+    let weighted_mean = |ws: &[f64]| -> (f64, f64) {
+        let mut sx = 0.0;
+        let mut sy = 0.0;
+        let mut sw = 0.0;
+        for (i, (x, y, _z, _d)) in kept.iter().enumerate() {
+            let w = ws[i];
+            sx += x * w;
+            sy += y * w;
+            sw += w;
+        }
+        if sw <= 1e-9 {
+            (0.0, 0.0)
+        } else {
+            (sx / sw, sy / sw)
+        }
+    };
+
+    let (mut cx, mut cy) = weighted_mean(&weights);
+    for _ in 0..2 {
+        let mut huber_weights = Vec::with_capacity(kept.len());
+        for (i, (x, y, _z, _d)) in kept.iter().enumerate() {
+            let r = ((*x - cx).hypot(*y - cy)).max(1e-9);
+            let huber = if r <= HUBER_DELTA_M { 1.0 } else { HUBER_DELTA_M / r };
+            huber_weights.push(weights[i] * huber);
+        }
+        let (nx, ny) = weighted_mean(&huber_weights);
+        cx = nx;
+        cy = ny;
+    }
+
+    let avg_z = kept.iter().map(|v| v.2).sum::<f64>() / kept.len() as f64;
+    Some((cx, cy, kept.len(), avg_z))
+}
+
+fn apply_processing(gray: &mut [u8], cfg: &ProcessingConfig) {
+    let gain = cfg.sensor_gain.max(0.01);
+    let black_offset = cfg.black_level_offset;
+    // approximate color balance as a luminance gain term for grayscale
+    let wb_gain = ((cfg.red_balance.max(0.0) + cfg.blue_balance.max(0.0)) * 0.5 / 1600.0)
+        .clamp(0.25, 4.0);
+    let total_gain = gain * wb_gain;
+
+    for p in gray.iter_mut() {
+        let mut v = (*p as f64) / 255.0;
+        v *= total_gain;
+        v += black_offset / 255.0;
+        v = v.clamp(0.0, 1.0);
+        *p = (v * 255.0).clamp(0.0, 255.0) as u8;
+    }
 }
 
 fn resize_gray_nearest(

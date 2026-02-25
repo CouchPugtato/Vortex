@@ -310,8 +310,8 @@ button:focus {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-width: 220px;
-  max-width: 260px;
+  min-width: 280px;
+  max-width: 360px;
   height: 24px;
   overflow: hidden;
   opacity: 1;
@@ -322,8 +322,8 @@ button:focus {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-width: 220px;
-  max-width: 260px;
+  min-width: 280px;
+  max-width: 360px;
   height: 24px;
   overflow: hidden;
   opacity: 1;
@@ -331,9 +331,14 @@ button:focus {
 }
 
 progress {
-  width: 160px;
+  width: 170px;
   height: 10px;
   accent-color: var(--accent);
+}
+
+#monitorProgressText,
+#deployProgressText {
+  white-space: nowrap;
 }
 
 .deploy-progress.is-hidden {
@@ -450,6 +455,21 @@ thead {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+#robotPoseText {
+  font-size: 0.85rem;
+  color: #d4d4d4;
+  margin-bottom: 8px;
+}
+
+#fieldMapCanvas {
+  width: 100%;
+  height: 280px;
+  display: block;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  background: #101010;
 }
 
 @media (max-width: 1180px) {

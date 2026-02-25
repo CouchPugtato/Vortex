@@ -12,13 +12,13 @@
     "tag_size_m": 0.16,
     "x_offset": 0,
     "y_offset": 0,
-    "z_offset": 0,
+    "z_offset": 0.4572,
     "pitch_deg": 0,
     "yaw_deg": 0,
     "roll_deg": 0
   },
   "processing": {
-    "smoothing_alpha": 0.27,
+    "smoothing_alpha": 0.33,
     "black_level_offset": 12,
     "sensor_gain": 0.63,
     "red_balance": 3910,
@@ -27,6 +27,6 @@
   "object_detection": {
     "yolo_obj_width_m": 0.3,
     "yolo_obj_height_m": 0.3,
-    "confidence_threshold": 0.74
+    "confidence_threshold": 0.89
   }
 }

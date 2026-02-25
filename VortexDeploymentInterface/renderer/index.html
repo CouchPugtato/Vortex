@@ -17,7 +17,17 @@
             <button id="loadRuntime">Load</button>
             <button id="saveRuntime" class="accent wide-btn">Save Config</button>
           </div>
+          <label>AprilTag Map</label>
+          <div class="row">
+            <input id="tagMapPath" />
+            <button id="browseTagMap">Browse</button>
+            <button id="loadTagMap">Load Map</button>
+          </div>
           <div id="runtimeForm"></div>
+        </section>
+        <section class="card block">
+          <h2>Logs</h2>
+          <pre id="logs"></pre>
         </section>
       </section>
 
@@ -64,9 +74,11 @@
         </section>
 
         <section class="card block">
-          <h2>Logs</h2>
-          <pre id="logs"></pre>
+          <h2>Field Estimate</h2>
+          <div id="robotPoseText">Robot Pose: -</div>
+          <canvas id="fieldMapCanvas"></canvas>
         </section>
+
       </main>
     </div>
 

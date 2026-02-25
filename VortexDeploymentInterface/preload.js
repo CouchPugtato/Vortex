@@ -11,6 +11,8 @@ function makeSubscriber(channel) {
 contextBridge.exposeInMainWorld("vortexApi", {
   bootstrap: () => ipcRenderer.invoke("bootstrap"),
   chooseFolder: () => ipcRenderer.invoke("choose-folder"),
+  chooseFile: (opts) => ipcRenderer.invoke("choose-file", opts),
+  loadTagMap: (mapPath) => ipcRenderer.invoke("load-tag-map", mapPath),
   saveAppConfig: (config) => ipcRenderer.invoke("save-app-config", config),
   loadRuntimeConfig: (runtimePath) => ipcRenderer.invoke("load-runtime-config", runtimePath),
   saveRuntimeConfig: (runtimePath, config) =>

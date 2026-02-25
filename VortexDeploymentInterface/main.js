@@ -99,6 +99,7 @@ function defaultAppConfig() {
     pass: "",
     remote_path: "/home/jetson/deployments",
     local_path: path.resolve(__dirname, ".."),
+    tag_map_path: path.resolve(__dirname, "..", "config", "apriltag_map.json"),
     monitor_start_cmd: "",
     monitor_stop_cmd: "pkill -f orin_bridge || true",
     startup_service_name: "",
@@ -316,8 +317,10 @@ function splitMonitorCommand(monitorStartCmd) {
 function withBridgeEnv(cmdTail, binary) {
   const tail = String(cmdTail || "").trim();
   if (binary !== "orin_bridge") return tail;
-  if (/\bYOLO_ENGINE=/.test(tail)) return tail;
-  return `YOLO_ENGINE='models/rockpaperscizzors.engine' ${tail}`;
+  const envParts = [];
+  if (!/\bYOLO_ENGINE=/.test(tail)) envParts.push(`YOLO_ENGINE='models/rockpaperscizzors.engine'`);
+  if (envParts.length === 0) return tail;
+  return `${envParts.join(" ")} ${tail}`;
 }
 
 async function resolveMonitorCommand(conn, settings) {
@@ -659,6 +662,7 @@ const monitorManager = {
     try {
       emitMonitorStartProgress({ status: "starting", percent: 10, text: "Connecting..." });
       this.conn = await connectSsh(settings);
+      await syncTagMapRemote(this.conn, settings);
 
       if (settings.startup_service_name) {
         emitMonitorStartProgress({ status: "starting", percent: 20, text: "Stopping service..." });
@@ -754,6 +758,38 @@ const monitorManager = {
   }
 };
 
+async function syncTagMapRemote(conn, settings) {
+  try {
+    const localPath = path.resolve(String(settings.tag_map_path || ""));
+    if (!localPath || !fsSync.existsSync(localPath)) {
+      emitLog("Tag map not found locally; using remote/default map path if present.");
+      return { ok: false, reason: "missing-local-map" };
+    }
+    const sftp = await getSftp(conn);
+    const targets = [
+      inferRemoteDeployFolder(settings.remote_path, settings.local_path),
+      settings.remote_path,
+      `/home/${settings.user}/deployments/Vortex`
+    ]
+      .map((p) => String(p || "").replace(/\/+$/, ""))
+      .filter(Boolean)
+      .filter((v, i, arr) => arr.indexOf(v) === i);
+    let wrote = 0;
+    for (const t of targets) {
+      const remotePath = `${t}/config/apriltag_map.json`;
+      const remoteParent = path.posix.dirname(remotePath);
+      await execCommand(conn, `mkdir -p '${remoteParent}'`);
+      await sftpFastPut(sftp, localPath, remotePath);
+      emitLog(`Tag map synced to remote: ${remotePath}`);
+      wrote += 1;
+    }
+    return { ok: wrote > 0, remotePath: `${targets[0]}/config/apriltag_map.json` };
+  } catch (err) {
+    emitLog(`Tag map sync failed: ${err?.message || String(err)}`);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 const previewManager = {
   running: false,
   async start(settings) {
@@ -814,6 +850,10 @@ ipcMain.handle("bootstrap", async () => {
   const appCfg = { ...defaultAppConfig(), ...(await readJson(APP_CONFIG_PATH, {})) };
   delete appCfg.preview_camera_index;
   appCfg.local_path = path.resolve(__dirname, appCfg.local_path || "..");
+  appCfg.tag_map_path = path.resolve(
+    __dirname,
+    appCfg.tag_map_path || path.join("..", "config", "apriltag_map.json")
+  );
   const runtimeConfigPath = appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH;
   const runtimeConfig = await readJson(runtimeConfigPath, {});
   return { appConfig: appCfg, runtimeConfigPath, runtimeConfig };
@@ -825,6 +865,22 @@ ipcMain.handle("choose-folder", async () => {
   });
   if (result.canceled || !result.filePaths[0]) return null;
   return result.filePaths[0];
+});
+
+ipcMain.handle("choose-file", async (_evt, opts) => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openFile"],
+    filters: Array.isArray(opts?.filters) ? opts.filters : undefined
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle("load-tag-map", async (_evt, filePath) => {
+  const mapPath = path.resolve(String(filePath || ""));
+  const data = await readJson(mapPath, null);
+  if (!data) throw new Error(`Failed to load tag map: ${mapPath}`);
+  return data;
 });
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
