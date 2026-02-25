@@ -19,6 +19,9 @@ const TAG_OVERLAY_STICKY_MS = 450;
 
 const el = {
   runtimePath: document.querySelector("#runtimePath"),
+  jetsonWatts: document.querySelector("#jetsonWatts"),
+  jetsonWattsValue: document.querySelector("#jetsonWattsValue"),
+  applyJetsonWatts: document.querySelector("#applyJetsonWatts"),
   tagMapPath: document.querySelector("#tagMapPath"),
   onnxPath: document.querySelector("#onnxPath"),
   browseTagMap: document.querySelector("#browseTagMap"),
@@ -32,9 +35,13 @@ const el = {
   saveRuntime: document.querySelector("#saveRuntime"),
   runtimeForm: document.querySelector("#runtimeForm"),
   deployBtn: document.querySelector("#deployBtn"),
+  buildMainBtn: document.querySelector("#buildMainBtn"),
   deployProgressWrap: document.querySelector("#deployProgressWrap"),
   deployProgress: document.querySelector("#deployProgress"),
   deployProgressText: document.querySelector("#deployProgressText"),
+  buildProgressWrap: document.querySelector("#buildProgressWrap"),
+  buildProgress: document.querySelector("#buildProgress"),
+  buildProgressText: document.querySelector("#buildProgressText"),
   monitorProgressWrap: document.querySelector("#monitorProgressWrap"),
   monitorProgress: document.querySelector("#monitorProgress"),
   monitorProgressText: document.querySelector("#monitorProgressText"),
@@ -63,6 +70,7 @@ function appendLog(msg) {
 let deployFadeTimer = null;
 let monitorFadeTimer = null;
 let onnxFadeTimer = null;
+let buildFadeTimer = null;
 let runtimeSyncTimer = null;
 
 function setDeployIndicator(stateKind, text, percent = null) {
@@ -146,6 +154,33 @@ function setOnnxIndicator(stateKind, text, percent = null) {
   }
 }
 
+function setBuildIndicator(stateKind, text, percent = null) {
+  if (buildFadeTimer) {
+    clearTimeout(buildFadeTimer);
+    buildFadeTimer = null;
+  }
+  const wrap = el.buildProgressWrap;
+  wrap.classList.remove("is-hidden", "is-done", "is-error");
+
+  if (stateKind === "hidden") {
+    wrap.classList.add("is-hidden");
+    return;
+  }
+  if (stateKind === "done") wrap.classList.add("is-done");
+  if (stateKind === "error") wrap.classList.add("is-error");
+
+  if (typeof percent === "number") {
+    el.buildProgress.value = Math.max(0, Math.min(100, percent));
+  }
+  if (text) el.buildProgressText.textContent = text;
+
+  if (stateKind === "done" || stateKind === "error") {
+    buildFadeTimer = setTimeout(() => {
+      setBuildIndicator("hidden", "");
+    }, 1800);
+  }
+}
+
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
   state.tagMapPath = String(cfg?.tag_map_path || state.tagMapPath || "");
@@ -155,6 +190,12 @@ function hydrateAppConfig(cfg) {
   if (state.selectedCamera == null) {
     state.selectedCamera = 0;
   }
+  if (el.jetsonWatts && el.jetsonWattsValue) {
+    const watts = Number(cfg?.jetson_max_watts);
+    const clamped = Number.isFinite(watts) ? Math.max(5, Math.min(60, Math.round(watts))) : 15;
+    el.jetsonWatts.value = String(clamped);
+    el.jetsonWattsValue.textContent = `${clamped}W`;
+  }
 }
 
 function readAppConfigFromUI() {
@@ -162,11 +203,14 @@ function readAppConfigFromUI() {
   const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
   const tagMapPath = String(el.tagMapPath?.value || state.tagMapPath || "").trim();
   const onnxPath = String(el.onnxPath?.value || state.onnxPath || "").trim();
+  const wattsRaw = Number(el.jetsonWatts?.value ?? state.appConfig?.jetson_max_watts ?? 15);
+  const jetsonWatts = Number.isFinite(wattsRaw) ? Math.max(5, Math.min(60, Math.round(wattsRaw))) : 15;
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
     tag_map_path: tagMapPath,
-    onnx_model_path: onnxPath
+    onnx_model_path: onnxPath,
+    jetson_max_watts: jetsonWatts
   };
 }
 
@@ -279,24 +323,36 @@ function renderRuntimeForm(config) {
 }
 
 function readRuntimeConfigFromForm() {
-  const result = { camera: {}, processing: {}, object_detection: {} };
+  const formResult = { camera: {}, processing: {}, object_detection: {} };
   const inputs = el.runtimeForm.querySelectorAll("input");
   for (const input of inputs) {
     const section = input.dataset.section;
     const key = input.dataset.key;
     if (input.type === "checkbox") {
-      result[section][key] = input.checked;
+      formResult[section][key] = input.checked;
       continue;
     }
     const raw = input.value.trim();
     if (input.type !== "range" && (raw.toLowerCase() === "true" || raw.toLowerCase() === "false")) {
-      result[section][key] = raw.toLowerCase() === "true";
+      formResult[section][key] = raw.toLowerCase() === "true";
       continue;
     }
     const num = Number(raw);
-    result[section][key] = Number.isFinite(num) && raw !== "" ? num : raw;
+    formResult[section][key] = Number.isFinite(num) && raw !== "" ? num : raw;
   }
-  return result;
+  const merged = JSON.parse(JSON.stringify(state.runtimeConfig || {}));
+  if (!merged.camera_profiles || typeof merged.camera_profiles !== "object") {
+    merged.camera_profiles = {};
+  }
+  const cam = Number(state.selectedCamera);
+  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  merged.camera_profiles[String(profileId)] = formResult.camera;
+  if (!merged.camera || typeof merged.camera !== "object" || profileId === 0) {
+    merged.camera = formResult.camera;
+  }
+  merged.processing = formResult.processing;
+  merged.object_detection = formResult.object_detection;
+  return merged;
 }
 
 function scheduleLiveRuntimeSync() {
@@ -337,6 +393,39 @@ function getCameraCandidates() {
 function refreshCameraControls() {
   const cams = getCameraCandidates();
   el.nextCamera.disabled = !state.pipelineRunning || cams.length < 2;
+}
+
+function cloneCameraConfig(camera) {
+  return JSON.parse(JSON.stringify(camera || {}));
+}
+
+function ensureCameraProfilesForIds(ids) {
+  if (!state.runtimeConfig || typeof state.runtimeConfig !== "object") return;
+  if (!state.runtimeConfig.camera || typeof state.runtimeConfig.camera !== "object") {
+    state.runtimeConfig.camera = {};
+  }
+  if (!state.runtimeConfig.camera_profiles || typeof state.runtimeConfig.camera_profiles !== "object") {
+    state.runtimeConfig.camera_profiles = {};
+  }
+  for (const id of ids) {
+    const key = String(id);
+    if (!state.runtimeConfig.camera_profiles[key] || typeof state.runtimeConfig.camera_profiles[key] !== "object") {
+      state.runtimeConfig.camera_profiles[key] = cloneCameraConfig(state.runtimeConfig.camera);
+    }
+  }
+}
+
+function renderRuntimeFormForCurrentCamera() {
+  const ids = [0, 1, 2, 3, 4, 5];
+  ensureCameraProfilesForIds(ids);
+  const cam = Number(state.selectedCamera);
+  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  const cfg = JSON.parse(JSON.stringify(state.runtimeConfig || {}));
+  const profile = cfg?.camera_profiles?.[String(profileId)];
+  if (profile && typeof profile === "object") {
+    cfg.camera = cloneCameraConfig(profile);
+  }
+  renderRuntimeForm(cfg);
 }
 
 async function refreshRemoteCameras() {
@@ -765,7 +854,7 @@ async function init() {
   if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
   if (el.onnxPath) el.onnxPath.value = state.onnxPath;
   state.runtimeConfig = boot.runtimeConfig;
-  renderRuntimeForm(state.runtimeConfig);
+  renderRuntimeFormForCurrentCamera();
   await loadTagMapFromPath(state.tagMapPath, { log: false });
 
   if (state.appConfig.monitor_start_cmd === "") {
@@ -779,7 +868,7 @@ async function init() {
     state.runtimePath = el.runtimePath.value.trim();
     try {
       state.runtimeConfig = await window.vortexApi.loadRuntimeConfig(state.runtimePath);
-      renderRuntimeForm(state.runtimeConfig);
+      renderRuntimeFormForCurrentCamera();
       appendLog(`Loaded runtime config: ${state.runtimePath}`);
     } catch (err) {
       appendLog(`Load failed: ${err.message}`);
@@ -797,6 +886,30 @@ async function init() {
       }
     }
     appendLog(`Saved runtime config: ${state.runtimePath}`);
+  });
+
+  el.jetsonWatts.addEventListener("input", async () => {
+    const v = Math.max(5, Math.min(60, Math.round(Number(el.jetsonWatts.value) || 15)));
+    el.jetsonWatts.value = String(v);
+    el.jetsonWattsValue.textContent = `${v}W`;
+    state.appConfig = { ...state.appConfig, jetson_max_watts: v };
+    await window.vortexApi.saveAppConfig(readAppConfigFromUI()).catch(() => {});
+  });
+
+  el.applyJetsonWatts.addEventListener("click", async () => {
+    const v = Math.max(5, Math.min(60, Math.round(Number(el.jetsonWatts.value) || 15)));
+    el.jetsonWatts.value = String(v);
+    el.jetsonWattsValue.textContent = `${v}W`;
+    state.appConfig = { ...state.appConfig, jetson_max_watts: v };
+    const cfg = readAppConfigFromUI();
+    await window.vortexApi.saveAppConfig(cfg).catch(() => {});
+    const res = await window.vortexApi.setJetsonPowerLimit(cfg, v);
+    if (!res?.ok) {
+      appendLog(`Power apply failed: ${res?.error || "unknown error"}`);
+    } else {
+      appendLog(`Power mode applied: request ${v}W -> mode ${res.modeId} (${res.modeWatts}W)`);
+      if (res.rebootRequired) appendLog("Jetson reported reboot required for this power mode change.");
+    }
   });
 
   el.browseTagMap.addEventListener("click", async () => {
@@ -858,6 +971,18 @@ async function init() {
     appendLog("Deploy started.");
   });
 
+  el.buildMainBtn.addEventListener("click", async () => {
+    const cfg = readAppConfigFromUI();
+    setBuildIndicator("active", "[0/0] Queued...", 0);
+    const res = await window.vortexApi.buildMainStart(cfg);
+    if (!res?.ok) {
+      setBuildIndicator("error", "✕ Build start failed", 0);
+      appendLog(`Build start failed: ${res?.error || "unknown error"}`);
+    } else {
+      appendLog("Main build started.");
+    }
+  });
+
   el.togglePipeline.addEventListener("click", async () => {
     let cfg = readAppConfigFromUI();
     if (!state.pipelineRunning) {
@@ -904,9 +1029,11 @@ async function init() {
       refreshCameraControls();
       return;
     }
+    state.runtimeConfig = readRuntimeConfigFromForm();
     const current = Number(state.selectedCamera);
     const idx = cams.indexOf(current);
     state.selectedCamera = cams[(idx + 1 + cams.length) % cams.length];
+    renderRuntimeFormForCurrentCamera();
     await window.vortexApi.saveAppConfig(state.appConfig).catch(() => {});
     if (state.pipelineRunning) {
       try {
@@ -1028,7 +1155,10 @@ async function init() {
     if (!state.tagMap && Number.isFinite(Number(bridge?.field?.length)) && Number.isFinite(Number(bridge?.field?.width))) {
       state.tagMap = { tags: [], field: { length: Number(bridge.field.length), width: Number(bridge.field.width) } };
     }
-    if (state.selectedCamera == null) state.selectedCamera = cam;
+    if (state.selectedCamera == null) {
+      state.selectedCamera = cam;
+      renderRuntimeFormForCurrentCamera();
+    }
     renderDetectionTable();
     drawOverlay();
   });
@@ -1074,10 +1204,25 @@ async function init() {
       setOnnxIndicator("active", text, percent);
     }
   });
+  window.vortexApi.onMainBuildProgress((p) => {
+    const status = String(p?.status || "");
+    const percent = Number(p?.percent || 0);
+    const text = String(p?.text || `${percent}%`);
+    if (status === "done") {
+      setBuildIndicator("done", text, 100);
+    } else if (status === "error") {
+      setBuildIndicator("error", text, percent);
+    } else if (status === "hidden") {
+      setBuildIndicator("hidden", "");
+    } else {
+      setBuildIndicator("active", text, percent);
+    }
+  });
 
   setDeployIndicator("hidden", "");
   setMonitorIndicator("hidden", "");
   setOnnxIndicator("hidden", "");
+  setBuildIndicator("hidden", "");
   await refreshRemoteCameras();
   refreshCameraControls();
   renderRobotPose();

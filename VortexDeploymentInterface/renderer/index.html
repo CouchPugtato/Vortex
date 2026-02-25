@@ -17,6 +17,12 @@
             <button id="loadRuntime">Load</button>
             <button id="saveRuntime" class="accent wide-btn">Save Config</button>
           </div>
+          <label>Jetson Power Limit (W)</label>
+          <div class="row">
+            <input id="jetsonWatts" type="range" min="5" max="60" step="1" />
+            <span id="jetsonWattsValue" class="pill">15W</span>
+            <button id="applyJetsonWatts" class="accent">Apply</button>
+          </div>
           <label>AprilTag Map</label>
           <div class="row">
             <input id="tagMapPath" />
@@ -50,6 +56,7 @@
             <button id="togglePipeline" class="accent">Start Monitor</button>
             <button id="nextCamera">Next Camera</button>
             <button id="deployBtn">Deploy</button>
+            <button id="buildMainBtn">Build Main</button>
           </div>
           <div class="row wrap progress-row">
             <div id="monitorProgressWrap" class="monitor-progress is-hidden">
@@ -59,6 +66,10 @@
             <div id="deployProgressWrap" class="deploy-progress is-hidden">
               <progress id="deployProgress" max="100" value="0"></progress>
               <span id="deployProgressText">0%</span>
+            </div>
+            <div id="buildProgressWrap" class="build-progress is-hidden">
+              <progress id="buildProgress" max="100" value="0"></progress>
+              <span id="buildProgressText">0%</span>
             </div>
           </div>
           <div class="row wrap">

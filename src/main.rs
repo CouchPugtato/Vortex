@@ -202,7 +202,7 @@ fn main() -> anyhow::Result<()> {
             idx,
             threads_per_cam,
             tx_stats.clone(),
-            runtime_config.camera,
+            runtime_config.camera_for_index(idx),
             runtime_config.processing,
             runtime_config.object_detection,
             tag_map_by_id.clone(),

@@ -191,6 +191,21 @@ button:focus {
   font-size: 0.85rem;
 }
 
+#jetsonWatts {
+  margin-top: 0;
+  flex: 1 1 auto;
+}
+
+#jetsonWattsValue {
+  min-width: 58px;
+  text-align: center;
+}
+
+#applyJetsonWatts {
+  min-width: 84px;
+  white-space: nowrap;
+}
+
 #runtimeForm .slider-input {
   appearance: none;
   -webkit-appearance: none;
@@ -340,6 +355,18 @@ button:focus {
   transition: opacity 420ms ease, max-width 420ms ease, height 220ms ease;
 }
 
+.build-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 280px;
+  max-width: 420px;
+  height: 24px;
+  overflow: hidden;
+  opacity: 1;
+  transition: opacity 420ms ease, max-width 420ms ease, height 220ms ease;
+}
+
 .onnx-progress {
   display: inline-flex;
   align-items: center;
@@ -360,7 +387,8 @@ progress {
 
 #monitorProgressText,
 #deployProgressText,
-#onnxProgressText {
+#onnxProgressText,
+#buildProgressText {
   white-space: nowrap;
 }
 
@@ -373,6 +401,14 @@ progress {
 }
 
 .monitor-progress.is-hidden {
+  opacity: 0;
+  max-width: 0;
+  min-width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.build-progress.is-hidden {
   opacity: 0;
   max-width: 0;
   min-width: 0;
@@ -396,6 +432,10 @@ progress {
   display: none;
 }
 
+.build-progress.is-done #buildProgress {
+  display: none;
+}
+
 .onnx-progress.is-done #onnxProgress {
   display: none;
 }
@@ -406,6 +446,11 @@ progress {
 }
 
 .monitor-progress.is-done #monitorProgressText {
+  color: #ff8d8d;
+  font-weight: 700;
+}
+
+.build-progress.is-done #buildProgressText {
   color: #ff8d8d;
   font-weight: 700;
 }
@@ -421,6 +466,11 @@ progress {
 }
 
 .monitor-progress.is-error #monitorProgressText {
+  color: #ff7f7f;
+  font-weight: 700;
+}
+
+.build-progress.is-error #buildProgressText {
   color: #ff7f7f;
   font-weight: 700;
 }

@@ -12,5 +12,6 @@
   "startup_service_name": "",
   "preview_remote_path": "/tmp/vortex_bridge_frame.jpg",
   "preview_state_path": "/tmp/vortex_bridge_state.json",
-  "preview_capture_cmd": ""
+  "preview_capture_cmd": "",
+  "jetson_max_watts": 35
 }

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::BufReader;
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -73,9 +74,11 @@ pub struct ObjectDetectionConfig {
     pub confidence_threshold: f64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub camera_profiles: HashMap<String, CameraConfig>,
     #[serde(default)]
     pub processing: ProcessingConfig,
     #[serde(default)]
@@ -99,6 +102,14 @@ impl RuntimeConfig {
             }
         }
         Ok(config)
+    }
+
+    pub fn camera_for_index(&self, camera_index: usize) -> CameraConfig {
+        let key = camera_index.to_string();
+        self.camera_profiles
+            .get(&key)
+            .copied()
+            .unwrap_or(self.camera)
     }
 }
 

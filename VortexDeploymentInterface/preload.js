@@ -21,7 +21,10 @@ contextBridge.exposeInMainWorld("vortexApi", {
     ipcRenderer.invoke("save-runtime-config", runtimePath, config),
   syncRuntimeConfigRemote: (settings, config) =>
     ipcRenderer.invoke("sync-runtime-config-remote", settings, config),
+  setJetsonPowerLimit: (settings, watts) =>
+    ipcRenderer.invoke("set-jetson-power-limit", settings, watts),
   deployStart: (settings) => ipcRenderer.invoke("deploy-start", settings),
+  buildMainStart: (settings) => ipcRenderer.invoke("build-main-start", settings),
   monitorStart: (settings) => ipcRenderer.invoke("monitor-start", settings),
   monitorStop: () => ipcRenderer.invoke("monitor-stop"),
   previewStart: (settings) => ipcRenderer.invoke("preview-start", settings),
@@ -37,5 +40,6 @@ contextBridge.exposeInMainWorld("vortexApi", {
   onBridgeState: makeSubscriber("bridge-state"),
   onDeployProgress: makeSubscriber("deploy-progress"),
   onMonitorStartProgress: makeSubscriber("monitor-start-progress"),
-  onOnnxUploadProgress: makeSubscriber("onnx-upload-progress")
+  onOnnxUploadProgress: makeSubscriber("onnx-upload-progress"),
+  onMainBuildProgress: makeSubscriber("main-build-progress")
 });

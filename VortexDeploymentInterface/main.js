@@ -86,6 +86,10 @@ function emitOnnxUploadProgress(progress) {
   const win = getWindow();
   if (win) win.webContents.send("onnx-upload-progress", progress);
 }
+function emitMainBuildProgress(progress) {
+  const win = getWindow();
+  if (win) win.webContents.send("main-build-progress", progress);
+}
 
 function isDetectionLine(line) {
   const s = String(line || "").trim();
@@ -111,7 +115,8 @@ function defaultAppConfig() {
     startup_service_name: "",
     preview_remote_path: "/tmp/vortex_preview.jpg",
     preview_state_path: "/tmp/vortex_bridge_state.json",
-    preview_capture_cmd: ""
+    preview_capture_cmd: "",
+    jetson_max_watts: 15
   };
 }
 
@@ -160,6 +165,147 @@ function tailForLog(text, limit = 6000) {
   if (!t) return "";
   if (t.length <= limit) return t;
   return `...[output truncated, showing last ${limit} chars]\n${t.slice(-limit)}`;
+}
+
+function stripAnsi(text) {
+  return String(text || "").replace(/\x1B\[[0-9;]*[A-Za-z]/g, "");
+}
+
+function parseNvpmodelModes(configText) {
+  const text = String(configText || "");
+  const byId = new Map();
+  const blockRe = /<\s*POWER_MODEL\b([^>]*)>([\s\S]*?)<\/\s*POWER_MODEL\s*>/gi;
+  let m = null;
+  while ((m = blockRe.exec(text)) != null) {
+    const attrs = String(m[1] || "");
+    const body = String(m[2] || "");
+    const id = Number((attrs.match(/\bID\s*=\s*([0-9]+)/i) || [])[1]);
+    if (!Number.isFinite(id)) continue;
+    const name = String((attrs.match(/\bNAME\s*=\s*("[^"]+"|'[^']+'|[^\s>]+)/i) || [])[1] || `MODE_${id}`)
+      .replace(/['"]/g, "");
+    let watts = Number((body.match(/\bPOWER_BUDGET\s+([0-9]+(?:\.[0-9]+)?)/i) || [])[1]);
+    if (Number.isFinite(watts) && watts > 200) watts /= 1000.0;
+    if (!Number.isFinite(watts)) {
+      const w = name.match(/([0-9]+(?:\.[0-9]+)?)\s*W/i);
+      if (w) watts = Number(w[1]);
+    }
+    if (!Number.isFinite(watts) && /MAXN/i.test(name)) watts = 999;
+    byId.set(id, { id, watts, name });
+  }
+
+  // fallback parser for nontagged style
+  const lineRe = /POWER_MODEL[^\n\r]*\bID\s*=\s*([0-9]+)[^\n\r]*/gi;
+  const lineMatches = [];
+  let lm = null;
+  while ((lm = lineRe.exec(text)) != null) {
+    lineMatches.push({
+      id: Number(lm[1]),
+      line: String(lm[0] || ""),
+      index: Number(lm.index),
+      end: Number(lineRe.lastIndex)
+    });
+  }
+  for (let i = 0; i < lineMatches.length; i += 1) {
+    const cur = lineMatches[i];
+    const id = cur.id;
+    if (!Number.isFinite(id)) continue;
+    const nameMatch = cur.line.match(/\bNAME\s*=\s*("[^"]+"|'[^']+'|[^\s>]+)/i);
+    const name = nameMatch ? String(nameMatch[1]).replace(/['"]/g, "") : `MODE_${id}`;
+    const start = cur.end;
+    const end = i + 1 < lineMatches.length ? lineMatches[i + 1].index : text.length;
+    const section = text.slice(start, end);
+    let watts = Number((section.match(/\bPOWER_BUDGET\s+([0-9]+(?:\.[0-9]+)?)/i) || [])[1]);
+    if (Number.isFinite(watts) && watts > 200) watts /= 1000.0;
+    if (!Number.isFinite(watts)) {
+      const w = name.match(/([0-9]+(?:\.[0-9]+)?)\s*W/i);
+      if (w) watts = Number(w[1]);
+    }
+    if (!Number.isFinite(watts) && /MAXN/i.test(name)) watts = 999;
+    if (!byId.has(id)) byId.set(id, { id, watts, name });
+  }
+
+  const modes = [...byId.values()];
+  modes.sort((a, b) => {
+    const aw = Number.isFinite(a.watts) ? a.watts : -1;
+    const bw = Number.isFinite(b.watts) ? b.watts : -1;
+    return aw - bw || a.id - b.id;
+  });
+  return modes;
+}
+
+function parseNvpmodelModesFromQuery(queryText) {
+  const text = String(queryText || "");
+  const byId = new Map();
+  const re = /\bID\s*[:=]\s*([0-9]+)[^\n\r]*\bNAME\s*[:=]\s*([^\n\r]+)/gi;
+  let m = null;
+  while ((m = re.exec(text)) != null) {
+    const id = Number(m[1]);
+    if (!Number.isFinite(id)) continue;
+    const name = String(m[2] || "").replace(/[<>"']/g, "").trim() || `MODE_${id}`;
+    let watts = NaN;
+    const w = name.match(/([0-9]+(?:\.[0-9]+)?)\s*W/i);
+    if (w) watts = Number(w[1]);
+    if (!Number.isFinite(watts) && /MAXN/i.test(name)) watts = 999;
+    byId.set(id, { id, watts, name });
+  }
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+async function setJetsonPowerLimit(settings, requestedWatts) {
+  const conn = await connectSsh(settings);
+  try {
+    const req = Number(requestedWatts);
+    if (!Number.isFinite(req) || req <= 0) throw new Error(`Invalid wattage: ${requestedWatts}`);
+
+    const cfgPathRes = await execCommand(
+      conn,
+      "bash -lc \"for f in /etc/nvpmodel.conf /etc/nvpmodel/*.conf /etc/nvpmodel_*.conf; do [ -f \\\"$f\\\" ] && echo \\\"$f\\\"; done | head -n 1\""
+    );
+    const cfgPath = String(cfgPathRes.stdout || "").trim() || "/etc/nvpmodel.conf";
+    const cfg = await execCommand(conn, `bash -lc "cat '${cfgPath}' 2>/dev/null || true"`);
+    let modes = parseNvpmodelModes(cfg.stdout || "");
+    if (modes.length === 0) {
+      const q = await execCommand(conn, "bash -lc \"nvpmodel -q --verbose 2>/dev/null || nvpmodel -q 2>/dev/null || true\"");
+      modes = parseNvpmodelModesFromQuery(`${q.stdout || ""}\n${q.stderr || ""}`);
+    }
+    if (modes.length === 0) throw new Error(`Could not parse nvpmodel modes (config path: ${cfgPath})`);
+
+    const numeric = modes.filter((x) => Number.isFinite(x.watts));
+    let chosen = numeric[0] || modes[0];
+    for (const mode of numeric) {
+      if (mode.watts <= req) chosen = mode;
+    }
+    const pw = shSingle(settings.pass || "");
+    const applyLog = `/tmp/vortex_nvp_apply_${Date.now()}.log`;
+    const apply = await execCommand(
+      conn,
+      `bash -lc "echo ${pw} | sudo -S -p '' nvpmodel -m ${chosen.id} > '${applyLog}' 2>&1; code=\\$?; cat '${applyLog}'; exit \\$code"`
+    );
+    const out = String((apply.stdout || "") + "\n" + (apply.stderr || "")).trim();
+    const rebootRequired = /reboot required/i.test(out) || /DO YOU WANT TO REBOOT NOW/i.test(out);
+    if (apply.code !== 0) {
+      if (rebootRequired) {
+        return { ok: false, rebootRequired: true, error: "Reboot required for this power mode. Reboot Jetson, then apply again." };
+      }
+      throw new Error(out || `nvpmodel apply failed (exit=${apply.code})`);
+    }
+    emitLog(`Jetson power mode set: requested ${req}W, applied mode ${chosen.id} (${chosen.watts}W, ${chosen.name})`);
+    if (rebootRequired) emitLog("Jetson reported reboot required for this power mode change.");
+    return {
+      ok: true,
+      requestedWatts: req,
+      modeId: chosen.id,
+      modeWatts: chosen.watts,
+      modeName: chosen.name,
+      rebootRequired
+    };
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitLog(`Jetson power mode set failed: ${msg}`);
+    return { ok: false, error: msg };
+  } finally {
+    conn.end();
+  }
 }
 
 function connectSsh(settings) {
@@ -300,6 +446,93 @@ async function deployProject(settings) {
     }
     emitLog("Deployment finished successfully.");
     emitDeployProgress({ percent: 100, current: total, total, status: "done" });
+  } finally {
+    conn.end();
+  }
+}
+
+async function buildMainProgram(settings) {
+  const conn = await connectSsh(settings);
+  try {
+    emitMainBuildProgress({ status: "starting", percent: 0, text: "Connecting..." });
+    const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+    const hasCargo = await execCommand(conn, `test -f '${remoteTarget}/Cargo.toml' && echo OK || echo NO`);
+    if (!String(hasCargo.stdout || "").includes("OK")) {
+      throw new Error(`No Cargo.toml found in ${remoteTarget}. Deploy first.`);
+    }
+
+    let total = 1;
+    try {
+      const meta = await execCommand(
+        conn,
+        `bash -lc "cd '${remoteTarget}' && cargo metadata --format-version 1 --locked 2>/dev/null"`
+      );
+      if (meta.code === 0) {
+        const parsed = JSON.parse(String(meta.stdout || "{}"));
+        const count = Array.isArray(parsed?.resolve?.nodes) ? parsed.resolve.nodes.length : 1;
+        total = Math.max(1, Number(count) || 1);
+      }
+    } catch (_err) {}
+    emitLog(`[0/${total}] Starting remote build`);
+    emitMainBuildProgress({ status: "active", percent: 0, text: `[0/${total}] Starting` });
+
+    const cmd = `bash -lc "cd '${remoteTarget}' && cargo build -vv --release --bin dumapril-taglocalization 2>&1"`;
+    const channel = await execCommand(conn, cmd, { stream: true });
+    await new Promise((resolve, reject) => {
+      let pending = "";
+      const seen = new Set();
+      const onLine = (raw) => {
+        const line = stripAnsi(raw).trim();
+        if (!line) return;
+        const bracket = line.match(/\[([0-9]+)\/([0-9]+)\]/);
+        if (bracket) {
+          const cur = Number(bracket[1]);
+          const ttl = Number(bracket[2]);
+          if (Number.isFinite(cur) && Number.isFinite(ttl) && ttl > 0) {
+            const pct = Math.max(0, Math.min(99, Math.round((cur * 100) / ttl)));
+            emitLog(line);
+            emitMainBuildProgress({ status: "active", percent: pct, text: bracket[0] });
+            return;
+          }
+        }
+        const step = line.match(/^(Compiling|Fresh)\s+([^\s]+)\s+/);
+        if (step) {
+          const action = String(step[1]);
+          const crate = String(step[2]);
+          if (crate) seen.add(crate);
+          const cur = seen.size;
+          const synthetic = `[${cur}/${total}] ${action} ${crate}`;
+          emitLog(synthetic);
+          const pct = Math.max(0, Math.min(99, Math.round((cur * 100) / Math.max(1, total))));
+          emitMainBuildProgress({ status: "active", percent: pct, text: synthetic });
+          return;
+        }
+        if (/^Finished\b/i.test(line)) {
+          emitLog(`[${total}/${total}] ${line}`);
+          emitMainBuildProgress({ status: "active", percent: 99, text: `[${total}/${total}] Finished` });
+        }
+      };
+
+      const onData = (buf) => {
+        pending += buf.toString("utf8");
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || "";
+        for (const ln of lines) onLine(ln);
+      };
+      channel.on("data", onData);
+      channel.stderr.on("data", onData);
+      channel.on("error", reject);
+      channel.on("close", (code) => {
+        if (pending.trim()) onLine(pending.trim());
+        if (code === 0) {
+          emitMainBuildProgress({ status: "done", percent: 100, text: "✓ Main build complete" });
+          resolve();
+        } else {
+          emitMainBuildProgress({ status: "error", percent: 0, text: "✕ Main build failed" });
+          reject(new Error(`Remote build failed with exit code ${code}`));
+        }
+      });
+    });
   } finally {
     conn.end();
   }
@@ -1033,12 +1266,26 @@ ipcMain.handle("sync-runtime-config-remote", async (_evt, settings, config) => {
   }
 });
 
+ipcMain.handle("set-jetson-power-limit", async (_evt, settings, watts) => {
+  return setJetsonPowerLimit(settings, watts);
+});
+
 ipcMain.handle("deploy-start", async (_evt, settings) => {
   deployProject(settings)
     .then(() => emitLog("Deploy complete."))
     .catch((err) => {
       emitLog(`Deploy failed: ${err.message}`);
       emitDeployProgress({ percent: 0, current: 0, total: 0, status: "error" });
+    });
+  return { ok: true };
+});
+
+ipcMain.handle("build-main-start", async (_evt, settings) => {
+  buildMainProgram(settings)
+    .then(() => emitLog("Main build complete."))
+    .catch((err) => {
+      emitLog(`Main build failed: ${err.message}`);
+      emitMainBuildProgress({ status: "error", percent: 0, text: "✕ Main build failed" });
     });
   return { ok: true };
 });
@@ -1083,6 +1330,19 @@ ipcMain.handle("preview-stop", async () => {
 ipcMain.handle("list-remote-cameras", async (_evt, settings) => {
   const conn = await connectSsh(settings);
   try {
+    const grouped = await execCommand(
+      conn,
+      "bash -lc \"if command -v v4l2-ctl >/dev/null 2>&1; then v4l2-ctl --list-devices 2>/dev/null | awk 'BEGIN{best=\"\"} /^[^[:space:]].*:$/{ if(best!=\"\"){ print best; best=\"\" }; next } /^[[:space:]]*\\/dev\\/video[0-9]+/{ gsub(/^[[:space:]]*/, \"\", $0); sub(/^.*video/, \"\", $0); n=$0+0; if(best==\"\" || n<best) best=n } END{ if(best!=\"\") print best }' | sort -n | uniq; fi\""
+    );
+    const groupedCameras = String(grouped.stdout || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n));
+    if (groupedCameras.length > 0) {
+      return { ok: true, cameras: groupedCameras };
+    }
     const out = await execCommand(
       conn,
       "bash -lc \"ls -1 /dev/video* 2>/dev/null | sed -E 's#.*/video##' | grep -E '^[0-9]+$' | sort -n | uniq\""

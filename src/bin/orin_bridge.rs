@@ -415,6 +415,8 @@ fn main() -> Result<()> {
         );
     }
     let dev = selected_dev.expect("selected camera must have a device");
+    let mut camera_cfg = runtime_config.camera_for_index(camera_index);
+    eprintln!("Using camera profile for id {}", camera_index);
     let mut fmt = dev.format()?;
     fmt.fourcc = FourCC::new(b"MJPG");
     dev.set_format(&fmt)?;
@@ -463,8 +465,10 @@ fn main() -> Result<()> {
                         }
                     }
                     runtime_config = new_cfg;
+                    camera_cfg = runtime_config.camera_for_index(camera_index);
                     cfg_last_modified = modified;
                     eprintln!("Runtime config reloaded: {}", cfg_path);
+                    eprintln!("Using camera profile for id {}", camera_index);
                 }
             }
             let map_modified = fs::metadata(&tag_map_path).and_then(|m| m.modified()).ok();
@@ -519,20 +523,20 @@ fn main() -> Result<()> {
                     (c[1][0], c[1][1]), // BR
                     (c[2][0], c[2][1]), // TR
                 ];
-                let corners = undistort::undistort_points(&corners_raw, &runtime_config.camera);
-                let tag_size = runtime_config.camera.tag_size_m;
+                let corners = undistort::undistort_points(&corners_raw, &camera_cfg);
+                let tag_size = camera_cfg.tag_size_m;
                 let (x, y, z, floor_z_error) = if let Some(p) = pose::estimate_pose(
                     &corners,
                     tag_size,
-                    runtime_config.camera.fx,
-                    runtime_config.camera.fy,
-                    runtime_config.camera.cx,
-                    runtime_config.camera.cy,
+                    camera_cfg.fx,
+                    camera_cfg.fy,
+                    camera_cfg.cx,
+                    camera_cfg.cy,
                 ) {
                     if let Some((map_by_id, _field_meta)) = &tag_map_loaded {
                         if let Some(tag_field) = map_by_id.get(&apr.id) {
                             let (robot_field, z_err) =
-                                estimate_robot_field_from_tag(&p, tag_field, &runtime_config.camera);
+                                estimate_robot_field_from_tag(&p, tag_field, &camera_cfg);
                             field_candidates.push((robot_field.x, robot_field.y, z_err, p.translation.z.abs()));
                             (robot_field.x, robot_field.y, 0.0, z_err)
                         } else {
@@ -605,17 +609,17 @@ fn main() -> Result<()> {
                     let obj_h_m = runtime_config.object_detection.yolo_obj_height_m;
                     let mut z_candidates = Vec::new();
                     if bbox[2] > 1.0 {
-                        z_candidates.push((runtime_config.camera.fx * obj_w_m) / bbox[2]);
+                        z_candidates.push((camera_cfg.fx * obj_w_m) / bbox[2]);
                     }
                     if bbox[3] > 1.0 {
-                        z_candidates.push((runtime_config.camera.fy * obj_h_m) / bbox[3]);
+                        z_candidates.push((camera_cfg.fy * obj_h_m) / bbox[3]);
                     }
                     if z_candidates.is_empty() {
                         continue;
                     }
                     let z = z_candidates.iter().sum::<f64>() / z_candidates.len() as f64;
-                    let x = (u - runtime_config.camera.cx) * z / runtime_config.camera.fx;
-                    let y = (v - runtime_config.camera.cy) * z / runtime_config.camera.fy;
+                    let x = (u - camera_cfg.cx) * z / camera_cfg.fx;
+                    let y = (v - camera_cfg.cy) * z / camera_cfg.fy;
                     objects.push(ObjectOut {
                         class_name: o.class_name,
                         confidence: o.confidence,
