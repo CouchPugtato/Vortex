@@ -28,6 +28,7 @@ async-stream = "0.3"
 futures = "0.3"
 libc = "0.2"
 libloading = "0.8"
+nt_client = "0.2.0"
 
 [build-dependencies]
 cc = "1.0"

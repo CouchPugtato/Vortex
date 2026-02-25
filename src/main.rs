@@ -11,10 +11,13 @@ use nalgebra as _;
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 use std::env;
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::Once;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
@@ -25,15 +28,21 @@ use v4l::video::Capture;
 use v4l::io::traits::CaptureStream;
 use v4l::capability::Flags;
 use turbojpeg::{Decompressor, Compressor, Image, PixelFormat, Subsamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use nt_client::{Client, NTAddr, NewClientOptions};
+use nt_client::data::{Properties, SubscriptionOptions};
+use nt_client::publish::Publisher;
+use nt_client::subscribe::Subscriber;
+use nt_client::topic::Topic;
 
 use crate::config::{CameraConfig, ObjectDetectionConfig, ProcessingConfig, RuntimeConfig};
 use crate::detector::Detection;
 
+static PANIC_HOOK_INIT: Once = Once::new();
 
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AprilTagPose {
     pub id: usize,
     pub x: f64,
@@ -42,7 +51,7 @@ pub struct AprilTagPose {
     pub floor_z_error: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct YoloBBox {
     pub class_name: String,
     pub confidence: f64,
@@ -52,7 +61,7 @@ pub struct YoloBBox {
     pub z: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 enum ProcessedDetection {
     AprilTag(AprilTagPose),
     Yolo(YoloBBox),
@@ -66,6 +75,308 @@ struct PipelineStats {
     camera_index: usize,
     detections: ProcessedDetections,
     timestamp: Instant,
+}
+
+struct NtCameraTopics {
+    fps: Topic,
+    detection_count: Topic,
+    apriltag_count: Topic,
+    yolo_count: Topic,
+    has_robot_pose: Topic,
+    robot_x: Topic,
+    robot_y: Topic,
+    robot_tags_used: Topic,
+    robot_floor_err_avg: Topic,
+    apriltags_json: Topic,
+    objects_json: Topic,
+}
+
+struct NtCameraPublishers {
+    fps: Publisher<f64>,
+    detection_count: Publisher<i64>,
+    apriltag_count: Publisher<i64>,
+    yolo_count: Publisher<i64>,
+    has_robot_pose: Publisher<bool>,
+    robot_x: Publisher<f64>,
+    robot_y: Publisher<f64>,
+    robot_tags_used: Publisher<i64>,
+    robot_floor_err_avg: Publisher<f64>,
+    apriltags_json: Publisher<String>,
+    objects_json: Publisher<String>,
+}
+
+struct NtTelemetry {
+    runtime: tokio::runtime::Runtime,
+    topics: HashMap<usize, NtCameraTopics>,
+    subscribers: HashMap<usize, Vec<Subscriber>>,
+    publishers: HashMap<usize, NtCameraPublishers>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RobotPoseOut {
+    x: f64,
+    y: f64,
+    tags_used: usize,
+    floor_z_error_avg: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CameraSnapshotOut {
+    camera_index: usize,
+    fps: f64,
+    apriltags: Vec<AprilTagPose>,
+    objects: Vec<YoloBBox>,
+    robot_pose: Option<RobotPoseOut>,
+}
+
+struct UdpTelemetry {
+    socket: UdpSocket,
+    target: SocketAddrV4,
+}
+
+impl UdpTelemetry {
+    fn try_from_env() -> anyhow::Result<Option<Self>> {
+        if !env_flag("VORTEX_UDP_ENABLE", false) {
+            return Ok(None);
+        }
+        let ip_raw = match env::var("VORTEX_UDP_TARGET") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return Ok(None),
+        };
+        let ip = ip_raw
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map_err(|_| anyhow::anyhow!("Invalid VORTEX_UDP_TARGET '{}'", ip_raw))?;
+        let port = env_u64("VORTEX_UDP_PORT", 5809) as u16;
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        Ok(Some(Self {
+            socket,
+            target: SocketAddrV4::new(ip, port),
+        }))
+    }
+
+    fn publish_camera_snapshot(
+        &self,
+        camera_index: usize,
+        fps: f64,
+        detections: &[ProcessedDetection],
+        robot_pose: Option<(f64, f64, usize, f64)>,
+    ) {
+        let mut apriltags = Vec::new();
+        let mut objects = Vec::new();
+        for det in detections {
+            match det {
+                ProcessedDetection::AprilTag(a) => apriltags.push(a.clone()),
+                ProcessedDetection::Yolo(y) => objects.push(y.clone()),
+            }
+        }
+        let robot_pose = robot_pose.map(|(x, y, tags_used, floor_z_error_avg)| RobotPoseOut {
+            x,
+            y,
+            tags_used,
+            floor_z_error_avg,
+        });
+        let payload = CameraSnapshotOut {
+            camera_index,
+            fps,
+            apriltags,
+            objects,
+            robot_pose,
+        };
+        if let Ok(json) = serde_json::to_vec(&payload) {
+            let _ = self.socket.send_to(&json, self.target);
+        }
+    }
+}
+
+impl NtTelemetry {
+    fn try_from_env(camera_indices: &[usize]) -> anyhow::Result<Option<Self>> {
+        let enabled = env_flag("VORTEX_NT_ENABLE", true);
+        if !enabled {
+            return Ok(None);
+        }
+
+        let identity = env::var("VORTEX_NT_IDENTITY").unwrap_or_else(|_| "vortex-main".to_string());
+        let base_table = normalize_nt_base(
+            &env::var("VORTEX_NT_TABLE").unwrap_or_else(|_| "/Vortex/Vision".to_string()),
+        );
+        let mut opts = NewClientOptions::default();
+        opts.name = identity;
+        opts.addr = nt_addr_from_env();
+        opts.ping_interval = Duration::from_millis(env_u64("VORTEX_NT_PING_MS", 1000));
+        opts.response_timeout = Duration::from_millis(env_u64("VORTEX_NT_RESPONSE_TIMEOUT_MS", 10000));
+        opts.update_time_interval = Duration::from_millis(env_u64("VORTEX_NT_TIME_SYNC_MS", 5000));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let client = Client::new(opts);
+
+        let mut topics = HashMap::new();
+        for &idx in camera_indices {
+            let prefix = format!("{}/Camera{}", base_table, idx);
+            topics.insert(
+                idx,
+                NtCameraTopics {
+                    fps: client.topic(format!("{prefix}/fps")),
+                    detection_count: client.topic(format!("{prefix}/detections_total")),
+                    apriltag_count: client.topic(format!("{prefix}/apriltag_count")),
+                    yolo_count: client.topic(format!("{prefix}/yolo_count")),
+                    has_robot_pose: client.topic(format!("{prefix}/robot/has_pose")),
+                    robot_x: client.topic(format!("{prefix}/robot/x")),
+                    robot_y: client.topic(format!("{prefix}/robot/y")),
+                    robot_tags_used: client.topic(format!("{prefix}/robot/tags_used")),
+                    robot_floor_err_avg: client.topic(format!("{prefix}/robot/floor_err_avg")),
+                    apriltags_json: client.topic(format!("{prefix}/apriltags_json")),
+                    objects_json: client.topic(format!("{prefix}/objects_json")),
+                },
+            );
+        }
+
+        runtime.spawn(async move {
+            if let Err(e) = client.connect().await {
+                eprintln!("NetworkTables connection stopped: {}", e);
+            }
+        });
+
+        let out = NtTelemetry {
+            runtime,
+            topics,
+            subscribers: HashMap::new(),
+            publishers: HashMap::new(),
+        };
+        Ok(Some(out))
+    }
+
+    fn add_camera_subscribers(&mut self, camera_index: usize) -> anyhow::Result<()> {
+        if self.subscribers.contains_key(&camera_index) {
+            return Ok(());
+        }
+        let topics = self
+            .topics
+            .get(&camera_index)
+            .ok_or_else(|| anyhow::anyhow!("missing NT topics for camera {}", camera_index))?;
+        let subs = self.runtime.block_on(async {
+            let opts = SubscriptionOptions::default();
+            let out = vec![
+                topics.fps.subscribe(opts.clone()).await,
+                topics.detection_count.subscribe(opts.clone()).await,
+                topics.apriltag_count.subscribe(opts.clone()).await,
+                topics.yolo_count.subscribe(opts.clone()).await,
+                topics.has_robot_pose.subscribe(opts.clone()).await,
+                topics.robot_x.subscribe(opts.clone()).await,
+                topics.robot_y.subscribe(opts.clone()).await,
+                topics.robot_tags_used.subscribe(opts.clone()).await,
+                topics.robot_floor_err_avg.subscribe(opts.clone()).await,
+                topics.apriltags_json.subscribe(opts.clone()).await,
+                topics.objects_json.subscribe(opts.clone()).await,
+            ];
+            Ok::<Vec<Subscriber>, anyhow::Error>(out)
+        })?;
+        self.subscribers.insert(camera_index, subs);
+        Ok(())
+    }
+
+    fn add_camera_publishers(&mut self, camera_index: usize) -> anyhow::Result<()> {
+        if self.publishers.contains_key(&camera_index) {
+            return Ok(());
+        }
+        self.add_camera_subscribers(camera_index)?;
+        let topics = self
+            .topics
+            .get(&camera_index)
+            .ok_or_else(|| anyhow::anyhow!("missing NT topics for camera {}", camera_index))?;
+        let publishers = self.runtime.block_on(async {
+            let props = Properties::default();
+            let timeout_dur = Duration::from_millis(env_u64("VORTEX_NT_PUBLISH_CREATE_TIMEOUT_MS", 5000));
+            let pubs = NtCameraPublishers {
+                fps: tokio::time::timeout(timeout_dur, topics.fps.publish::<f64>(props.clone())).await??,
+                detection_count: tokio::time::timeout(timeout_dur, topics.detection_count.publish::<i64>(props.clone())).await??,
+                apriltag_count: tokio::time::timeout(timeout_dur, topics.apriltag_count.publish::<i64>(props.clone())).await??,
+                yolo_count: tokio::time::timeout(timeout_dur, topics.yolo_count.publish::<i64>(props.clone())).await??,
+                has_robot_pose: tokio::time::timeout(timeout_dur, topics.has_robot_pose.publish::<bool>(props.clone())).await??,
+                robot_x: tokio::time::timeout(timeout_dur, topics.robot_x.publish::<f64>(props.clone())).await??,
+                robot_y: tokio::time::timeout(timeout_dur, topics.robot_y.publish::<f64>(props.clone())).await??,
+                robot_tags_used: tokio::time::timeout(timeout_dur, topics.robot_tags_used.publish::<i64>(props.clone())).await??,
+                robot_floor_err_avg: tokio::time::timeout(timeout_dur, topics.robot_floor_err_avg.publish::<f64>(props.clone())).await??,
+                apriltags_json: tokio::time::timeout(timeout_dur, topics.apriltags_json.publish::<String>(props.clone())).await??,
+                objects_json: tokio::time::timeout(timeout_dur, topics.objects_json.publish::<String>(props.clone())).await??,
+            };
+            Ok::<NtCameraPublishers, anyhow::Error>(pubs)
+        })?;
+        self.publishers.insert(camera_index, publishers);
+        Ok(())
+    }
+
+    fn publish_camera_snapshot(
+        &mut self,
+        camera_index: usize,
+        fps: f64,
+        detections: &[ProcessedDetection],
+        robot_pose: Option<(f64, f64, usize, f64)>,
+    ) -> anyhow::Result<()> {
+        self.add_camera_publishers(camera_index)?;
+        let pubs = self
+            .publishers
+            .get(&camera_index)
+            .ok_or_else(|| anyhow::anyhow!("missing NT publishers for camera {}", camera_index))?;
+
+        let mut apriltags = Vec::new();
+        let mut objects = Vec::new();
+        for det in detections {
+            match det {
+                ProcessedDetection::AprilTag(a) => apriltags.push(a.clone()),
+                ProcessedDetection::Yolo(y) => objects.push(y.clone()),
+            }
+        }
+        let tag_count = apriltags.len() as i64;
+        let yolo_count = objects.len() as i64;
+        let total_count = tag_count + yolo_count;
+        let tags_json = serde_json::to_string(&apriltags).unwrap_or_else(|_| "[]".to_string());
+        let objects_json = serde_json::to_string(&objects).unwrap_or_else(|_| "[]".to_string());
+
+        let (has_pose, pose_x, pose_y, tags_used, floor_err) = match robot_pose {
+            Some((x, y, used, err)) => (true, x, y, used as i64, err),
+            None => (false, 0.0, 0.0, 0_i64, 0.0),
+        };
+
+        let publish_result = catch_unwind(AssertUnwindSafe(|| {
+            self.runtime.block_on(async {
+                pubs.fps.set(fps).await;
+                pubs.detection_count.set(total_count).await;
+                pubs.apriltag_count.set(tag_count).await;
+                pubs.yolo_count.set(yolo_count).await;
+                pubs.has_robot_pose.set(has_pose).await;
+                pubs.robot_x.set(pose_x).await;
+                pubs.robot_y.set(pose_y).await;
+                pubs.robot_tags_used.set(tags_used).await;
+                pubs.robot_floor_err_avg.set(floor_err).await;
+                pubs.apriltags_json.set(tags_json).await;
+                pubs.objects_json.set(objects_json).await;
+            });
+        }));
+        if publish_result.is_err() {
+            self.publishers.remove(&camera_index);
+            return Err(anyhow::anyhow!(
+                "NetworkTables publish panicked (connection likely dropped); publishers reset for camera {}",
+                camera_index
+            ));
+        }
+
+        if env_flag("VORTEX_NT_DEBUG", false) {
+            eprintln!(
+                "NT publish cam={} fps={:.2} tags={} yolo={} pose={}",
+                camera_index,
+                fps,
+                tag_count,
+                yolo_count,
+                has_pose
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -117,6 +428,8 @@ struct FieldTagPose {
 }
 
 fn main() -> anyhow::Result<()> {
+    install_filtered_panic_hook();
+
     let args: Vec<String> = env::args().collect();
     
     // parse camera indices from args
@@ -209,6 +522,48 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let mut nt_telemetry = match NtTelemetry::try_from_env(&camera_indices) {
+        Ok(Some(nt)) => {
+            let nt_target = if let Ok(server) = env::var("VORTEX_NT_SERVER") {
+                format!("server-{}", server.trim())
+            } else if let Ok(team) = env::var("VORTEX_NT_TEAM") {
+                format!("team-{}", team.trim())
+            } else {
+                "local".to_string()
+            };
+            println!(
+                "NetworkTables enabled: target={} table={}",
+                nt_target,
+                env::var("VORTEX_NT_TABLE").unwrap_or_else(|_| "/Vortex/Vision".to_string())
+            );
+            Some(nt)
+        }
+        Ok(None) => {
+            println!("NetworkTables disabled (VORTEX_NT_ENABLE=0).");
+            None
+        }
+        Err(e) => {
+            eprintln!("NetworkTables init failed: {}. Falling back to console output.", e);
+            None
+        }
+    };
+    let udp_telemetry = match UdpTelemetry::try_from_env() {
+        Ok(Some(udp)) => {
+            println!(
+                "UDP telemetry enabled: target={}:{}",
+                env::var("VORTEX_UDP_TARGET").unwrap_or_default(),
+                env_u64("VORTEX_UDP_PORT", 5809)
+            );
+            Some(udp)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("UDP telemetry init failed: {}", e);
+            None
+        }
+    };
+    let mut nt_reconnect_after = Instant::now();
+
     // monitor loop
     let mut cam_stats: HashMap<usize, (u64, Instant)> = HashMap::new(); // (frame_count, last_report)
     let mut cam_fps: HashMap<usize, f64> = HashMap::new();
@@ -272,16 +627,39 @@ fn main() -> anyhow::Result<()> {
                 let duration = now.duration_since(*last_time);
                 
                 if duration.as_secs() >= 1 {
+                    if nt_telemetry.is_none()
+                        && env_flag("VORTEX_NT_ENABLE", true)
+                        && Instant::now() >= nt_reconnect_after
+                    {
+                        match NtTelemetry::try_from_env(&camera_indices) {
+                            Ok(Some(nt)) => {
+                                eprintln!("NetworkTables reconnected.");
+                                nt_telemetry = Some(nt);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                eprintln!("NetworkTables reconnect failed: {}", e);
+                                nt_reconnect_after = Instant::now() + Duration::from_secs(2);
+                            }
+                        }
+                    }
+
                     let fps = *count as f64 / duration.as_secs_f64();
                     cam_fps.insert(stat.camera_index, fps);
                     *count = 0;
                     *last_time = now;
-                    
-                    // print summary
-                    print!("\x1B[2J\x1B[1;1H"); // clear screen
-                    println!("=== Multi-Camera Status ===");
+
+                    let use_console_output = nt_telemetry.is_none();
+                    if use_console_output {
+                        print!("\x1B[2J\x1B[1;1H");
+                        println!("=== Multi-Camera Status ===");
+                    }
+
                     for &idx in &camera_indices {
-                        let detections = cam_detections.get(&idx).unwrap();
+                        let mut nt_disconnect = false;
+                        let Some(detections) = cam_detections.get(&idx) else {
+                            continue;
+                        };
                         let tag_count = detections
                             .iter()
                             .filter(|d| matches!(d, ProcessedDetection::AprilTag(_)))
@@ -290,38 +668,49 @@ fn main() -> anyhow::Result<()> {
                             .iter()
                             .filter(|d| matches!(d, ProcessedDetection::Yolo(_)))
                             .count();
-                        println!("Camera {}: {:.2} FPS | Last Detections: {}", 
-                            idx, 
-                            cam_fps.get(&idx).unwrap_or(&0.0),
-                            detections.len()
-                        );
-                        println!("  - Counts: AprilTag={} YOLO={}", tag_count, yolo_count);
+
+                        if use_console_output {
+                            println!(
+                                "Camera {}: {:.2} FPS | Last Detections: {}",
+                                idx,
+                                cam_fps.get(&idx).unwrap_or(&0.0),
+                                detections.len()
+                            );
+                            println!("  - Counts: AprilTag={} YOLO={}", tag_count, yolo_count);
+                        }
+
                         let mut field_candidates: Vec<(f64, f64, f64, f64)> = Vec::new();
                         for det in detections {
                             match det {
                                 ProcessedDetection::AprilTag(a) => {
                                     field_candidates.push((a.x, a.y, a.floor_z_error, a.z.abs()));
-                                    println!(
-                                        "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m",
-                                        a.id, a.x, a.y, a.floor_z_error
-                                    );
+                                    if use_console_output {
+                                        println!(
+                                            "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m",
+                                            a.id, a.x, a.y, a.floor_z_error
+                                        );
+                                    }
                                 }
                                 ProcessedDetection::Yolo(y) => {
-                                    println!(
-                                        "  - Object: {} ({:.2}) | Dist: {:.2}m | X: {:.2}m | Y: {:.2}m | BBox: [{:.0},{:.0},{:.0},{:.0}]",
-                                        y.class_name,
-                                        y.confidence,
-                                        y.z,
-                                        y.x,
-                                        y.y,
-                                        y.bbox[0],
-                                        y.bbox[1],
-                                        y.bbox[2],
-                                        y.bbox[3]
-                                    );
+                                    if use_console_output {
+                                        println!(
+                                            "  - Object: {} ({:.2}) | Dist: {:.2}m | X: {:.2}m | Y: {:.2}m | BBox: [{:.0},{:.0},{:.0},{:.0}]",
+                                            y.class_name,
+                                            y.confidence,
+                                            y.z,
+                                            y.x,
+                                            y.y,
+                                            y.bbox[0],
+                                            y.bbox[1],
+                                            y.bbox[2],
+                                            y.bbox[3]
+                                        );
+                                    }
                                 }
                             }
                         }
+
+                        let mut pose_for_publish: Option<(f64, f64, usize, f64)> = None;
                         if let Some((raw_x, raw_y, used, avg_z_err)) = robust_fuse_field_pose(&field_candidates) {
                             const MAX_STEP_M: f64 = 0.60;
                             const SMOOTH_ALPHA: f64 = 0.18;
@@ -345,10 +734,43 @@ fn main() -> anyhow::Result<()> {
                                 (raw_x, raw_y)
                             };
                             filtered_robot_xy.insert(idx, (sx, sy));
-                            println!(
-                                "  - Robot Pose Avg | Field X: {:.2}m | Field Y: {:.2}m | Tags: {} | FloorErr: {:.3}m",
-                                sx, sy, used, avg_z_err
+                            pose_for_publish = Some((sx, sy, used, avg_z_err));
+                            if use_console_output {
+                                println!(
+                                    "  - Robot Pose Avg | Field X: {:.2}m | Field Y: {:.2}m | Tags: {} | FloorErr: {:.3}m",
+                                    sx, sy, used, avg_z_err
+                                );
+                            }
+                        } else if let Some((sx, sy)) = filtered_robot_xy.get(&idx).copied() {
+                            pose_for_publish = Some((sx, sy, 0, 0.0));
+                        }
+
+                        if let Some(nt) = nt_telemetry.as_mut() {
+                            if let Err(e) = nt.publish_camera_snapshot(
+                                idx,
+                                *cam_fps.get(&idx).unwrap_or(&0.0),
+                                detections,
+                                pose_for_publish,
+                            ) {
+                                eprintln!("NetworkTables publish failed for camera {}: {}", idx, e);
+                                let msg = e.to_string();
+                                if msg.contains("channel closed") || msg.contains("panicked") {
+                                    nt_disconnect = true;
+                                }
+                            }
+                        }
+                        if let Some(udp) = udp_telemetry.as_ref() {
+                            udp.publish_camera_snapshot(
+                                idx,
+                                *cam_fps.get(&idx).unwrap_or(&0.0),
+                                detections,
+                                pose_for_publish,
                             );
+                        }
+                        if nt_disconnect {
+                            nt_telemetry = None;
+                            nt_reconnect_after = Instant::now() + Duration::from_secs(2);
+                            break;
                         }
                     }
                 }
@@ -893,6 +1315,66 @@ fn resolve_tag_map_path() -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+}
+
+fn env_flag(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(v) => {
+            let lower = v.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    match env::var(key) {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn normalize_nt_base(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/Vortex/Vision".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+fn nt_addr_from_env() -> NTAddr {
+    if let Ok(server_raw) = env::var("VORTEX_NT_SERVER") {
+        if let Ok(ip) = server_raw.trim().parse::<Ipv4Addr>() {
+            return NTAddr::Custom(ip);
+        }
+        eprintln!(
+            "Invalid VORTEX_NT_SERVER='{}'; expected IPv4 like 192.168.1.50",
+            server_raw
+        );
+    }
+    if let Ok(team_raw) = env::var("VORTEX_NT_TEAM") {
+        if let Ok(team) = team_raw.trim().parse::<u16>() {
+            return NTAddr::TeamNumber(team);
+        }
+    }
+    NTAddr::Local
+}
+
+fn install_filtered_panic_hook() {
+    PANIC_HOOK_INIT.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(location) = info.location() {
+                if location.file().contains("nt_client-0.2.0/src/publish.rs") {
+                    return;
+                }
+            }
+            default_hook(info);
+        }));
+    });
 }
 
 fn robust_fuse_field_pose(candidates: &[(f64, f64, f64, f64)]) -> Option<(f64, f64, usize, f64)> {
