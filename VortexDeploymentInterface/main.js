@@ -13,6 +13,11 @@ const FIXED_SSH = Object.freeze({
   user: "vortex",
   pass: "redstorm"
 });
+const serviceGuard = {
+  activeCount: 0,
+  lastSettings: null
+};
+let quitCleanupInProgress = false;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -44,6 +49,23 @@ app.on("window-all-closed", () => {
   monitorManager.stop();
   previewManager.stop();
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", (event) => {
+  if (quitCleanupInProgress) return;
+  quitCleanupInProgress = true;
+  event.preventDefault();
+  (async () => {
+    try {
+      await monitorManager.stop();
+      previewManager.stop();
+      await restartManagedStartupServiceOnExit();
+    } catch (err) {
+      emitLog(`Shutdown cleanup error: ${err?.message || String(err)}`);
+    } finally {
+      app.quit();
+    }
+  })();
 });
 
 function getWindow() {
@@ -134,6 +156,69 @@ function withFixedSshConfig(cfg) {
     user: FIXED_SSH.user,
     pass: FIXED_SSH.pass
   };
+}
+
+function normalizeServiceName(name) {
+  return String(name || "").trim();
+}
+
+function hasManagedService(settings) {
+  return !!normalizeServiceName(settings?.startup_service_name);
+}
+
+async function stopManagedStartupService(settings, reason = "operation") {
+  if (!hasManagedService(settings)) return;
+  const cfg = withFixedSshConfig(settings);
+  const serviceName = normalizeServiceName(cfg.startup_service_name);
+  const conn = await connectSsh(cfg);
+  try {
+    const stopSvc = await execCommand(conn, `sudo systemctl stop ${serviceName}`);
+    if (stopSvc.code !== 0) {
+      emitLog(`Service stop failed (${reason}): ${stopSvc.stderr || stopSvc.stdout}`);
+    } else {
+      emitLog(`Service stopped (${reason}): ${serviceName}`);
+    }
+  } finally {
+    conn.end();
+  }
+}
+
+async function startManagedStartupService(settings, reason = "exit") {
+  if (!hasManagedService(settings)) return;
+  const cfg = withFixedSshConfig(settings);
+  const serviceName = normalizeServiceName(cfg.startup_service_name);
+  const conn = await connectSsh(cfg);
+  try {
+    const startSvc = await execCommand(conn, `sudo systemctl start ${serviceName}`);
+    if (startSvc.code !== 0) {
+      emitLog(`Service start failed (${reason}): ${startSvc.stderr || startSvc.stdout}`);
+    } else {
+      emitLog(`Service started (${reason}): ${serviceName}`);
+    }
+  } finally {
+    conn.end();
+  }
+}
+
+async function beginManagedToolActivity(settings, label) {
+  if (!hasManagedService(settings)) return;
+  serviceGuard.lastSettings = withFixedSshConfig(settings);
+  const wasIdle = serviceGuard.activeCount === 0;
+  serviceGuard.activeCount += 1;
+  if (wasIdle) {
+    await stopManagedStartupService(serviceGuard.lastSettings, label);
+  }
+}
+
+function endManagedToolActivity() {
+  if (serviceGuard.activeCount > 0) {
+    serviceGuard.activeCount -= 1;
+  }
+}
+
+async function restartManagedStartupServiceOnExit() {
+  if (!serviceGuard.lastSettings || !hasManagedService(serviceGuard.lastSettings)) return;
+  await startManagedStartupService(serviceGuard.lastSettings, "tool-closed");
 }
 
 function resolvePathFromAppDir(candidatePath, fallback = "") {
@@ -947,6 +1032,7 @@ const monitorManager = {
   channel: null,
   stopping: false,
   settings: null,
+  activityHeld: false,
   async start(settings) {
     if (this.conn) throw new Error("Monitor already running");
     this.settings = settings;
@@ -955,19 +1041,6 @@ const monitorManager = {
       emitMonitorStartProgress({ status: "starting", percent: 10, text: "Connecting..." });
       this.conn = await connectSsh(settings);
       await syncTagMapRemote(this.conn, settings);
-
-      if (settings.startup_service_name) {
-        emitMonitorStartProgress({ status: "starting", percent: 20, text: "Stopping service..." });
-        const stopSvc = await execCommand(
-          this.conn,
-          `sudo systemctl stop ${settings.startup_service_name}`
-        );
-        if (stopSvc.code !== 0) {
-          emitLog(`Service stop failed: ${stopSvc.stderr || stopSvc.stdout}`);
-        } else {
-          emitLog(`Service stopped: ${settings.startup_service_name}`);
-        }
-      }
 
       emitMonitorStartProgress({ status: "starting", percent: 55, text: "Resolving monitor..." });
       const resolvedStart = await resolveMonitorCommand(this.conn, settings);
@@ -997,16 +1070,9 @@ const monitorManager = {
           emitMonitorLine(pending.trim());
           if (!isDetectionLine(pending.trim())) emitLog(pending.trim());
         }
-        if (this.settings && this.settings.startup_service_name) {
-          try {
-            const restart = await execCommand(
-              this.conn,
-              `sudo systemctl start ${this.settings.startup_service_name}`
-            );
-            if (restart.code === 0) {
-              emitLog(`Service restarted: ${this.settings.startup_service_name}`);
-            }
-          } catch (_err) {}
+        if (this.activityHeld) {
+          endManagedToolActivity();
+          this.activityHeld = false;
         }
         this.cleanup();
         emitMonitorState(false);
@@ -1035,6 +1101,10 @@ const monitorManager = {
     } catch (err) {
       emitLog(`Monitor stop failed: ${err.message}`);
     } finally {
+      if (this.activityHeld) {
+        endManagedToolActivity();
+        this.activityHeld = false;
+      }
       this.cleanup();
       emitMonitorState(false);
       emitMonitorStartProgress({ status: "hidden", percent: 0, text: "" });
@@ -1179,8 +1249,10 @@ ipcMain.handle("load-tag-map", async (_evt, filePath) => {
 });
 
 ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath) => {
-  const conn = await connectSsh(settings);
+  let conn = null;
+  await beginManagedToolActivity(settings, "onnx-upload-build");
   try {
+    conn = await connectSsh(settings);
     emitOnnxUploadProgress({ status: "starting", percent: 5, text: "Connecting..." });
     const localPath = path.resolve(String(localOnnxPath || ""));
     if (!localPath || !fsSync.existsSync(localPath)) {
@@ -1276,7 +1348,8 @@ ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath)
     emitOnnxUploadProgress({ status: "error", percent: 0, text: "✕ Upload/build failed" });
     return { ok: false, error: msg };
   } finally {
-    conn.end();
+    if (conn) conn.end();
+    endManagedToolActivity();
   }
 });
 
@@ -1330,31 +1403,61 @@ ipcMain.handle("set-jetson-power-limit", async (_evt, settings, watts) => {
 });
 
 ipcMain.handle("deploy-start", async (_evt, settings) => {
+  try {
+    await beginManagedToolActivity(settings, "deploy");
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitLog(`Service pre-stop failed: ${msg}`);
+    return { ok: false, error: msg };
+  }
   deployProject(settings)
     .then(() => emitLog("Deploy complete."))
     .catch((err) => {
       emitLog(`Deploy failed: ${err.message}`);
       emitDeployProgress({ percent: 0, current: 0, total: 0, status: "error" });
+    })
+    .finally(() => {
+      endManagedToolActivity();
     });
   return { ok: true };
 });
 
 ipcMain.handle("build-main-start", async (_evt, settings) => {
+  try {
+    await beginManagedToolActivity(settings, "main-build");
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitLog(`Service pre-stop failed: ${msg}`);
+    return { ok: false, error: msg };
+  }
   buildMainProgram(settings)
     .then(() => emitLog("Main build complete."))
     .catch((err) => {
       emitLog(`Main build failed: ${err.message}`);
       emitMainBuildProgress({ status: "error", percent: 0, text: "✕ Main build failed" });
+    })
+    .finally(() => {
+      endManagedToolActivity();
     });
   return { ok: true };
 });
 
 ipcMain.handle("monitor-start", async (_evt, settings) => {
   emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });
+  let activityStarted = false;
   try {
+    await beginManagedToolActivity(settings, "monitor");
+    activityStarted = true;
     await monitorManager.start(settings);
+    monitorManager.activityHeld = true;
     return { ok: true };
   } catch (err) {
+    if (activityStarted && monitorManager.activityHeld) {
+      endManagedToolActivity();
+      monitorManager.activityHeld = false;
+    } else if (activityStarted) {
+      endManagedToolActivity();
+    }
     const msg = err?.message || String(err);
     emitLog(`Monitor start failed: ${msg}`);
     if (msg.includes("All configured authentication methods failed")) {

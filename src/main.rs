@@ -626,7 +626,7 @@ fn main() -> anyhow::Result<()> {
                 let now = Instant::now();
                 let duration = now.duration_since(*last_time);
                 
-                if duration.as_secs() >= 1 {
+                if duration >= Duration::from_millis(20) {
                     if nt_telemetry.is_none()
                         && env_flag("VORTEX_NT_ENABLE", true)
                         && Instant::now() >= nt_reconnect_after
