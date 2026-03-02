@@ -19,8 +19,11 @@
           </div>
           <label>Jetson Power Limit (W)</label>
           <div class="row">
-            <input id="jetsonWatts" type="range" min="5" max="60" step="1" />
-            <span id="jetsonWattsValue" class="pill">15W</span>
+            <select id="jetsonWatts">
+              <option value="7">7W</option>
+              <option value="15" selected>15W</option>
+              <option value="25">25W</option>
+            </select>
             <button id="applyJetsonWatts" class="accent">Apply</button>
           </div>
           <label>AprilTag Map</label>

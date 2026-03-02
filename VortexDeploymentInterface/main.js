@@ -385,6 +385,46 @@ function parseNvpmodelModesFromQuery(queryText) {
   return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
+function parseCurrentNvpmodelState(text) {
+  const raw = String(text || "");
+  const name = ((raw.match(/Current mode:\s*NV Power Mode:\s*([^\r\n]+)/i) || [])[1] || "").trim();
+  const id = Number((raw.match(/Current mode:[\s\S]*?\n\s*([0-9]+)\s*(?:\r?\n|$)/i) || [])[1]);
+  return {
+    name: name || "",
+    id: Number.isFinite(id) ? id : null
+  };
+}
+
+function pickTargetPowerMode(modes, requestedWatts) {
+  const req = Number(requestedWatts);
+  const exact = modes.find((m) =>
+    Number.isFinite(m?.watts) && Math.round(Number(m.watts)) === Math.round(req)
+  ) || modes.find((m) => new RegExp(`\\b${Math.round(req)}\\s*W\\b`, "i").test(String(m?.name || "")));
+  if (exact) return exact;
+
+  const numeric = modes.filter((x) => Number.isFinite(x.watts));
+  if (numeric.length === 0) return modes[0] || null;
+  let chosen = numeric[0];
+  for (const mode of numeric) {
+    if (mode.watts <= req) chosen = mode;
+  }
+  return chosen;
+}
+
+async function waitForJetsonReconnect(settings, timeoutMs = 180000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const conn = await connectSsh(settings);
+      conn.end();
+      return true;
+    } catch (_err) {
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  return false;
+}
+
 async function setJetsonPowerLimit(settings, requestedWatts) {
   const cfg = withFixedSshConfig(settings);
   const conn = await connectSsh(settings);
@@ -397,42 +437,112 @@ async function setJetsonPowerLimit(settings, requestedWatts) {
       "bash -lc \"for f in /etc/nvpmodel.conf /etc/nvpmodel/*.conf /etc/nvpmodel_*.conf; do [ -f \\\"$f\\\" ] && echo \\\"$f\\\"; done | head -n 1\""
     );
     const cfgPath = String(cfgPathRes.stdout || "").trim() || "/etc/nvpmodel.conf";
-    const cfg = await execCommand(conn, `bash -lc "cat '${cfgPath}' 2>/dev/null || true"`);
-    let modes = parseNvpmodelModes(cfg.stdout || "");
+    const cfgText = await execCommand(conn, `bash -lc "cat '${cfgPath}' 2>/dev/null || true"`);
+    let modes = parseNvpmodelModes(cfgText.stdout || "");
     if (modes.length === 0) {
       const q = await execCommand(conn, "bash -lc \"nvpmodel -q --verbose 2>/dev/null || nvpmodel -q 2>/dev/null || true\"");
       modes = parseNvpmodelModesFromQuery(`${q.stdout || ""}\n${q.stderr || ""}`);
     }
     if (modes.length === 0) throw new Error(`Could not parse nvpmodel modes (config path: ${cfgPath})`);
 
-    const numeric = modes.filter((x) => Number.isFinite(x.watts));
-    let chosen = numeric[0] || modes[0];
-    for (const mode of numeric) {
-      if (mode.watts <= req) chosen = mode;
-    }
+    const chosen = pickTargetPowerMode(modes, req);
+    if (!chosen) throw new Error("No power mode candidates found");
+    emitLog(`Power mode target selected: requested ${req}W -> mode ${chosen.id} (${chosen.name})`);
+
+    const beforeQ = await execCommand(conn, "bash -lc \"nvpmodel -q --verbose 2>/dev/null || nvpmodel -q 2>/dev/null || true\"");
+    const before = parseCurrentNvpmodelState(`${beforeQ.stdout || ""}\n${beforeQ.stderr || ""}`);
+
     const pw = shSingle(cfg.pass || "");
     const applyLog = `/tmp/vortex_nvp_apply_${Date.now()}.log`;
     const apply = await execCommand(
       conn,
-      `bash -lc "echo ${pw} | sudo -S -p '' nvpmodel -m ${chosen.id} > '${applyLog}' 2>&1; code=\\$?; cat '${applyLog}'; exit \\$code"`
+      `bash -lc "echo ${pw} | sudo -S -p '' bash -lc \\\"printf 'YES\\\\n' | /usr/sbin/nvpmodel -m ${chosen.id}\\\" > '${applyLog}' 2>&1; code=\\$?; cat '${applyLog}'; exit \\$code"`
     );
     const out = String((apply.stdout || "") + "\n" + (apply.stderr || "")).trim();
-    const rebootRequired = /reboot required/i.test(out) || /DO YOU WANT TO REBOOT NOW/i.test(out);
-    if (apply.code !== 0) {
-      if (rebootRequired) {
-        return { ok: false, rebootRequired: true, error: "Reboot required for this power mode. Reboot Jetson, then apply again." };
-      }
-      throw new Error(out || `nvpmodel apply failed (exit=${apply.code})`);
+    const applyCode = Number.isFinite(Number(apply.code)) ? Number(apply.code) : null;
+    const likelyRebootDisconnect = applyCode == null;
+    const rebootRequired =
+      /reboot required/i.test(out) ||
+      /DO YOU WANT TO REBOOT NOW/i.test(out) ||
+      likelyRebootDisconnect;
+    const rebootAlreadyStarted =
+      /rebooting/i.test(out) ||
+      /Connection to .* closed/i.test(out) ||
+      likelyRebootDisconnect;
+    if (applyCode !== null && applyCode !== 0 && !rebootRequired) {
+      throw new Error(out || `nvpmodel apply failed (exit=${applyCode})`);
     }
+
+    if (rebootRequired) {
+      if (rebootAlreadyStarted) {
+        emitLog(`Jetson accepted mode ${chosen.name} and already started reboot.`);
+      } else {
+        emitLog(`Jetson requires reboot to apply mode ${chosen.name}. Rebooting now...`);
+        try {
+          await execCommand(
+            conn,
+            `bash -lc "echo ${pw} | sudo -S -p '' reboot >/tmp/vortex_reboot_${Date.now()}.log 2>&1 || true"`
+          );
+        } catch (_err) {
+          // expected to disconnect quickly once reboot starts
+        }
+      }
+      conn.end();
+
+      emitLog("Waiting for Jetson to come back online...");
+      const online = await waitForJetsonReconnect(settings, 180000);
+      if (!online) {
+        return {
+          ok: false,
+          rebootRequired: true,
+          rebooting: true,
+          error: "Jetson reboot started but SSH did not come back within 180s."
+        };
+      }
+      emitLog("Jetson is back online. Verifying applied power mode...");
+      const verifyConn = await connectSsh(settings);
+      try {
+        const afterQ = await execCommand(
+          verifyConn,
+          "bash -lc \"nvpmodel -q --verbose 2>/dev/null || nvpmodel -q 2>/dev/null || true\""
+        );
+        const after = parseCurrentNvpmodelState(`${afterQ.stdout || ""}\n${afterQ.stderr || ""}`);
+        if (after.id === chosen.id || (after.name && after.name === chosen.name)) {
+          emitLog(`Jetson power mode applied after reboot: ${after.name || chosen.name} (${after.id ?? chosen.id})`);
+          return {
+            ok: true,
+            requestedWatts: req,
+            modeId: chosen.id,
+            modeWatts: chosen.watts,
+            modeName: chosen.name,
+            rebootRequired: true,
+            rebooting: false,
+            rebooted: true,
+            previousModeId: before.id,
+            previousModeName: before.name
+          };
+        }
+        return {
+          ok: false,
+          error: `Reboot completed, but mode verify failed. Expected ${chosen.name} (${chosen.id}), got ${after.name || "unknown"} (${after.id ?? "?"}).`,
+          rebootRequired: true,
+          rebooting: false
+        };
+      } finally {
+        verifyConn.end();
+      }
+    }
+
     emitLog(`Jetson power mode set: requested ${req}W, applied mode ${chosen.id} (${chosen.watts}W, ${chosen.name})`);
-    if (rebootRequired) emitLog("Jetson reported reboot required for this power mode change.");
     return {
       ok: true,
       requestedWatts: req,
       modeId: chosen.id,
       modeWatts: chosen.watts,
       modeName: chosen.name,
-      rebootRequired
+      rebootRequired: false,
+      previousModeId: before.id,
+      previousModeName: before.name
     };
   } catch (err) {
     const msg = err?.message || String(err);

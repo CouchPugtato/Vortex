@@ -20,7 +20,6 @@ const TAG_OVERLAY_STICKY_MS = 450;
 const el = {
   runtimePath: document.querySelector("#runtimePath"),
   jetsonWatts: document.querySelector("#jetsonWatts"),
-  jetsonWattsValue: document.querySelector("#jetsonWattsValue"),
   applyJetsonWatts: document.querySelector("#applyJetsonWatts"),
   tagMapPath: document.querySelector("#tagMapPath"),
   onnxPath: document.querySelector("#onnxPath"),
@@ -190,11 +189,11 @@ function hydrateAppConfig(cfg) {
   if (state.selectedCamera == null) {
     state.selectedCamera = 0;
   }
-  if (el.jetsonWatts && el.jetsonWattsValue) {
+  if (el.jetsonWatts) {
     const watts = Number(cfg?.jetson_max_watts);
-    const clamped = Number.isFinite(watts) ? Math.max(5, Math.min(60, Math.round(watts))) : 15;
-    el.jetsonWatts.value = String(clamped);
-    el.jetsonWattsValue.textContent = `${clamped}W`;
+    const allowed = new Set([7, 15, 25]);
+    const selected = Number.isFinite(watts) && allowed.has(Math.round(watts)) ? Math.round(watts) : 15;
+    el.jetsonWatts.value = String(selected);
   }
 }
 
@@ -204,7 +203,10 @@ function readAppConfigFromUI() {
   const tagMapPath = String(el.tagMapPath?.value || state.tagMapPath || "").trim();
   const onnxPath = String(el.onnxPath?.value || state.onnxPath || "").trim();
   const wattsRaw = Number(el.jetsonWatts?.value ?? state.appConfig?.jetson_max_watts ?? 15);
-  const jetsonWatts = Number.isFinite(wattsRaw) ? Math.max(5, Math.min(60, Math.round(wattsRaw))) : 15;
+  const allowed = new Set([7, 15, 25]);
+  const jetsonWatts = Number.isFinite(wattsRaw) && allowed.has(Math.round(wattsRaw))
+    ? Math.round(wattsRaw)
+    : 15;
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
@@ -888,28 +890,32 @@ async function init() {
     appendLog(`Saved runtime config: ${state.runtimePath}`);
   });
 
-  el.jetsonWatts.addEventListener("input", async () => {
-    const v = Math.max(5, Math.min(60, Math.round(Number(el.jetsonWatts.value) || 15)));
+  el.jetsonWatts.addEventListener("change", async () => {
+    const vRaw = Math.round(Number(el.jetsonWatts.value) || 15);
+    const v = [7, 15, 25].includes(vRaw) ? vRaw : 15;
     el.jetsonWatts.value = String(v);
-    el.jetsonWattsValue.textContent = `${v}W`;
     state.appConfig = { ...state.appConfig, jetson_max_watts: v };
     await window.vortexApi.saveAppConfig(readAppConfigFromUI()).catch(() => {});
   });
 
   el.applyJetsonWatts.addEventListener("click", async () => {
-    const v = Math.max(5, Math.min(60, Math.round(Number(el.jetsonWatts.value) || 15)));
+    const vRaw = Math.round(Number(el.jetsonWatts.value) || 15);
+    const v = [7, 15, 25].includes(vRaw) ? vRaw : 15;
     el.jetsonWatts.value = String(v);
-    el.jetsonWattsValue.textContent = `${v}W`;
     state.appConfig = { ...state.appConfig, jetson_max_watts: v };
     const cfg = readAppConfigFromUI();
     await window.vortexApi.saveAppConfig(cfg).catch(() => {});
     const res = await window.vortexApi.setJetsonPowerLimit(cfg, v);
     if (!res?.ok) {
-      appendLog(`Power apply failed: ${res?.error || "unknown error"}`);
-    } else {
-      appendLog(`Power mode applied: request ${v}W -> mode ${res.modeId} (${res.modeWatts}W)`);
-      if (res.rebootRequired) appendLog("Jetson reported reboot required for this power mode change.");
+      if (res?.rebootRequired || res?.rebooting) {
+        appendLog("Power mode change is in progress (reboot/verification).");
+      } else {
+        appendLog(`Power apply failed: ${res?.error || "unknown error"}`);
+      }
+      return;
     }
+    appendLog(`Power mode applied: request ${v}W -> mode ${res.modeId} (${res.modeWatts}W)`);
+    if (res.rebooted) appendLog("Jetson rebooted and power mode verified.");
   });
 
   el.browseTagMap.addEventListener("click", async () => {
