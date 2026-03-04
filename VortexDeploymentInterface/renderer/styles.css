@@ -97,6 +97,13 @@ label {
   margin-top: 8px;
 }
 
+.hint {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  margin-top: 6px;
+}
+
 input, select, button {
   border-radius: 6px;
   border: 1px solid var(--border);
