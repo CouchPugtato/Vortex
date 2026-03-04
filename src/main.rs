@@ -27,7 +27,7 @@ use v4l::io::mmap::Stream as MmapStream;
 use v4l::video::Capture;
 use v4l::io::traits::CaptureStream;
 use v4l::capability::Flags;
-use turbojpeg::{Decompressor, Compressor, Image, PixelFormat, Subsamp};
+use turbojpeg::{Decompressor, Image, PixelFormat};
 use serde::{Deserialize, Serialize};
 use nt_client::{Client, NTAddr, NewClientOptions};
 use nt_client::data::{Properties, SubscriptionOptions};
@@ -122,11 +122,40 @@ struct RobotPoseOut {
 
 #[derive(Debug, Clone, Serialize)]
 struct CameraSnapshotOut {
+    schema_version: u8,
+    descriptors: CameraSnapshotDescriptors,
     camera_index: usize,
     fps: f64,
     apriltags: Vec<AprilTagPose>,
     objects: Vec<YoloBBox>,
     robot_pose: Option<RobotPoseOut>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CameraSnapshotDescriptors {
+    fps_unit: &'static str,
+    apriltag_fields: &'static [&'static str],
+    apriltag_frame: &'static str,
+    object_fields: &'static [&'static str],
+    object_bbox_format: &'static str,
+    robot_pose_fields: &'static [&'static str],
+    robot_pose_frame: &'static str,
+}
+
+const APRILTAG_FIELDS: [&str; 5] = ["id", "x", "y", "z", "floor_z_error"];
+const OBJECT_FIELDS: [&str; 6] = ["class_name", "confidence", "bbox", "x", "y", "z"];
+const ROBOT_POSE_FIELDS: [&str; 4] = ["x", "y", "tags_used", "floor_z_error_avg"];
+
+fn camera_snapshot_descriptors() -> CameraSnapshotDescriptors {
+    CameraSnapshotDescriptors {
+        fps_unit: "frames_per_second",
+        apriltag_fields: &APRILTAG_FIELDS,
+        apriltag_frame: "field_meters",
+        object_fields: &OBJECT_FIELDS,
+        object_bbox_format: "[x, y, w, h] pixels",
+        robot_pose_fields: &ROBOT_POSE_FIELDS,
+        robot_pose_frame: "field_meters",
+    }
 }
 
 struct UdpTelemetry {
@@ -178,6 +207,8 @@ impl UdpTelemetry {
             floor_z_error_avg,
         });
         let payload = CameraSnapshotOut {
+            schema_version: 1,
+            descriptors: camera_snapshot_descriptors(),
             camera_index,
             fps,
             apriltags,
@@ -434,7 +465,7 @@ fn main() -> anyhow::Result<()> {
     
     // parse camera indices from args
     // examples: "0", "0,1", "0 2", "0, 2"
-    // create output directory for debug images
+    // create output directory
     if let Err(e) = std::fs::create_dir_all("output") {
         eprintln!("Failed to create output directory: {}", e);
     }
@@ -466,7 +497,13 @@ fn main() -> anyhow::Result<()> {
 
     fs::create_dir_all(&output_dir_base)?;
 
-    let config_path = Path::new("config/config.json");
+    let config_path_raw = env::var("VORTEX_RUNTIME_CONFIG")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "config/config.json".to_string());
+    let config_path = Path::new(&config_path_raw);
+    println!("Runtime Config: {:?}", config_path);
     let runtime_config = match RuntimeConfig::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1001,42 +1038,10 @@ fn spawn_camera_pipeline(
         }
 
         let mut detectors: Vec<DetectorWrapper> = Vec::new();
-        let mut saved_debug_frame = false;
 
         loop {
             if let Ok((mut pixels, width, height)) = rx_decode.recv() {
                 apply_processing(&mut pixels, &processing_config);
-                if !saved_debug_frame {
-                    match Compressor::new() {
-                        Ok(mut compressor) => {
-                            let image = Image {
-                                pixels: pixels.as_slice(),
-                                width,
-                                pitch: width,
-                                height,
-                                format: PixelFormat::GRAY,
-                            };
-                            compressor.set_subsamp(Subsamp::Gray);
-                            
-                            match compressor.compress_to_owned(image) {
-                                Ok(jpg_data) => {
-                                    let filename = format!("output/debug_cam{}.jpg", camera_index);
-                                    println!("DEBUG: Attempting to save frame to {}", filename);
-                                    if let Err(e) = std::fs::write(&filename, jpg_data) {
-                                        eprintln!("Failed to write debug frame: {}", e);
-                                    } else {
-                                        let abs_path = std::fs::canonicalize(&filename).unwrap_or(PathBuf::from(&filename));
-                                        println!("Saved debug frame to {}", abs_path.display());
-                                        saved_debug_frame = true;
-                                    }
-                                },
-                                Err(e) => eprintln!("Failed to compress debug frame: {}", e),
-                            }
-                        },
-                        Err(e) => eprintln!("Failed to create compressor: {}", e),
-                    }
-                }
-
                 if detectors.is_empty() {
                     let mut tag_initialized = false;
 

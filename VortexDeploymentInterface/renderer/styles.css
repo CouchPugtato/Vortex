@@ -164,6 +164,11 @@ button:focus {
   overflow: hidden;
 }
 
+/* Keep spacing between top-level collapsible panels consistent. */
+.left-panel .card.block > details.runtime-section {
+  margin-top: 10px;
+}
+
 .runtime-section > summary {
   cursor: pointer;
   padding: 8px 10px;

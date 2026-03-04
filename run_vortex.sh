@@ -12,9 +12,10 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 # Runtime config
+export VORTEX_RUNTIME_CONFIG="${VORTEX_RUNTIME_CONFIG:-config/config.json}"
 export VORTEX_NT_ENABLE=0
 export VORTEX_UDP_ENABLE=1
 export VORTEX_UDP_TARGET=192.168.1.24
 export VORTEX_UDP_PORT=5809
 
-exec "$BIN" 0,2
+exec "$BIN" 0,1

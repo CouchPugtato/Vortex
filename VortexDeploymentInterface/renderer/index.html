@@ -32,18 +32,59 @@
             <button id="browseTagMap">Browse</button>
             <button id="loadTagMap" class="accent">Load Map</button>
           </div>
-          <label>ONNX Model</label>
-          <div class="row">
-            <input id="onnxPath" />
-            <button id="browseOnnx">Browse</button>
-            <button id="uploadOnnxBuild" class="accent">Upload & Build</button>
-          </div>
-          <div class="row">
-            <div id="onnxProgressWrap" class="onnx-progress is-hidden">
-              <progress id="onnxProgress" max="100" value="0"></progress>
-              <span id="onnxProgressText">0%</span>
+          <details class="runtime-section">
+            <summary>Networking</summary>
+            <label>Startup Cameras (Main)</label>
+            <div class="row">
+              <input id="startupCameras" placeholder="0,1" />
             </div>
-          </div>
+            <label>NetworkTables</label>
+            <div class="row">
+              <label class="inline-control">Enable
+                <input id="ntEnable" type="checkbox" />
+              </label>
+              <label class="inline-control">Mode
+                <select id="ntMode">
+                  <option value="team">Team</option>
+                  <option value="custom">Custom IP</option>
+                  <option value="local">Localhost</option>
+                </select>
+              </label>
+            </div>
+            <div class="row">
+              <input id="ntTeam" placeholder="Team Number (e.g. 509)" />
+              <input id="ntServer" placeholder="Custom NT Server IPv4" />
+            </div>
+            <div class="row">
+              <input id="ntTable" placeholder="/Vortex/Vision" />
+            </div>
+            <label>UDP Telemetry</label>
+            <div class="row">
+              <label class="inline-control">Enable
+                <input id="udpEnable" type="checkbox" />
+              </label>
+            </div>
+            <div class="row">
+              <input id="udpTarget" placeholder="UDP Target IPv4" />
+              <input id="udpPort" placeholder="UDP Port (5809)" />
+            </div>
+          </details>
+          <details class="runtime-section">
+            <summary>Object Detection</summary>
+            <label>ONNX Model</label>
+            <div class="row">
+              <input id="onnxPath" />
+              <button id="browseOnnx">Browse</button>
+              <button id="uploadOnnxBuild" class="accent">Upload & Build</button>
+            </div>
+            <div class="row">
+              <div id="onnxProgressWrap" class="onnx-progress is-hidden">
+                <progress id="onnxProgress" max="100" value="0"></progress>
+                <span id="onnxProgressText">0%</span>
+              </div>
+            </div>
+            <div id="objectDetectionForm"></div>
+          </details>
           <div id="runtimeForm"></div>
         </section>
         <section class="card block">

@@ -15,7 +15,8 @@ const FIXED_SSH = Object.freeze({
 });
 const serviceGuard = {
   activeCount: 0,
-  lastSettings: null
+  lastSettings: null,
+  resumeInFlight: null
 };
 let quitCleanupInProgress = false;
 
@@ -145,7 +146,16 @@ function defaultAppConfig() {
     preview_remote_path: "/tmp/vortex_preview.jpg",
     preview_state_path: "/tmp/vortex_bridge_state.json",
     preview_capture_cmd: "",
-    jetson_max_watts: 15
+    jetson_max_watts: 15,
+    startup_camera_indices: "0,1",
+    vortex_nt_enable: false,
+    vortex_nt_mode: "team",
+    vortex_nt_team: "509",
+    vortex_nt_server: "",
+    vortex_nt_table: "/Vortex/Vision",
+    vortex_udp_enable: true,
+    vortex_udp_target: "192.168.1.24",
+    vortex_udp_port: 5809
   };
 }
 
@@ -213,6 +223,21 @@ async function beginManagedToolActivity(settings, label) {
 function endManagedToolActivity() {
   if (serviceGuard.activeCount > 0) {
     serviceGuard.activeCount -= 1;
+  }
+  if (
+    serviceGuard.activeCount === 0 &&
+    serviceGuard.lastSettings &&
+    hasManagedService(serviceGuard.lastSettings) &&
+    !serviceGuard.resumeInFlight
+  ) {
+    const resumeSettings = serviceGuard.lastSettings;
+    serviceGuard.resumeInFlight = startManagedStartupService(resumeSettings, "tool-idle")
+      .catch((err) => {
+        emitLog(`Service auto-resume failed: ${err?.message || String(err)}`);
+      })
+      .finally(() => {
+        serviceGuard.resumeInFlight = null;
+      });
   }
 }
 
@@ -292,6 +317,107 @@ function stripOuterQuotes(s) {
 
 function shSingle(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function normalizeCameraIndicesArg(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "0,1";
+  const parts = text
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => Number(p))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 63)
+    .map((n) => String(Math.trunc(n)));
+  if (parts.length === 0) return "0,1";
+  return [...new Set(parts)].join(",");
+}
+
+function normalizeNtMode(raw) {
+  const mode = String(raw || "").trim().toLowerCase();
+  if (mode === "local" || mode === "custom" || mode === "team") return mode;
+  return "team";
+}
+
+function normalizeUdpPort(raw, fallback = 5809) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.trunc(n);
+  if (i < 1 || i > 65535) return fallback;
+  return i;
+}
+
+function buildRunVortexScript(settings) {
+  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+  const cameraArg = normalizeCameraIndicesArg(settings.startup_camera_indices);
+  const ntEnable = !!settings.vortex_nt_enable;
+  const ntMode = normalizeNtMode(settings.vortex_nt_mode);
+  const ntTeam = String(settings.vortex_nt_team || "509").trim() || "509";
+  const ntServer = String(settings.vortex_nt_server || "").trim();
+  const ntTable = String(settings.vortex_nt_table || "/Vortex/Vision").trim() || "/Vortex/Vision";
+  const udpEnable = !!settings.vortex_udp_enable;
+  const udpTarget = String(settings.vortex_udp_target || "").trim();
+  const udpPort = normalizeUdpPort(settings.vortex_udp_port, 5809);
+
+  const lines = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    "",
+    `APP_DIR=${shSingle(remoteTarget)}`,
+    "BIN=\"$APP_DIR/target/release/dumapril-taglocalization\"",
+    "CAMERAS=" + shSingle(cameraArg),
+    "",
+    "cd \"$APP_DIR\"",
+    "",
+    "if [[ ! -x \"$BIN\" ]]; then",
+    "  echo \"[vortex] release binary missing, building...\"",
+    "  cargo build --release --bin dumapril-taglocalization",
+    "fi",
+    "",
+    "export VORTEX_RUNTIME_CONFIG=\"${VORTEX_RUNTIME_CONFIG:-config/config.json}\"",
+    `export VORTEX_NT_ENABLE=${ntEnable ? "1" : "0"}`,
+    `export VORTEX_NT_TABLE=${shSingle(ntTable)}`
+  ];
+
+  if (ntEnable) {
+    if (ntMode === "local") {
+      lines.push("unset VORTEX_NT_TEAM");
+      lines.push("unset VORTEX_NT_SERVER");
+    } else if (ntMode === "custom") {
+      if (ntServer) lines.push(`export VORTEX_NT_SERVER=${shSingle(ntServer)}`);
+      lines.push("unset VORTEX_NT_TEAM");
+    } else {
+      lines.push(`export VORTEX_NT_TEAM=${shSingle(ntTeam)}`);
+      lines.push("unset VORTEX_NT_SERVER");
+    }
+  } else {
+    lines.push("unset VORTEX_NT_TEAM");
+    lines.push("unset VORTEX_NT_SERVER");
+  }
+
+  lines.push(`export VORTEX_UDP_ENABLE=${udpEnable ? "1" : "0"}`);
+  if (udpEnable) {
+    if (udpTarget) lines.push(`export VORTEX_UDP_TARGET=${shSingle(udpTarget)}`);
+    lines.push(`export VORTEX_UDP_PORT=${udpPort}`);
+  }
+
+  lines.push("");
+  lines.push("exec \"$BIN\" \"$CAMERAS\"");
+  lines.push("");
+  return lines.join("\n");
+}
+
+async function syncRemoteStartupScript(conn, settings) {
+  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+  const runScriptPath = `${remoteTarget}/run_vortex.sh`;
+  const content = Buffer.from(buildRunVortexScript(settings), "utf8");
+  const sftp = await getSftp(conn);
+  await sftpWriteFile(sftp, runScriptPath, content);
+  await execCommand(
+    conn,
+    `bash -lc "sed -i 's/\\r$//' '${runScriptPath}'; chmod +x '${runScriptPath}'"`
+  );
+  emitLog("Remote startup script updated from Deployment Interface networking settings.");
 }
 
 function tailForLog(text, limit = 6000) {
@@ -660,9 +786,12 @@ async function deployProject(settings) {
       throw new Error(`Refusing to delete unsafe remote path: ${remoteTarget}`);
     }
 
-    emitLog(`Clearing remote folder: ${remoteTarget}`);
-    await execCommand(conn, `rm -rf '${remoteTarget}'`);
+    emitLog(`Clearing remote folder (preserving target/): ${remoteTarget}`);
     await execCommand(conn, `mkdir -p '${remoteTarget}'`);
+    await execCommand(
+      conn,
+      `bash -lc "find '${remoteTarget}' -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +"`
+    );
     emitLog(`Remote folder: ${remoteTarget}`);
 
     const sftp = await getSftp(conn);
@@ -691,6 +820,9 @@ async function deployProject(settings) {
         status: "uploading"
       });
     }
+
+    await syncRemoteStartupScript(conn, settings);
+
     emitLog("Deployment finished successfully.");
     emitDeployProgress({ percent: 100, current: total, total, status: "done" });
   } finally {
@@ -780,6 +912,9 @@ async function buildMainProgram(settings) {
         }
       });
     });
+
+    await syncRemoteStartupScript(conn, settings);
+    emitLog("Post-build startup script sync complete.");
   } finally {
     conn.end();
   }
@@ -1140,11 +1275,16 @@ async function resolveMonitorCommand(conn, settings) {
 const monitorManager = {
   conn: null,
   channel: null,
+  restartTimer: null,
   stopping: false,
   settings: null,
   activityHeld: false,
   async start(settings) {
     if (this.conn) throw new Error("Monitor already running");
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     this.settings = settings;
     this.stopping = false;
     try {
@@ -1154,6 +1294,11 @@ const monitorManager = {
 
       emitMonitorStartProgress({ status: "starting", percent: 55, text: "Resolving monitor..." });
       const resolvedStart = await resolveMonitorCommand(this.conn, settings);
+      emitMonitorStartProgress({ status: "starting", percent: 70, text: "Freeing camera devices..." });
+      await execCommand(
+        this.conn,
+        "bash -lc \"pkill -f dumapril-taglocalization >/dev/null 2>&1 || true; pkill -f orin_bridge >/dev/null 2>&1 || true; sleep 0.25\""
+      );
       emitMonitorStartProgress({ status: "starting", percent: 85, text: "Launching monitor..." });
       const cmd = `bash -lc "${String(resolvedStart).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
       this.channel = await execCommand(this.conn, cmd, { stream: true });
@@ -1176,11 +1321,12 @@ const monitorManager = {
         if (msg) emitLog(msg);
       });
       this.channel.on("close", async (code, signal) => {
+        const restartSettings = this.settings;
         if (pending.trim()) {
           emitMonitorLine(pending.trim());
           if (!isDetectionLine(pending.trim())) emitLog(pending.trim());
         }
-        if (this.activityHeld) {
+        if (this.activityHeld && this.stopping) {
           endManagedToolActivity();
           this.activityHeld = false;
         }
@@ -1190,6 +1336,15 @@ const monitorManager = {
         if (!this.stopping) {
           const exitCode = typeof code === "number" ? code : "unknown";
           emitLog(`Monitor stream ended (exit=${exitCode}${signal ? `, signal=${signal}` : ""}).`);
+          emitLog("Monitor exited unexpectedly. Restarting in 2s...");
+          this.restartTimer = setTimeout(async () => {
+            this.restartTimer = null;
+            try {
+              await this.start(restartSettings);
+            } catch (err) {
+              emitLog(`Monitor auto-restart failed: ${err?.message || String(err)}`);
+            }
+          }, 2000);
         }
       });
     } catch (err) {
@@ -1201,6 +1356,10 @@ const monitorManager = {
   },
   async stop() {
     this.stopping = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     try {
       if (this.settings && this.settings.monitor_stop_cmd) {
         const stopConn = await connectSsh(this.settings);

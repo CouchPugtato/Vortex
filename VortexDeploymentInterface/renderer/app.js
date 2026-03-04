@@ -21,6 +21,15 @@ const el = {
   runtimePath: document.querySelector("#runtimePath"),
   jetsonWatts: document.querySelector("#jetsonWatts"),
   applyJetsonWatts: document.querySelector("#applyJetsonWatts"),
+  startupCameras: document.querySelector("#startupCameras"),
+  ntEnable: document.querySelector("#ntEnable"),
+  ntMode: document.querySelector("#ntMode"),
+  ntTeam: document.querySelector("#ntTeam"),
+  ntServer: document.querySelector("#ntServer"),
+  ntTable: document.querySelector("#ntTable"),
+  udpEnable: document.querySelector("#udpEnable"),
+  udpTarget: document.querySelector("#udpTarget"),
+  udpPort: document.querySelector("#udpPort"),
   tagMapPath: document.querySelector("#tagMapPath"),
   onnxPath: document.querySelector("#onnxPath"),
   browseTagMap: document.querySelector("#browseTagMap"),
@@ -30,6 +39,7 @@ const el = {
   onnxProgressWrap: document.querySelector("#onnxProgressWrap"),
   onnxProgress: document.querySelector("#onnxProgress"),
   onnxProgressText: document.querySelector("#onnxProgressText"),
+  objectDetectionForm: document.querySelector("#objectDetectionForm"),
   loadRuntime: document.querySelector("#loadRuntime"),
   saveRuntime: document.querySelector("#saveRuntime"),
   runtimeForm: document.querySelector("#runtimeForm"),
@@ -58,6 +68,25 @@ const el = {
   logs: document.querySelector("#logs"),
   robotPoseText: document.querySelector("#robotPoseText"),
   fieldMapCanvas: document.querySelector("#fieldMapCanvas")
+};
+
+const CONTROL_SPEC = {
+  "processing.smoothing_alpha": { type: "range", min: 0, max: 1, step: 0.01 },
+  "processing.black_level_offset": { type: "range", min: 0, max: 64, step: 1 },
+  "processing.sensor_gain": { type: "range", min: 0.01, max: 2, step: 0.01 },
+  "processing.red_balance": { type: "range", min: 0, max: 4096, step: 1 },
+  "processing.blue_balance": { type: "range", min: 0, max: 4096, step: 1 },
+  "object_detection.use_nn": { type: "checkbox", defaultValue: true },
+  "object_detection.yolo_obj_width_m": { type: "text" },
+  "object_detection.yolo_obj_height_m": { type: "text" },
+  "object_detection.confidence_threshold": { type: "range", min: 0, max: 1, step: 0.01 }
+};
+
+const LABEL_MAP = {
+  "object_detection.use_nn": "use_nn",
+  "object_detection.yolo_obj_width_m": "obj_width_m",
+  "object_detection.yolo_obj_height_m": "obj_height_m",
+  "object_detection.confidence_threshold": "confidence_threshold"
 };
 
 function appendLog(msg) {
@@ -195,6 +224,57 @@ function hydrateAppConfig(cfg) {
     const selected = Number.isFinite(watts) && allowed.has(Math.round(watts)) ? Math.round(watts) : 15;
     el.jetsonWatts.value = String(selected);
   }
+  if (el.startupCameras) {
+    el.startupCameras.value = normalizeCameraIndices(cfg?.startup_camera_indices || "0,1");
+  }
+  if (el.ntEnable) el.ntEnable.checked = Boolean(cfg?.vortex_nt_enable);
+  if (el.ntMode) el.ntMode.value = normalizeNtMode(cfg?.vortex_nt_mode || "team");
+  if (el.ntTeam) el.ntTeam.value = String(cfg?.vortex_nt_team || "509");
+  if (el.ntServer) el.ntServer.value = String(cfg?.vortex_nt_server || "");
+  if (el.ntTable) el.ntTable.value = String(cfg?.vortex_nt_table || "/Vortex/Vision");
+  if (el.udpEnable) el.udpEnable.checked = cfg?.vortex_udp_enable == null ? true : Boolean(cfg?.vortex_udp_enable);
+  if (el.udpTarget) el.udpTarget.value = String(cfg?.vortex_udp_target || "192.168.1.24");
+  if (el.udpPort) el.udpPort.value = String(normalizePort(cfg?.vortex_udp_port, 5809));
+  syncNetworkFieldState();
+}
+
+function normalizeCameraIndices(raw) {
+  const parts = String(raw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => Number(s))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 63)
+    .map((n) => String(Math.trunc(n)));
+  if (parts.length === 0) return "0,1";
+  return [...new Set(parts)].join(",");
+}
+
+function normalizeNtMode(raw) {
+  const mode = String(raw || "").trim().toLowerCase();
+  if (mode === "team" || mode === "custom" || mode === "local") return mode;
+  return "team";
+}
+
+function normalizePort(raw, fallback = 5809) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.trunc(n);
+  if (i < 1 || i > 65535) return fallback;
+  return i;
+}
+
+function syncNetworkFieldState() {
+  const ntEnabled = Boolean(el.ntEnable?.checked);
+  const ntMode = normalizeNtMode(el.ntMode?.value || "team");
+  if (el.ntMode) el.ntMode.disabled = !ntEnabled;
+  if (el.ntTeam) el.ntTeam.disabled = !ntEnabled || ntMode !== "team";
+  if (el.ntServer) el.ntServer.disabled = !ntEnabled || ntMode !== "custom";
+  if (el.ntTable) el.ntTable.disabled = !ntEnabled;
+
+  const udpEnabled = Boolean(el.udpEnable?.checked);
+  if (el.udpTarget) el.udpTarget.disabled = !udpEnabled;
+  if (el.udpPort) el.udpPort.disabled = !udpEnabled;
 }
 
 function readAppConfigFromUI() {
@@ -207,12 +287,32 @@ function readAppConfigFromUI() {
   const jetsonWatts = Number.isFinite(wattsRaw) && allowed.has(Math.round(wattsRaw))
     ? Math.round(wattsRaw)
     : 15;
+  const startupCameraIndices = normalizeCameraIndices(
+    el.startupCameras?.value || state.appConfig?.startup_camera_indices || "0,1"
+  );
+  const ntEnable = Boolean(el.ntEnable?.checked ?? state.appConfig?.vortex_nt_enable);
+  const ntMode = normalizeNtMode(el.ntMode?.value || state.appConfig?.vortex_nt_mode || "team");
+  const ntTeam = String(el.ntTeam?.value || state.appConfig?.vortex_nt_team || "509").trim() || "509";
+  const ntServer = String(el.ntServer?.value || state.appConfig?.vortex_nt_server || "").trim();
+  const ntTable = String(el.ntTable?.value || state.appConfig?.vortex_nt_table || "/Vortex/Vision").trim() || "/Vortex/Vision";
+  const udpEnable = Boolean(el.udpEnable?.checked ?? state.appConfig?.vortex_udp_enable ?? true);
+  const udpTarget = String(el.udpTarget?.value || state.appConfig?.vortex_udp_target || "192.168.1.24").trim();
+  const udpPort = normalizePort(el.udpPort?.value || state.appConfig?.vortex_udp_port || 5809, 5809);
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
     tag_map_path: tagMapPath,
     onnx_model_path: onnxPath,
-    jetson_max_watts: jetsonWatts
+    jetson_max_watts: jetsonWatts,
+    startup_camera_indices: startupCameraIndices,
+    vortex_nt_enable: ntEnable,
+    vortex_nt_mode: ntMode,
+    vortex_nt_team: ntTeam,
+    vortex_nt_server: ntServer,
+    vortex_nt_table: ntTable,
+    vortex_udp_enable: udpEnable,
+    vortex_udp_target: udpTarget,
+    vortex_udp_port: udpPort
   };
 }
 
@@ -231,41 +331,15 @@ function renderRuntimeForm(config) {
     "red_balance",
     "blue_balance"
   ];
-  const orderedObjectDetection = [
-    "use_nn",
-    "yolo_obj_width_m",
-    "yolo_obj_height_m",
-    "confidence_threshold"
-  ];
-
   const sections = [
     { key: "camera", title: "Camera Intrinsics Profile", fields: orderedCameraIntrinsics },
     { key: "camera", title: "Camera Translation", fields: orderedCameraTranslation },
-    { key: "processing", title: "Processing Constants", fields: orderedProcessing },
-    { key: "object_detection", title: "Object Detection Constants", fields: orderedObjectDetection }
+    { key: "processing", title: "Processing Constants", fields: orderedProcessing }
   ];
-  const controlSpec = {
-    "processing.smoothing_alpha": { type: "range", min: 0, max: 1, step: 0.01 },
-    "processing.black_level_offset": { type: "range", min: 0, max: 64, step: 1 },
-    "processing.sensor_gain": { type: "range", min: 0.01, max: 2, step: 0.01 },
-    "processing.red_balance": { type: "range", min: 0, max: 4096, step: 1 },
-    "processing.blue_balance": { type: "range", min: 0, max: 4096, step: 1 },
-    "object_detection.use_nn": { type: "checkbox", defaultValue: true },
-    "object_detection.yolo_obj_width_m": { type: "text" },
-    "object_detection.yolo_obj_height_m": { type: "text" },
-    "object_detection.confidence_threshold": { type: "range", min: 0, max: 1, step: 0.01 }
-  };
-  const labelMap = {
-    "object_detection.use_nn": "use_nn",
-    "object_detection.yolo_obj_width_m": "obj_width_m",
-    "object_detection.yolo_obj_height_m": "obj_height_m",
-    "object_detection.confidence_threshold": "confidence_threshold"
-  };
 
   for (const section of sections) {
     const details = document.createElement("details");
     details.className = "runtime-section";
-    details.open = true;
 
     const summary = document.createElement("summary");
     summary.textContent = section.title;
@@ -279,8 +353,8 @@ function renderRuntimeForm(config) {
       wrap.dataset.section = section.key;
       wrap.dataset.key = key;
       const fullKey = `${section.key}.${key}`;
-      wrap.textContent = labelMap[fullKey] || key;
-      const spec = controlSpec[`${section.key}.${key}`];
+      wrap.textContent = LABEL_MAP[fullKey] || key;
+      const spec = CONTROL_SPEC[`${section.key}.${key}`];
       const input = document.createElement("input");
       input.dataset.section = section.key;
       input.dataset.key = key;
@@ -324,12 +398,67 @@ function renderRuntimeForm(config) {
   }
 }
 
-function readRuntimeConfigFromForm() {
-  const formResult = { camera: {}, processing: {}, object_detection: {} };
-  const inputs = el.runtimeForm.querySelectorAll("input");
+function renderObjectDetectionForm(config) {
+  if (!el.objectDetectionForm) return;
+  el.objectDetectionForm.innerHTML = "";
+  const fields = ["use_nn", "yolo_obj_width_m", "yolo_obj_height_m", "confidence_threshold"];
+  const grid = document.createElement("div");
+  grid.className = "runtime-grid";
+
+  for (const key of fields) {
+    const section = "object_detection";
+    const wrap = document.createElement("label");
+    wrap.dataset.section = section;
+    wrap.dataset.key = key;
+    const fullKey = `${section}.${key}`;
+    wrap.textContent = LABEL_MAP[fullKey] || key;
+    const spec = CONTROL_SPEC[fullKey];
+    const input = document.createElement("input");
+    input.dataset.section = section;
+    input.dataset.key = key;
+    const value = config?.[section]?.[key];
+
+    if (spec?.type === "checkbox") {
+      input.type = "checkbox";
+      input.className = "toggle-input";
+      input.checked = value == null ? Boolean(spec.defaultValue) : Boolean(value);
+      input.addEventListener("change", () => scheduleLiveRuntimeSync());
+    } else if (spec?.type === "range") {
+      input.type = "range";
+      input.className = "slider-input";
+      input.min = String(spec.min);
+      input.max = String(spec.max);
+      input.step = String(spec.step);
+      input.value = String(value ?? spec.min);
+      const valueEl = document.createElement("span");
+      valueEl.className = "slider-value";
+      valueEl.textContent = input.value;
+      input.addEventListener("input", () => {
+        valueEl.textContent = input.value;
+        scheduleLiveRuntimeSync();
+      });
+      wrap.appendChild(input);
+      wrap.appendChild(valueEl);
+      grid.appendChild(wrap);
+      continue;
+    } else {
+      input.type = "text";
+      input.value = value ?? "";
+      input.addEventListener("change", () => scheduleLiveRuntimeSync());
+    }
+    wrap.appendChild(input);
+    grid.appendChild(wrap);
+  }
+
+  el.objectDetectionForm.appendChild(grid);
+}
+
+function collectRuntimeInputs(container, formResult) {
+  const inputs = container?.querySelectorAll("input") || [];
   for (const input of inputs) {
     const section = input.dataset.section;
     const key = input.dataset.key;
+    if (!section || !key || !formResult[section]) continue;
     if (input.type === "checkbox") {
       formResult[section][key] = input.checked;
       continue;
@@ -342,6 +471,12 @@ function readRuntimeConfigFromForm() {
     const num = Number(raw);
     formResult[section][key] = Number.isFinite(num) && raw !== "" ? num : raw;
   }
+}
+
+function readRuntimeConfigFromForm() {
+  const formResult = { camera: {}, processing: {}, object_detection: {} };
+  collectRuntimeInputs(el.runtimeForm, formResult);
+  collectRuntimeInputs(el.objectDetectionForm, formResult);
   const merged = JSON.parse(JSON.stringify(state.runtimeConfig || {}));
   if (!merged.camera_profiles || typeof merged.camera_profiles !== "object") {
     merged.camera_profiles = {};
@@ -428,6 +563,7 @@ function renderRuntimeFormForCurrentCamera() {
     cfg.camera = cloneCameraConfig(profile);
   }
   renderRuntimeForm(cfg);
+  renderObjectDetectionForm(cfg);
 }
 
 async function refreshRemoteCameras() {
@@ -896,6 +1032,34 @@ async function init() {
     el.jetsonWatts.value = String(v);
     state.appConfig = { ...state.appConfig, jetson_max_watts: v };
     await window.vortexApi.saveAppConfig(readAppConfigFromUI()).catch(() => {});
+  });
+
+  const saveNetworkConfig = async () => {
+    if (el.startupCameras) {
+      el.startupCameras.value = normalizeCameraIndices(el.startupCameras.value);
+    }
+    if (el.udpPort) {
+      el.udpPort.value = String(normalizePort(el.udpPort.value, 5809));
+    }
+    syncNetworkFieldState();
+    state.appConfig = readAppConfigFromUI();
+    await window.vortexApi.saveAppConfig(state.appConfig).catch(() => {});
+  };
+
+  [
+    el.startupCameras,
+    el.ntEnable,
+    el.ntMode,
+    el.ntTeam,
+    el.ntServer,
+    el.ntTable,
+    el.udpEnable,
+    el.udpTarget,
+    el.udpPort
+  ].forEach((input) => {
+    if (!input) return;
+    const evt = input.type === "checkbox" || input.tagName === "SELECT" ? "change" : "blur";
+    input.addEventListener(evt, saveNetworkConfig);
   });
 
   el.applyJetsonWatts.addEventListener("click", async () => {

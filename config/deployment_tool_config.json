@@ -13,5 +13,14 @@
   "preview_remote_path": "/tmp/vortex_bridge_frame.jpg",
   "preview_state_path": "/tmp/vortex_bridge_state.json",
   "preview_capture_cmd": "",
-  "jetson_max_watts": 7
+  "jetson_max_watts": 7,
+  "startup_camera_indices": "0,1",
+  "vortex_nt_enable": true,
+  "vortex_nt_mode": "team",
+  "vortex_nt_team": "509",
+  "vortex_nt_server": "",
+  "vortex_nt_table": "/Vortex/Vision",
+  "vortex_udp_enable": true,
+  "vortex_udp_target": "192.168.1.24",
+  "vortex_udp_port": 5809
 }
