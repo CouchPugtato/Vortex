@@ -1,8 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Alias,
+    [string]$Alias = "jetson-usb",
 
-    [string]$Host = "192.168.55.1",
+    [string]$JetsonHost = "192.168.55.1",
 
     [string]$User = "vortex",
 
@@ -34,17 +33,17 @@ if (-not (Test-Path $knownHosts)) {
 }
 
 if ($ReplaceKey) {
-    Write-Host "Removing stored host keys for alias '$Alias' and host '$Host'..."
+    Write-Host "Removing stored host keys for alias '$Alias' and host '$JetsonHost'..."
     & ssh-keygen -R $Alias -f $knownHosts | Out-Host
-    & ssh-keygen -R $Host -f $knownHosts | Out-Host
+    & ssh-keygen -R $JetsonHost -f $knownHosts | Out-Host
 }
 
 $sshArgs = @(
     "-o", "HostKeyAlias=$Alias",
     "-o", "UserKnownHostsFile=$knownHosts",
     "-o", "StrictHostKeyChecking=accept-new",
-    "$User@$Host"
+    "$User@$JetsonHost"
 )
 
-Write-Host "Connecting to $User@$Host using host key alias '$Alias'..."
+Write-Host "Connecting to $User@$JetsonHost using host key alias '$Alias'..."
 & ssh @sshArgs
