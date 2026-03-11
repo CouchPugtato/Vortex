@@ -350,14 +350,7 @@ function normalizeUdpPort(raw, fallback = 5809) {
 function buildRunVortexScript(settings) {
   const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
   const cameraArg = normalizeCameraIndicesArg(settings.startup_camera_indices);
-  const ntEnable = !!settings.vortex_nt_enable;
-  const ntMode = normalizeNtMode(settings.vortex_nt_mode);
-  const ntTeam = String(settings.vortex_nt_team || "509").trim() || "509";
-  const ntServer = String(settings.vortex_nt_server || "").trim();
   const ntTable = String(settings.vortex_nt_table || "/Vortex/Vision").trim() || "/Vortex/Vision";
-  const udpEnable = !!settings.vortex_udp_enable;
-  const udpTarget = String(settings.vortex_udp_target || "").trim();
-  const udpPort = normalizeUdpPort(settings.vortex_udp_port, 5809);
 
   const lines = [
     "#!/usr/bin/env bash",
@@ -375,31 +368,14 @@ function buildRunVortexScript(settings) {
     "fi",
     "",
     "export VORTEX_RUNTIME_CONFIG=\"${VORTEX_RUNTIME_CONFIG:-config/config.json}\"",
-    `export VORTEX_NT_ENABLE=${ntEnable ? "1" : "0"}`,
-    `export VORTEX_NT_TABLE=${shSingle(ntTable)}`
+    "export VORTEX_NT_ENABLE=0",
+    `export VORTEX_NT_TABLE=${shSingle(ntTable)}`,
+    "unset VORTEX_NT_TEAM",
+    "unset VORTEX_NT_SERVER",
+    "export VORTEX_UDP_ENABLE=1",
+    "export VORTEX_UDP_TARGET=10.5.9.2",
+    "export VORTEX_UDP_PORT=5091"
   ];
-
-  if (ntEnable) {
-    if (ntMode === "local") {
-      lines.push("unset VORTEX_NT_TEAM");
-      lines.push("unset VORTEX_NT_SERVER");
-    } else if (ntMode === "custom") {
-      if (ntServer) lines.push(`export VORTEX_NT_SERVER=${shSingle(ntServer)}`);
-      lines.push("unset VORTEX_NT_TEAM");
-    } else {
-      lines.push(`export VORTEX_NT_TEAM=${shSingle(ntTeam)}`);
-      lines.push("unset VORTEX_NT_SERVER");
-    }
-  } else {
-    lines.push("unset VORTEX_NT_TEAM");
-    lines.push("unset VORTEX_NT_SERVER");
-  }
-
-  lines.push(`export VORTEX_UDP_ENABLE=${udpEnable ? "1" : "0"}`);
-  if (udpEnable) {
-    if (udpTarget) lines.push(`export VORTEX_UDP_TARGET=${shSingle(udpTarget)}`);
-    lines.push(`export VORTEX_UDP_PORT=${udpPort}`);
-  }
 
   lines.push("");
   lines.push("exec \"$BIN\" \"$CAMERAS\"");

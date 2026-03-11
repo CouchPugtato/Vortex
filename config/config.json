@@ -10,11 +10,11 @@
     "p2": -0.0015944157516858115,
     "k3": 0.01684902183689297,
     "tag_size_m": 0.16,
-    "x_offset": 0,
-    "y_offset": 0,
+    "x_offset": 0.3193769,
+    "y_offset": 0.35214,
     "z_offset": 0.4572,
-    "pitch_deg": 0,
-    "yaw_deg": 0,
+    "pitch_deg": 10,
+    "yaw_deg": 45,
     "roll_deg": 0
   },
   "camera_profiles": {
@@ -29,11 +29,11 @@
       "p2": -0.0015944157516858115,
       "k3": 0.01684902183689297,
       "tag_size_m": 0.16,
-      "x_offset": 0,
-      "y_offset": 0,
+      "x_offset": 0.3193769,
+      "y_offset": 0.35214,
       "z_offset": 0.4572,
-      "pitch_deg": 0,
-      "yaw_deg": 0,
+      "pitch_deg": 10,
+      "yaw_deg": 45,
       "roll_deg": 0
     },
     "1": {
@@ -65,11 +65,11 @@
       "p2": -0.0015944157516858115,
       "k3": 0.01684902183689297,
       "tag_size_m": 0.16,
-      "x_offset": 0,
-      "y_offset": 0,
+      "x_offset": 0.3193769,
+      "y_offset": 0.315214,
       "z_offset": 0.4572,
-      "pitch_deg": 0,
-      "yaw_deg": 0,
+      "pitch_deg": 10,
+      "yaw_deg": 45,
       "roll_deg": 0
     },
     "3": {
@@ -130,7 +130,7 @@
   "processing": {
     "smoothing_alpha": 0.23,
     "black_level_offset": 12,
-    "sensor_gain": 0.63,
+    "sensor_gain": 0.64,
     "red_balance": 3910,
     "blue_balance": 3638
   },

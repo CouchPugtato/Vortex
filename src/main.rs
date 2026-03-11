@@ -11,7 +11,7 @@ use nalgebra as _;
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 use std::env;
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
@@ -160,7 +160,7 @@ fn camera_snapshot_descriptors() -> CameraSnapshotDescriptors {
 
 struct UdpTelemetry {
     socket: UdpSocket,
-    target: SocketAddrV4,
+    target: SocketAddr,
 }
 
 impl UdpTelemetry {
@@ -168,21 +168,15 @@ impl UdpTelemetry {
         if !env_flag("VORTEX_UDP_ENABLE", false) {
             return Ok(None);
         }
-        let ip_raw = match env::var("VORTEX_UDP_TARGET") {
+        let target_raw = match env::var("VORTEX_UDP_TARGET") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => return Ok(None),
         };
-        let ip = ip_raw
-            .trim()
-            .parse::<Ipv4Addr>()
-            .map_err(|_| anyhow::anyhow!("Invalid VORTEX_UDP_TARGET '{}'", ip_raw))?;
         let port = env_u64("VORTEX_UDP_PORT", 5809) as u16;
+        let target = resolve_udp_target(&target_raw, port)?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
-        Ok(Some(Self {
-            socket,
-            target: SocketAddrV4::new(ip, port),
-        }))
+        Ok(Some(Self { socket, target }))
     }
 
     fn publish_camera_snapshot(
@@ -245,8 +239,8 @@ impl NtTelemetry {
         let client = Client::new(opts);
 
         let mut topics = HashMap::new();
-        for &idx in camera_indices {
-            let prefix = format!("{}/Camera{}", base_table, idx);
+        for (slot, &idx) in camera_indices.iter().enumerate() {
+            let prefix = format!("{}/camera{}", base_table, slot);
             topics.insert(
                 idx,
                 NtCameraTopics {
@@ -1366,6 +1360,31 @@ fn nt_addr_from_env() -> NTAddr {
         }
     }
     NTAddr::Local
+}
+
+fn resolve_udp_target(target_raw: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    let target = target_raw.trim();
+    if let Ok(ip) = target.parse::<Ipv4Addr>() {
+        return Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+    }
+
+    let mut addrs = (target, port).to_socket_addrs().map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid VORTEX_UDP_TARGET '{}': expected IPv4 or resolvable hostname ({})",
+            target_raw,
+            e
+        )
+    })?;
+
+    addrs
+        .find(|addr| matches!(addr, SocketAddr::V4(_)))
+        .or_else(|| addrs.next())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid VORTEX_UDP_TARGET '{}': hostname resolved to no socket addresses",
+                target_raw
+            )
+        })
 }
 
 fn install_filtered_panic_hook() {
