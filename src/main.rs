@@ -1115,17 +1115,10 @@ fn spawn_camera_pipeline(
                                     (c[2][0], c[2][1]),
                                 ];
 
-                                let corners = if needs_undistort {
-                                    crate::undistort::undistort_points(&corners_raw, &effective_config)
-                                } else {
-                                    corners_raw
-                                };
-
-                                let tag_size = effective_config.tag_size_m;
                                 let (x, y, z, floor_z_error) = if let Some(pose) = pose::estimate_pose(
-                                    &corners,
-                                    tag_size,
-                                    effective_config.fx, effective_config.fy, effective_config.cx, effective_config.cy
+                                    &corners_raw,
+                                    &effective_config,
+                                    true,
                                 ) {
                                     if let Some(tag_field) = tag_map_by_id.get(&apr_det.id) {
                                         let (p_field_robot, z_err) =
@@ -1141,6 +1134,12 @@ fn spawn_camera_pipeline(
                                     }
                                 } else {
                                     // fallback to simple estimation
+                                    let corners = if needs_undistort {
+                                        crate::undistort::undistort_points(&corners_raw, &effective_config)
+                                    } else {
+                                        corners_raw
+                                    };
+                                    let tag_size = effective_config.tag_size_m;
                                     let side_len_px = (
                                         ((corners[0].0 - corners[1].0).powi(2) + (corners[0].1 - corners[1].1).powi(2)).sqrt() +
                                         ((corners[1].0 - corners[2].0).powi(2) + (corners[1].1 - corners[2].1).powi(2)).sqrt() +

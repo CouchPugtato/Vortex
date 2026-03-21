@@ -523,15 +523,10 @@ fn main() -> Result<()> {
                     (c[1][0], c[1][1]), // BR
                     (c[2][0], c[2][1]), // TR
                 ];
-                let corners = undistort::undistort_points(&corners_raw, &camera_cfg);
-                let tag_size = camera_cfg.tag_size_m;
                 let (x, y, z, floor_z_error) = if let Some(p) = pose::estimate_pose(
-                    &corners,
-                    tag_size,
-                    camera_cfg.fx,
-                    camera_cfg.fy,
-                    camera_cfg.cx,
-                    camera_cfg.cy,
+                    &corners_raw,
+                    &camera_cfg,
+                    true,
                 ) {
                     if let Some((map_by_id, _field_meta)) = &tag_map_loaded {
                         if let Some(tag_field) = map_by_id.get(&apr.id) {
