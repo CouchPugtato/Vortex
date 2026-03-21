@@ -76,6 +76,7 @@ struct ProcessedDetections(Vec<ProcessedDetection>);
 struct PipelineStats {
     camera_index: usize,
     detections: ProcessedDetections,
+    joint_robot_pose: Option<(f64, f64, usize, f64)>,
     timestamp: Instant,
 }
 
@@ -601,6 +602,7 @@ fn main() -> anyhow::Result<()> {
     let mut cam_stats: HashMap<usize, (u64, Instant)> = HashMap::new(); // (frame_count, last_report)
     let mut cam_fps: HashMap<usize, f64> = HashMap::new();
     let mut cam_detections: HashMap<usize, Vec<ProcessedDetection>> = HashMap::new();
+    let mut cam_joint_pose: HashMap<usize, Option<(f64, f64, usize, f64)>> = HashMap::new();
     let mut filtered_robot_xy: HashMap<usize, (f64, f64)> = HashMap::new();
     
     // simple exponential smoothing for pose
@@ -614,6 +616,7 @@ fn main() -> anyhow::Result<()> {
         cam_stats.insert(idx, (0, start_time));
         cam_fps.insert(idx, 0.0);
         cam_detections.insert(idx, Vec::new());
+        cam_joint_pose.insert(idx, None);
     }
 
     loop {
@@ -652,6 +655,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             cam_detections.insert(stat.camera_index, smoothed_detections);
+            cam_joint_pose.insert(stat.camera_index, stat.joint_robot_pose);
 
             if let Some((count, last_time)) = cam_stats.get_mut(&stat.camera_index) {
                 *count += 1;
@@ -743,8 +747,13 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
 
+                        let raw_pose = cam_joint_pose
+                            .get(&idx)
+                            .copied()
+                            .flatten()
+                            .or_else(|| robust_fuse_field_pose(&field_candidates));
                         let mut pose_for_publish: Option<(f64, f64, usize, f64)> = None;
-                        if let Some((raw_x, raw_y, used, avg_z_err)) = robust_fuse_field_pose(&field_candidates) {
+                        if let Some((raw_x, raw_y, used, avg_z_err)) = raw_pose {
                             const MAX_STEP_M: f64 = 0.60;
                             const SMOOTH_ALPHA: f64 = 0.18;
                             let prev = filtered_robot_xy.get(&idx).copied();
@@ -1092,6 +1101,9 @@ fn spawn_camera_pipeline(
                 }
 
                 let mut processed_detections = Vec::new();
+                let mut joint_object_points: Vec<Vector3<f64>> = Vec::new();
+                let mut joint_image_points: Vec<(f64, f64)> = Vec::new();
+                let mut joint_initial_pose: Option<pose::PoseEstimate> = None;
 
                 for detector in &mut detectors {
                     let raw_dets = match detector.detect(&pixels, width, height, &processing_config) {
@@ -1145,6 +1157,17 @@ fn spawn_camera_pipeline(
                                 let (x, y, z, floor_z_error) = if let Some((estimate, field_eval)) = selected_estimate {
                                     if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                                         continue;
+                                    }
+                                    if let Some(tag_field) = tag_field {
+                                        let field_corners = tag_field_corner_points(tag_field, effective_config.tag_size_m);
+                                        for (field_corner, image_corner) in field_corners.iter().zip(corners_raw.iter()) {
+                                            joint_object_points.push(*field_corner);
+                                            joint_image_points.push(*image_corner);
+                                        }
+                                        match &joint_initial_pose {
+                                            Some(best) if best.reprojection_rmse_px <= estimate.reprojection_rmse_px => {}
+                                            _ => joint_initial_pose = Some(estimate.clone()),
+                                        }
                                     }
                                     if let Some((p_field_robot, z_err)) = field_eval {
                                         (p_field_robot.x, p_field_robot.y, 0.0, z_err)
@@ -1238,9 +1261,35 @@ fn spawn_camera_pipeline(
                     }
                 }
 
+                let joint_robot_pose = if joint_object_points.len() >= 8 {
+                    joint_initial_pose
+                        .as_ref()
+                        .and_then(|initial| {
+                            pose::estimate_pose_from_correspondences(
+                                &joint_object_points,
+                                &joint_image_points,
+                                &camera_config,
+                                true,
+                                &initial.pose,
+                            )
+                        })
+                        .and_then(|estimate| {
+                            if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
+                                None
+                            } else {
+                                let (robot_field, z_err) =
+                                    estimate_robot_field_from_field_pose(&estimate.pose, &camera_config);
+                                Some((robot_field.x, robot_field.y, joint_object_points.len() / 4, z_err))
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let stat = PipelineStats {
                     camera_index,
                     detections: ProcessedDetections(processed_detections),
+                    joint_robot_pose,
                     timestamp: Instant::now(),
                 };
 
@@ -1337,6 +1386,34 @@ fn resolve_tag_map_path() -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+}
+
+fn estimate_robot_field_from_field_pose(
+    pose: &pose::Pose,
+    camera_cfg: &CameraConfig,
+) -> (Vector3<f64>, f64) {
+    let r_cf = pose.rotation;
+    let r_fc = r_cf.transpose();
+    let p_fc = -r_fc * pose.translation;
+
+    let r_rc = camera_to_robot_rotation(camera_cfg);
+    let r_cr = r_rc.transpose();
+    let cam_offset_robot = Vector3::new(camera_cfg.x_offset, camera_cfg.y_offset, camera_cfg.z_offset);
+    let robot_origin_in_camera = -r_cr * cam_offset_robot;
+    let p_fr = p_fc + r_fc * robot_origin_in_camera;
+    let floor_z_error = p_fr.z.abs();
+    (p_fr, floor_z_error)
+}
+
+fn tag_field_corner_points(tag_field: &FieldTagPose, tag_size_m: f64) -> [Vector3<f64>; 4] {
+    let s = tag_size_m / 2.0;
+    let local = [
+        Vector3::new(-s, -s, 0.0),
+        Vector3::new(-s, s, 0.0),
+        Vector3::new(s, s, 0.0),
+        Vector3::new(s, -s, 0.0),
+    ];
+    local.map(|corner| tag_field.pos + tag_field.rot_field_from_tag * corner)
 }
 
 fn env_flag(key: &str, default: bool) -> bool {

@@ -259,6 +259,34 @@ fn estimate_robot_field_from_tag(
     (p_fr, floor_z_error)
 }
 
+fn estimate_robot_field_from_field_pose(
+    pose: &pose::Pose,
+    camera_cfg: &config::CameraConfig,
+) -> (Vector3<f64>, f64) {
+    let r_cf = pose.rotation;
+    let r_fc = r_cf.transpose();
+    let p_fc = -r_fc * pose.translation;
+
+    let r_rc = camera_to_robot_rotation(camera_cfg);
+    let r_cr = r_rc.transpose();
+    let cam_offset_robot = Vector3::new(camera_cfg.x_offset, camera_cfg.y_offset, camera_cfg.z_offset);
+    let robot_origin_in_camera = -r_cr * cam_offset_robot;
+    let p_fr = p_fc + r_fc * robot_origin_in_camera;
+    let floor_z_error = p_fr.z.abs();
+    (p_fr, floor_z_error)
+}
+
+fn tag_field_corner_points(tag_field: &FieldTagPose, tag_size_m: f64) -> [Vector3<f64>; 4] {
+    let s = tag_size_m / 2.0;
+    let local = [
+        Vector3::new(-s, -s, 0.0),
+        Vector3::new(-s, s, 0.0),
+        Vector3::new(s, s, 0.0),
+        Vector3::new(s, -s, 0.0),
+    ];
+    local.map(|corner| tag_field.pos + tag_field.rot_field_from_tag * corner)
+}
+
 fn robust_fuse_field_pose(candidates: &[(f64, f64, f64, f64)]) -> Option<(f64, f64, usize, f64)> {
     // (x, y, floor_z_error, cam_depth)
     const MAX_FLOOR_ERR_M: f64 = 3.00;
@@ -514,6 +542,9 @@ fn main() -> Result<()> {
         let mut tags = Vec::new();
         let mut objects = Vec::new();
         let mut field_candidates: Vec<(f64, f64, f64, f64)> = Vec::new();
+        let mut joint_object_points: Vec<Vector3<f64>> = Vec::new();
+        let mut joint_image_points: Vec<(f64, f64)> = Vec::new();
+        let mut joint_initial_pose: Option<pose::PoseEstimate> = None;
 
         let dets = cpu.detect(&gray, width, height).unwrap_or_default();
         for det in dets {
@@ -553,6 +584,17 @@ fn main() -> Result<()> {
                 let (x, y, z, floor_z_error, reprojection_rmse_px) = if let Some((estimate, field_eval)) = selected_estimate {
                     if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                         continue;
+                    }
+                    if let Some(tag_field) = tag_field {
+                        let field_corners = tag_field_corner_points(tag_field, camera_cfg.tag_size_m);
+                        for (field_corner, image_corner) in field_corners.iter().zip(corners_raw.iter()) {
+                            joint_object_points.push(*field_corner);
+                            joint_image_points.push(*image_corner);
+                        }
+                        match &joint_initial_pose {
+                            Some(best) if best.reprojection_rmse_px <= estimate.reprojection_rmse_px => {}
+                            _ => joint_initial_pose = Some(estimate.clone()),
+                        }
                     }
                     if let Some((robot_field, z_err)) = field_eval {
                         field_candidates.push((robot_field.x, robot_field.y, z_err, estimate.pose.translation.z.abs()));
@@ -664,8 +706,33 @@ fn main() -> Result<()> {
             fps_last = Instant::now();
         }
 
+        let joint_robot_pose = if joint_object_points.len() >= 8 {
+            joint_initial_pose
+                .as_ref()
+                .and_then(|initial| {
+                    pose::estimate_pose_from_correspondences(
+                        &joint_object_points,
+                        &joint_image_points,
+                        &camera_cfg,
+                        true,
+                        &initial.pose,
+                    )
+                })
+                .and_then(|estimate| {
+                    if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
+                        None
+                    } else {
+                        let (robot_field, z_err) =
+                            estimate_robot_field_from_field_pose(&estimate.pose, &camera_cfg);
+                        Some((robot_field.x, robot_field.y, joint_object_points.len() / 4, z_err))
+                    }
+                })
+        } else {
+            None
+        };
+
         let robot_pose = if let Some((raw_x, raw_y, used, avg_z_err)) =
-            robust_fuse_field_pose(&field_candidates)
+            joint_robot_pose.or_else(|| robust_fuse_field_pose(&field_candidates))
         {
             // temporal smoothing with jump clamp to reduce jitter in UI/telemetry
             const MAX_STEP_M: f64 = 0.60;

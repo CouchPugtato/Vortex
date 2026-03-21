@@ -153,68 +153,57 @@ pub fn estimate_pose(
 
         let fronto_parallel_pose = fronto_parallel_initial_pose(corners, camera);
 
-        let mut best_pose = None;
-        let mut best_cost = f64::INFINITY;
-        for candidate in [Some(initial_pose), fronto_parallel_pose].into_iter().flatten() {
-            let refined = refine_pose_pnp(
-                &candidate,
-                &model_points_3d,
-                corners,
-                camera,
-                apply_distortion,
-            )
-            .or(Some(candidate));
-            if let Some(pose) = refined {
-                if let Some(cost) = reprojection_cost(
-                    &pose_to_params(&pose),
-                    &model_points_3d,
-                    corners,
-                    camera,
-                    apply_distortion,
-                ) {
-                    if cost < best_cost {
-                        best_cost = cost;
-                        best_pose = Some(PoseEstimate {
-                            pose,
-                            reprojection_rmse_px: (cost / 8.0).sqrt(),
-                        });
-                    }
-                }
-            }
-        }
-        return best_pose;
+        return select_best_pose_estimate(
+            &model_points_3d,
+            corners,
+            camera,
+            apply_distortion,
+            [Some(initial_pose), fronto_parallel_pose],
+        );
     }
 
     None
 }
 
+pub fn estimate_pose_from_correspondences(
+    object_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+    apply_distortion: bool,
+    initial_pose: &Pose,
+) -> Option<PoseEstimate> {
+    if object_points.len() != image_points.len() || object_points.len() < 4 {
+        return None;
+    }
+    select_best_pose_estimate(
+        object_points,
+        image_points,
+        camera,
+        apply_distortion,
+        [Some(initial_pose.clone()), None],
+    )
+}
+
 pub fn reprojection_rmse_px_for_pose(
     pose: &Pose,
-    corners: &[(f64, f64); 4],
+    corners: &[(f64, f64)],
     camera: &CameraConfig,
     apply_distortion: bool,
 ) -> Option<f64> {
-    let s = camera.tag_size_m / 2.0;
-    let model_points_3d = [
-        Vector3::new(-s, -s, 0.0),
-        Vector3::new(-s, s, 0.0),
-        Vector3::new(s, s, 0.0),
-        Vector3::new(s, -s, 0.0),
-    ];
     let cost = reprojection_cost(
         &pose_to_params(pose),
-        &model_points_3d,
+        &square_model_points(camera.tag_size_m),
         corners,
         camera,
         apply_distortion,
     )?;
-    Some((cost / 8.0).sqrt())
+    Some((cost / (corners.len() as f64 * 2.0)).sqrt())
 }
 
 fn refine_pose_pnp(
     initial_pose: &Pose,
-    model_points: &[Vector3<f64>; 4],
-    image_points: &[(f64, f64); 4],
+    model_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
     camera: &CameraConfig,
     apply_distortion: bool,
 ) -> Option<Pose> {
@@ -267,8 +256,8 @@ fn refine_pose_pnp(
 
 fn reprojection_cost(
     params: &DVector<f64>,
-    model_points: &[Vector3<f64>; 4],
-    image_points: &[(f64, f64); 4],
+    model_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
     camera: &CameraConfig,
     apply_distortion: bool,
 ) -> Option<f64> {
@@ -279,11 +268,14 @@ fn reprojection_cost(
 
 fn reprojection_residuals(
     params: &DVector<f64>,
-    model_points: &[Vector3<f64>; 4],
-    image_points: &[(f64, f64); 4],
+    model_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
     camera: &CameraConfig,
     apply_distortion: bool,
 ) -> Option<DVector<f64>> {
+    if model_points.len() != image_points.len() || model_points.is_empty() {
+        return None;
+    }
     let pose = params_to_pose(params)?;
     let mut residuals = Vec::with_capacity(8);
     for (point, observed) in model_points.iter().zip(image_points.iter()) {
@@ -296,8 +288,8 @@ fn reprojection_residuals(
 
 fn numerical_jacobian(
     params: &DVector<f64>,
-    model_points: &[Vector3<f64>; 4],
-    image_points: &[(f64, f64); 4],
+    model_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
     camera: &CameraConfig,
     apply_distortion: bool,
 ) -> Option<DMatrix<f64>> {
@@ -423,4 +415,53 @@ fn fronto_parallel_initial_pose(
         rotation: Matrix3::identity(),
         translation: Vector3::new(x, y, z),
     })
+}
+
+fn square_model_points(tag_size_m: f64) -> [Vector3<f64>; 4] {
+    let s = tag_size_m / 2.0;
+    [
+        Vector3::new(-s, -s, 0.0),
+        Vector3::new(-s, s, 0.0),
+        Vector3::new(s, s, 0.0),
+        Vector3::new(s, -s, 0.0),
+    ]
+}
+
+fn select_best_pose_estimate<const N: usize>(
+    model_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+    apply_distortion: bool,
+    candidates: [Option<Pose>; N],
+) -> Option<PoseEstimate> {
+    let mut best_pose = None;
+    let mut best_cost = f64::INFINITY;
+    for candidate in candidates.into_iter().flatten() {
+        let refined = refine_pose_pnp(
+            &candidate,
+            model_points,
+            image_points,
+            camera,
+            apply_distortion,
+        )
+        .or(Some(candidate));
+        if let Some(pose) = refined {
+            if let Some(cost) = reprojection_cost(
+                &pose_to_params(&pose),
+                model_points,
+                image_points,
+                camera,
+                apply_distortion,
+            ) {
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_pose = Some(PoseEstimate {
+                        pose,
+                        reprojection_rmse_px: (cost / (image_points.len() as f64 * 2.0)).sqrt(),
+                    });
+                }
+            }
+        }
+    }
+    best_pose
 }
