@@ -35,6 +35,7 @@ struct TagOut {
     y: f64,
     z: f64,
     floor_z_error: f64,
+    reprojection_rmse_px: f64,
     corners: [[f64; 2]; 4],
     seen_fps: f64,
     seen_pct: f64,
@@ -74,6 +75,8 @@ struct RobotPoseOut {
     tags_used: usize,
     floor_z_error_avg: f64,
 }
+
+const MAX_TAG_REPROJECTION_RMSE_PX: f64 = 2.0;
 
 #[derive(Clone, Debug, Deserialize)]
 struct TagMap {
@@ -523,25 +526,48 @@ fn main() -> Result<()> {
                     (c[1][0], c[1][1]), // BR
                     (c[2][0], c[2][1]), // TR
                 ];
-                let (x, y, z, floor_z_error) = if let Some(p) = pose::estimate_pose(
-                    &corners_raw,
-                    &camera_cfg,
-                    true,
-                ) {
-                    if let Some((map_by_id, _field_meta)) = &tag_map_loaded {
-                        if let Some(tag_field) = map_by_id.get(&apr.id) {
-                            let (robot_field, z_err) =
-                                estimate_robot_field_from_tag(&p, tag_field, &camera_cfg);
-                            field_candidates.push((robot_field.x, robot_field.y, z_err, p.translation.z.abs()));
-                            (robot_field.x, robot_field.y, 0.0, z_err)
-                        } else {
-                            (p.translation.x, p.translation.y, p.translation.z, 0.0)
-                        }
+                let tag_field = tag_map_loaded
+                    .as_ref()
+                    .and_then(|(map_by_id, _field_meta)| map_by_id.get(&apr.id));
+                let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
+                for estimate in apr.cpu_pose_candidates(&camera_cfg, true, 50) {
+                    let field_eval =
+                        tag_field.map(|tf| estimate_robot_field_from_tag(&estimate.pose, tf, &camera_cfg));
+                    let ambiguity_cost = estimate.reprojection_rmse_px
+                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0);
+                    match &best_estimate {
+                        Some((_, _, best_cost)) if ambiguity_cost >= *best_cost => {}
+                        _ => best_estimate = Some((estimate, field_eval, ambiguity_cost)),
+                    }
+                }
+                let selected_estimate = best_estimate
+                    .map(|(estimate, field_eval, _)| (estimate, field_eval))
+                    .or_else(|| {
+                        pose::estimate_pose(&corners_raw, &camera_cfg, true).map(|estimate| {
+                            let field_eval =
+                                tag_field.map(|tf| estimate_robot_field_from_tag(&estimate.pose, tf, &camera_cfg));
+                            (estimate, field_eval)
+                        })
+                    });
+
+                let (x, y, z, floor_z_error, reprojection_rmse_px) = if let Some((estimate, field_eval)) = selected_estimate {
+                    if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
+                        continue;
+                    }
+                    if let Some((robot_field, z_err)) = field_eval {
+                        field_candidates.push((robot_field.x, robot_field.y, z_err, estimate.pose.translation.z.abs()));
+                        (robot_field.x, robot_field.y, 0.0, z_err, estimate.reprojection_rmse_px)
                     } else {
-                        (p.translation.x, p.translation.y, p.translation.z, 0.0)
+                        (
+                            estimate.pose.translation.x,
+                            estimate.pose.translation.y,
+                            estimate.pose.translation.z,
+                            0.0,
+                            estimate.reprojection_rmse_px,
+                        )
                     }
                 } else {
-                    (0.0, 0.0, 0.0, 0.0)
+                    (0.0, 0.0, 0.0, 0.0, 0.0)
                 };
                 for i in 0..4 {
                     let a = corners_raw[i];
@@ -568,6 +594,7 @@ fn main() -> Result<()> {
                     y,
                     z,
                     floor_z_error,
+                    reprojection_rmse_px,
                     corners: apr.corners,
                     seen_fps,
                     seen_pct,
@@ -711,8 +738,8 @@ fn main() -> Result<()> {
         );
         for t in &state.apriltags {
             println!(
-                "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m",
-                t.id, t.x, t.y, t.floor_z_error
+                "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m | Reproj: {:.3}px",
+                t.id, t.x, t.y, t.floor_z_error, t.reprojection_rmse_px
             );
         }
         if let Some(rp) = &state.robot_pose {

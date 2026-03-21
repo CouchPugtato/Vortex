@@ -51,6 +51,8 @@ pub struct AprilTagPose {
     pub floor_z_error: f64,
 }
 
+const MAX_TAG_REPROJECTION_RMSE_PX: f64 = 2.0;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct YoloBBox {
     pub class_name: String,
@@ -1115,19 +1117,41 @@ fn spawn_camera_pipeline(
                                     (c[2][0], c[2][1]),
                                 ];
 
-                                let (x, y, z, floor_z_error) = if let Some(pose) = pose::estimate_pose(
-                                    &corners_raw,
-                                    &effective_config,
-                                    true,
-                                ) {
-                                    if let Some(tag_field) = tag_map_by_id.get(&apr_det.id) {
-                                        let (p_field_robot, z_err) =
-                                            estimate_robot_field_from_tag(&pose, tag_field, &effective_config);
+                                let tag_field = tag_map_by_id.get(&apr_det.id);
+                                let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
+                                for estimate in apr_det.cpu_pose_candidates(&effective_config, true, 50) {
+                                    let field_eval = tag_field.map(|tf| {
+                                        estimate_robot_field_from_tag(&estimate.pose, tf, &effective_config)
+                                    });
+                                    let ambiguity_cost = estimate.reprojection_rmse_px
+                                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0);
+                                    match &best_estimate {
+                                        Some((_, _, best_cost)) if ambiguity_cost >= *best_cost => {}
+                                        _ => best_estimate = Some((estimate, field_eval, ambiguity_cost)),
+                                    }
+                                }
+                                let selected_estimate = best_estimate
+                                    .map(|(estimate, field_eval, _)| (estimate, field_eval))
+                                    .or_else(|| {
+                                        pose::estimate_pose(&corners_raw, &effective_config, true)
+                                            .map(|estimate| {
+                                                let field_eval = tag_field.map(|tf| {
+                                                    estimate_robot_field_from_tag(&estimate.pose, tf, &effective_config)
+                                                });
+                                                (estimate, field_eval)
+                                            })
+                                    });
+
+                                let (x, y, z, floor_z_error) = if let Some((estimate, field_eval)) = selected_estimate {
+                                    if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
+                                        continue;
+                                    }
+                                    if let Some((p_field_robot, z_err)) = field_eval {
                                         (p_field_robot.x, p_field_robot.y, 0.0, z_err)
                                     } else {
                                         // fallback: map missing this tag -> keep robot-frame estimate
                                         let p_robot = transform_camera_to_robot(
-                                            pose.translation,
+                                            estimate.pose.translation,
                                             &effective_config
                                         );
                                         (p_robot.x, p_robot.y, p_robot.z, 0.0)
@@ -1516,6 +1540,7 @@ fn rescale_apriltag_detections(detections: &mut [Detection], scale_back: f64) {
                 corner[0] *= scale_back;
                 corner[1] *= scale_back;
             }
+            apr.drop_cpu_pose_source();
         }
     }
 }

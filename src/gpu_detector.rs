@@ -164,6 +164,7 @@ impl GpuDetector {
                                 [d.corners[2].x as f64, d.corners[2].y as f64],
                                 [d.corners[3].x as f64, d.corners[3].y as f64],
                             ],
+                            cpu_detection: None,
                         }));
                     }
                     vpi::vpiArrayUnlock(self.output_array);

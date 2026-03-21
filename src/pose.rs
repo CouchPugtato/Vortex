@@ -8,6 +8,12 @@ pub struct Pose {
     pub translation: Vector3<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PoseEstimate {
+    pub pose: Pose,
+    pub reprojection_rmse_px: f64,
+}
+
 /// estimates 3d pose from 4 image corners
 /// 
 /// # Arguments
@@ -21,7 +27,7 @@ pub fn estimate_pose(
     corners: &[(f64, f64); 4],
     camera: &CameraConfig,
     apply_distortion: bool,
-) -> Option<Pose> {
+) -> Option<PoseEstimate> {
     // 1. normalize image coordinates
     let image_points: Vec<Point2<f64>> = corners.iter().map(|p| {
         let (x, y) = if apply_distortion {
@@ -168,7 +174,10 @@ pub fn estimate_pose(
                 ) {
                     if cost < best_cost {
                         best_cost = cost;
-                        best_pose = Some(pose);
+                        best_pose = Some(PoseEstimate {
+                            pose,
+                            reprojection_rmse_px: (cost / 8.0).sqrt(),
+                        });
                     }
                 }
             }
@@ -177,6 +186,29 @@ pub fn estimate_pose(
     }
 
     None
+}
+
+pub fn reprojection_rmse_px_for_pose(
+    pose: &Pose,
+    corners: &[(f64, f64); 4],
+    camera: &CameraConfig,
+    apply_distortion: bool,
+) -> Option<f64> {
+    let s = camera.tag_size_m / 2.0;
+    let model_points_3d = [
+        Vector3::new(-s, -s, 0.0),
+        Vector3::new(-s, s, 0.0),
+        Vector3::new(s, s, 0.0),
+        Vector3::new(s, -s, 0.0),
+    ];
+    let cost = reprojection_cost(
+        &pose_to_params(pose),
+        &model_points_3d,
+        corners,
+        camera,
+        apply_distortion,
+    )?;
+    Some((cost / 8.0).sqrt())
 }
 
 fn refine_pose_pnp(
