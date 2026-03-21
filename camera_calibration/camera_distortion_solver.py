@@ -3,6 +3,18 @@ import numpy as np
 import os
 import json
 
+CAPTURE_WIDTH = 1920
+CAPTURE_HEIGHT = 1080
+
+
+def open_camera(camera_index):
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+    return cap
+
 def main():
     CHECKERBOARD = (9, 6) # number of internal squares
     
@@ -20,14 +32,15 @@ def main():
     objp[:, :2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2)
     objp = objp * SQUARE_SIZE
 
-    cap = cv2.VideoCapture(current_camera_index)
-    if not cap.isOpened():
+    cap = open_camera(current_camera_index)
+    if cap is None:
         print(f"Error: Could not open camera {current_camera_index}")
         return
 
     print("=================================================================")
     print(f"Camera Calibration Tool")
     print(f"Searching for {CHECKERBOARD[0]}x{CHECKERBOARD[1]} checkerboard corners.")
+    print(f"Requested capture mode: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}")
     print("-----------------------------------------------------------------")
     print("Controls:")
     print("  [S] - Save current frame (if checkerboard found)")
@@ -76,6 +89,7 @@ def main():
         # UI Overlay
         cv2.putText(display_frame, status_text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         cv2.putText(display_frame, f"Saved Frames: {valid_frames}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(display_frame, f"Resolution: {gray.shape[1]}x{gray.shape[0]}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         cv2.imshow('Camera Calibration', display_frame)
 
@@ -126,15 +140,15 @@ def main():
             print("Switching to next camera...")
             current_camera_index += 1
             cap.release()
-            cap = cv2.VideoCapture(current_camera_index)
+            cap = open_camera(current_camera_index)
             
             # if next camera not found, loop back to 0
-            if not cap.isOpened():
+            if cap is None:
                 print(f"Camera {current_camera_index} not found. looping back to 0.")
                 current_camera_index = 0
-                cap = cv2.VideoCapture(current_camera_index)
+                cap = open_camera(current_camera_index)
             
-            if cap.isOpened():
+            if cap is not None:
                 print(f"Successfully switched to Camera {current_camera_index}")
                 # reset calibration data because we changed cameras
                 objpoints = []

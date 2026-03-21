@@ -3,10 +3,10 @@ import numpy as np
 import json
 import time
 
-CAM_FX = 709.5  # pixels (calibrated from 3.0m real dist / 2.542m measured @ 601.2)
-CAM_FY = 709.5  # pixels
-CAM_CX = 960.0  # principal point x
-CAM_CY = 600.0  # principal point y
+CAM_FX = 590.2919154759219
+CAM_FY = 591.8160873557966
+CAM_CX = 960.2348193847832
+CAM_CY = 472.7595158081418
 TAG_SIZE_M = 0.16  # m
 
 # Global state for distortion toggle
@@ -33,9 +33,8 @@ def open_camera(camera_index):
     return cap
 
 def main():
-    # Load distortion coefficients from result4.json (or similar)
-    dist_coeffs_loaded = load_distortion_coefficients('result5.json') # Changed to result5.json as per logs, check if result4 is needed
-    print(f"Loaded distortion coefficients from result5.json")
+    dist_coeffs_loaded = load_distortion_coefficients('result7N.json')
+    print("Loaded distortion coefficients from result7N.json")
     print(dist_coeffs_loaded)
     
     global USE_DISTORTION
@@ -89,8 +88,8 @@ def main():
         # Note: If the camera supports 1920x1080, scale will be 1.0
         final_fx = CAM_FX * scale_x
         final_fy = CAM_FY * scale_y
-        final_cx = actual_width / 2.0
-        final_cy = actual_height / 2.0
+        final_cx = CAM_CX * scale_x
+        final_cy = CAM_CY * scale_y
         
         camera_matrix = np.array([
             [final_fx, 0, final_cx],
