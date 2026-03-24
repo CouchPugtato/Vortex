@@ -112,14 +112,13 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
             .add_family_bits(family, bits)
             .build()?;
 
-    // access the underlying C struct to set parameters not exposed by the wrapper
     unsafe {
         let ptr_ptr = &detector as *const Detector as *const *mut RawDetector;
         let raw_ptr = *ptr_ptr;
         
         if !raw_ptr.is_null() {
             (*raw_ptr).nthreads = nthreads;
-            (*raw_ptr).quad_decimate = 3.0;
+            (*raw_ptr).quad_decimate = 2.0;
             (*raw_ptr).quad_sigma = 0.0;
             (*raw_ptr).refine_edges = 1;
         }
@@ -131,7 +130,7 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
 fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
     let mut img = unsafe { AprilImage::new_uinit(width, height)? };
     
-    let dst = img.as_mut();
+    let dst: &mut _ = img.as_mut();
     
     if dst.len() == gray_data.len() {
         dst.copy_from_slice(gray_data);
