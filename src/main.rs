@@ -613,11 +613,7 @@ fn main() -> anyhow::Result<()> {
     let mut cam_detections: HashMap<usize, Vec<ProcessedDetection>> = HashMap::new();
     let mut cam_joint_pose: HashMap<usize, Option<(f64, f64, usize, f64)>> = HashMap::new();
     let mut filtered_robot_xy: HashMap<usize, (f64, f64)> = HashMap::new();
-    
-    // simple exponential smoothing for pose
-    // store last known pose for each tag id per camera
-    let mut pose_filters: HashMap<(usize, usize), (f64, f64, f64)> = HashMap::new(); // (cam_idx, tag_id) -> (x, y, z)
-    let alpha = runtime_config.processing.smoothing_alpha;
+    let final_smoothing_alpha = runtime_config.processing.smoothing_alpha.clamp(0.0, 1.0);
 
     // init stats
     let start_time = Instant::now();
@@ -630,40 +626,7 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         if let Ok(stat) = rx_stats.recv() {
-            let mut smoothed_detections = Vec::new();
-
-            for det in stat.detections.0 {
-                match det {
-                    ProcessedDetection::AprilTag(apr) => {
-                        let key = (stat.camera_index, apr.id);
-                        let (s_x, s_y, s_z) = if let Some(&(last_x, last_y, last_z)) = pose_filters.get(&key) {
-                            (
-                                last_x + alpha * (apr.x - last_x),
-                                last_y + alpha * (apr.y - last_y),
-                                last_z + alpha * (apr.z - last_z),
-                            )
-                        } else {
-                            (apr.x, apr.y, apr.z)
-                        };
-                        
-                        pose_filters.insert(key, (s_x, s_y, s_z));
-                        
-                        smoothed_detections.push(ProcessedDetection::AprilTag(AprilTagPose {
-                            id: apr.id,
-                            x: s_x,
-                            y: s_y,
-                            z: s_z,
-                            floor_z_error: apr.floor_z_error,
-                        }));
-                    }
-                    ProcessedDetection::Yolo(yolo) => {
-                        // no smoothing for YOLO detections
-                        smoothed_detections.push(ProcessedDetection::Yolo(yolo));
-                    }
-                }
-            }
-
-            cam_detections.insert(stat.camera_index, smoothed_detections);
+            cam_detections.insert(stat.camera_index, stat.detections.0);
             cam_joint_pose.insert(stat.camera_index, stat.joint_robot_pose);
 
             if let Some((count, last_time)) = cam_stats.get_mut(&stat.camera_index) {
@@ -763,8 +726,7 @@ fn main() -> anyhow::Result<()> {
                             .or_else(|| robust_fuse_field_pose(&field_candidates));
                         let mut pose_for_publish: Option<(f64, f64, usize, f64)> = None;
                         if let Some((raw_x, raw_y, used, avg_z_err)) = raw_pose {
-                            const MAX_STEP_M: f64 = 0.60;
-                            const SMOOTH_ALPHA: f64 = 0.18;
+                            const MAX_STEP_M: f64 = 5.0;
                             let prev = filtered_robot_xy.get(&idx).copied();
                             let (sx, sy) = if let Some((px, py)) = prev {
                                 let mut tx = raw_x;
@@ -778,8 +740,8 @@ fn main() -> anyhow::Result<()> {
                                     ty = py + dy * scale;
                                 }
                                 (
-                                    px + SMOOTH_ALPHA * (tx - px),
-                                    py + SMOOTH_ALPHA * (ty - py),
+                                    px + final_smoothing_alpha * (tx - px),
+                                    py + final_smoothing_alpha * (ty - py),
                                 )
                             } else {
                                 (raw_x, raw_y)

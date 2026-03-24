@@ -128,7 +128,7 @@
     }
   },
   "processing": {
-    "smoothing_alpha": 0,
+    "smoothing_alpha": 1,
     "black_level_offset": 12,
     "sensor_gain": 0.64,
     "red_balance": 3910,

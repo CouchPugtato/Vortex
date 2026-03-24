@@ -856,8 +856,8 @@ fn main() -> Result<()> {
             joint_robot_pose.or_else(|| robust_fuse_field_pose(&field_candidates))
         {
             // temporal smoothing with jump clamp to reduce jitter in UI/telemetry
-            const MAX_STEP_M: f64 = 0.60;
-            const SMOOTH_ALPHA: f64 = 0.18;
+            const MAX_STEP_M: f64 = 5.0;
+            let smooth_alpha = runtime_config.processing.smoothing_alpha.clamp(0.0, 1.0);
             let (sx, sy) = if let Some((px, py)) = filtered_robot_xy {
                 let mut tx = raw_x;
                 let mut ty = raw_y;
@@ -870,8 +870,8 @@ fn main() -> Result<()> {
                     ty = py + dy * scale;
                 }
                 (
-                    px + SMOOTH_ALPHA * (tx - px),
-                    py + SMOOTH_ALPHA * (ty - py),
+                    px + smooth_alpha * (tx - px),
+                    py + smooth_alpha * (ty - py),
                 )
             } else {
                 (raw_x, raw_y)
