@@ -884,7 +884,7 @@ function renderDetectionTable() {
   el.fps.textContent = `FPS: ${data.fps != null ? data.fps.toFixed(2) : "-"}`;
   const mode = el.viewMode.value;
   if (mode === "apriltag") {
-    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Field X (m)</th><th>Field Y (m)</th><th>Floor Err (m)</th><th>Seen / sec</th><th>Debug</th></tr>";
+    el.detectionTableHead.innerHTML = "<tr><th>ID</th><th>Field X (m)</th><th>Field Y (m)</th><th>Floor Err (m)</th><th>Seen / sec</th></tr>";
     const fpsValue = Number.isFinite(data.fps) && data.fps > 0 ? data.fps : 1;
     const windowSize = Math.max(1, Math.round(fpsValue));
     const recentFrames = (data.tagFrameHistory || []).slice(-windowSize);
@@ -907,33 +907,11 @@ function renderDetectionTable() {
         const dist = Number.isFinite(last?.dist) ? last.dist.toFixed(3) : "-";
         const x = Number.isFinite(last?.x) ? last.x.toFixed(2) : "-";
         const y = Number.isFinite(last?.y) ? last.y.toFixed(2) : "-";
-        const debug = last?.debug;
-        const source = debug?.selected_source || "-";
-        const side = Number.isFinite(Number(debug?.selected_camera_side_score))
-          ? Number(debug.selected_camera_side_score).toFixed(3)
-          : "-";
-        const normal = Array.isArray(debug?.tag_normal_field)
-          ? `[${debug.tag_normal_field.map((v) => Number(v).toFixed(2)).join(", ")}]`
-          : "-";
-        const candidates = Array.isArray(debug?.cpu_candidates)
-          ? debug.cpu_candidates
-              .map((c) => {
-                const rmse = Number.isFinite(Number(c?.reprojection_rmse_px))
-                  ? Number(c.reprojection_rmse_px).toFixed(3)
-                  : "-";
-                const cside = Number.isFinite(Number(c?.camera_side_score))
-                  ? Number(c.camera_side_score).toFixed(3)
-                  : "-";
-                return `c${c?.index ?? "?"}: rmse=${rmse}, side=${cside}`;
-              })
-              .join("<br>")
-          : "-";
-        const debugHtml = `src=${source}<br>side=${side}<br>normal=${normal}<br>${candidates}`;
-        return `<tr><td>${id}</td><td>${x}</td><td>${y}</td><td>${dist}</td><td>${seenPerSec.toFixed(2)} (${seenPct.toFixed(0)}%)</td><td>${debugHtml}</td></tr>`;
+        return `<tr><td>${id}</td><td>${x}</td><td>${y}</td><td>${dist}</td><td>${seenPerSec.toFixed(2)} (${seenPct.toFixed(0)}%)</td></tr>`;
       });
       const avgSeenPerSec = totalSeenPerSec / ids.length;
       const avgSeenPct = (avgSeenPerSec / Math.max(1e-6, fpsValue)) * 100;
-      rows.push(`<tr><td><b>Avg</b></td><td>-</td><td>-</td><td>-</td><td><b>${avgSeenPerSec.toFixed(2)} (${avgSeenPct.toFixed(0)}%)</b></td><td>-</td></tr>`);
+      rows.push(`<tr><td><b>Avg</b></td><td>-</td><td>-</td><td>-</td><td><b>${avgSeenPerSec.toFixed(2)} (${avgSeenPct.toFixed(0)}%)</b></td></tr>`);
       el.detectionTableBody.innerHTML = rows.join("");
     }
   } else {
@@ -1334,8 +1312,7 @@ async function init() {
         dist: Number(t?.floor_z_error ?? t?.z ?? 0),
         x: Number(t?.x ?? 0),
         y: Number(t?.y ?? 0),
-        corners: Array.isArray(t?.corners) ? t.corners : [],
-        debug: t?.debug || null
+        corners: Array.isArray(t?.corners) ? t.corners : []
       }));
       const idsThisFrame = row.apriltags.map((t) => t.id).filter((id) => Number.isFinite(id));
       row.tagFrameHistory = row.tagFrameHistory || [];
@@ -1348,7 +1325,6 @@ async function init() {
           x: t.x,
           y: t.y,
           corners: t.corners,
-          debug: t.debug,
           lastSeenTs: Date.now()
         });
       }

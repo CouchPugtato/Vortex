@@ -39,24 +39,6 @@ struct TagOut {
     corners: [[f64; 2]; 4],
     seen_fps: f64,
     seen_pct: f64,
-    debug: Option<TagDebugOut>,
-}
-
-#[derive(Serialize)]
-struct TagDebugOut {
-    selected_source: &'static str,
-    selected_camera_side_score: Option<f64>,
-    selected_camera_field_pos: Option<[f64; 3]>,
-    tag_normal_field: Option<[f64; 3]>,
-    cpu_candidates: Vec<TagCandidateDebugOut>,
-}
-
-#[derive(Serialize)]
-struct TagCandidateDebugOut {
-    index: usize,
-    reprojection_rmse_px: f64,
-    translation: [f64; 3],
-    camera_side_score: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -316,10 +298,6 @@ fn camera_visible_side_score(pose: &pose::Pose, tag_field: &FieldTagPose) -> f64
     let p_fc = estimate_camera_field_from_tag(pose, tag_field);
     let tag_normal_field = tag_field.rot_field_from_map_tag.column(0).into_owned();
     (p_fc - tag_field.pos).dot(&tag_normal_field)
-}
-
-fn vec3_to_array(v: Vector3<f64>) -> [f64; 3] {
-    [v.x, v.y, v.z]
 }
 
 fn field_camera_pose_from_tag_pose(
@@ -637,16 +615,6 @@ fn main() -> Result<()> {
                     .as_ref()
                     .and_then(|(map_by_id, _field_meta)| map_by_id.get(&apr.id));
                 let cpu_candidates = apr.cpu_pose_candidates(&camera_cfg, true, 50);
-                let candidate_debug: Vec<TagCandidateDebugOut> = cpu_candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(index, estimate)| TagCandidateDebugOut {
-                        index,
-                        reprojection_rmse_px: estimate.reprojection_rmse_px,
-                        translation: vec3_to_array(estimate.pose.translation),
-                        camera_side_score: tag_field.map(|tf| camera_visible_side_score(&estimate.pose, tf)),
-                    })
-                    .collect();
                 let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
                 for estimate in cpu_candidates.iter().cloned() {
                     let field_eval =
@@ -662,11 +630,6 @@ fn main() -> Result<()> {
                         _ => best_estimate = Some((estimate, field_eval, ambiguity_cost)),
                     }
                 }
-                let selected_source = if best_estimate.is_some() {
-                    "cpu_pose_candidates"
-                } else {
-                    "custom_pnp_fallback"
-                };
                 let selected_estimate = best_estimate
                     .map(|(estimate, field_eval, _)| (estimate, field_eval))
                     .or_else(|| {
@@ -682,19 +645,10 @@ fn main() -> Result<()> {
                         })
                     });
 
-                let (x, y, z, floor_z_error, reprojection_rmse_px, debug) = if let Some((estimate, field_eval)) = selected_estimate {
+                let (x, y, z, floor_z_error, reprojection_rmse_px) = if let Some((estimate, field_eval)) = selected_estimate {
                     if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                         continue;
                     }
-                    let debug = TagDebugOut {
-                        selected_source,
-                        selected_camera_side_score: tag_field.map(|tf| camera_visible_side_score(&estimate.pose, tf)),
-                        selected_camera_field_pos: tag_field
-                            .map(|tf| vec3_to_array(estimate_camera_field_from_tag(&estimate.pose, tf))),
-                        tag_normal_field: tag_field
-                            .map(|tf| vec3_to_array(tf.rot_field_from_map_tag.column(0).into_owned())),
-                        cpu_candidates: candidate_debug,
-                    };
                     if let Some(tag_field) = tag_field {
                         let field_corners = tag_field_corner_points(tag_field, camera_cfg.tag_size_m);
                         for (field_corner, image_corner) in field_corners.iter().zip(corners_raw.iter()) {
@@ -709,7 +663,7 @@ fn main() -> Result<()> {
                     }
                     if let Some((robot_field, z_err)) = field_eval {
                         field_candidates.push((robot_field.x, robot_field.y, z_err, estimate.pose.translation.z.abs()));
-                        (robot_field.x, robot_field.y, 0.0, z_err, estimate.reprojection_rmse_px, Some(debug))
+                        (robot_field.x, robot_field.y, 0.0, z_err, estimate.reprojection_rmse_px)
                     } else {
                         (
                             estimate.pose.translation.x,
@@ -717,19 +671,10 @@ fn main() -> Result<()> {
                             estimate.pose.translation.z,
                             0.0,
                             estimate.reprojection_rmse_px,
-                            Some(debug),
                         )
                     }
                 } else {
-                    let debug = TagDebugOut {
-                        selected_source,
-                        selected_camera_side_score: None,
-                        selected_camera_field_pos: None,
-                        tag_normal_field: tag_field
-                            .map(|tf| vec3_to_array(tf.rot_field_from_map_tag.column(0).into_owned())),
-                        cpu_candidates: candidate_debug,
-                    };
-                    (0.0, 0.0, 0.0, 0.0, 0.0, Some(debug))
+                    (0.0, 0.0, 0.0, 0.0, 0.0)
                 };
                 for i in 0..4 {
                     let a = corners_raw[i];
@@ -760,7 +705,6 @@ fn main() -> Result<()> {
                     corners: apr.corners,
                     seen_fps,
                     seen_pct,
-                    debug,
                 });
             }
         }
@@ -929,24 +873,6 @@ fn main() -> Result<()> {
                 "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m | Reproj: {:.3}px",
                 t.id, t.x, t.y, t.floor_z_error, t.reprojection_rmse_px
             );
-            if let Some(debug) = &t.debug {
-                println!(
-                    "    source={} side={:?} cam_field={:?} normal={:?}",
-                    debug.selected_source,
-                    debug.selected_camera_side_score,
-                    debug.selected_camera_field_pos,
-                    debug.tag_normal_field
-                );
-                for cand in &debug.cpu_candidates {
-                    println!(
-                        "    cand{} rmse={:.3} t={:?} side={:?}",
-                        cand.index,
-                        cand.reprojection_rmse_px,
-                        cand.translation,
-                        cand.camera_side_score
-                    );
-                }
-            }
         }
         if let Some(rp) = &state.robot_pose {
             println!(
