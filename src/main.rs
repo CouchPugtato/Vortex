@@ -453,6 +453,15 @@ struct TagMapQuaternion {
 struct FieldTagPose {
     pos: Vector3<f64>,
     rot_field_from_tag: Matrix3<f64>,
+    rot_field_from_map_tag: Matrix3<f64>,
+}
+
+fn map_tag_from_solver_tag_rotation() -> Matrix3<f64> {
+    Matrix3::new(
+        0.0, 0.0, -1.0,
+        1.0, 0.0, 0.0,
+        0.0, -1.0, 0.0,
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1120,13 +1129,13 @@ fn spawn_camera_pipeline(
                     for det in raw_dets {
                         match det {
                             Detection::AprilTag(apr_det) => {
-                                // Normalize corner order for pose solver: TL, BL, BR, TR
+                                // Preserve AprilTag's native corner order: TL, TR, BR, BL.
                                 let c = apr_det.corners;
                                 let corners_raw = [
-                                    (c[3][0], c[3][1]),
                                     (c[0][0], c[0][1]),
                                     (c[1][0], c[1][1]),
                                     (c[2][0], c[2][1]),
+                                    (c[3][0], c[3][1]),
                                 ];
 
                                 let tag_field = tag_map_by_id.get(&apr_det.id);
@@ -1135,8 +1144,12 @@ fn spawn_camera_pipeline(
                                     let field_eval = tag_field.map(|tf| {
                                         estimate_robot_field_from_tag(&estimate.pose, tf, &effective_config)
                                     });
+                                    let side_penalty = tag_field
+                                        .map(|tf| if camera_visible_side_score(&estimate.pose, tf) > 0.0 { 0.0 } else { 1_000.0 })
+                                        .unwrap_or(0.0);
                                     let ambiguity_cost = estimate.reprojection_rmse_px
-                                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0);
+                                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0)
+                                        + side_penalty;
                                     match &best_estimate {
                                         Some((_, _, best_cost)) if ambiguity_cost >= *best_cost => {}
                                         _ => best_estimate = Some((estimate, field_eval, ambiguity_cost)),
@@ -1147,6 +1160,11 @@ fn spawn_camera_pipeline(
                                     .or_else(|| {
                                         pose::estimate_pose(&corners_raw, &effective_config, true)
                                             .map(|estimate| {
+                                                if let Some(tf) = tag_field {
+                                                    if camera_visible_side_score(&estimate.pose, tf) <= 0.0 {
+                                                        return (estimate, None);
+                                                    }
+                                                }
                                                 let field_eval = tag_field.map(|tf| {
                                                     estimate_robot_field_from_tag(&estimate.pose, tf, &effective_config)
                                                 });
@@ -1164,9 +1182,10 @@ fn spawn_camera_pipeline(
                                             joint_object_points.push(*field_corner);
                                             joint_image_points.push(*image_corner);
                                         }
+                                        let field_estimate = field_camera_pose_from_tag_pose(&estimate, tag_field);
                                         match &joint_initial_pose {
-                                            Some(best) if best.reprojection_rmse_px <= estimate.reprojection_rmse_px => {}
-                                            _ => joint_initial_pose = Some(estimate.clone()),
+                                            Some(best) if best.reprojection_rmse_px <= field_estimate.reprojection_rmse_px => {}
+                                            _ => joint_initial_pose = Some(field_estimate),
                                         }
                                     }
                                     if let Some((p_field_robot, z_err)) = field_eval {
@@ -1338,6 +1357,19 @@ fn estimate_robot_field_from_tag(
     (p_fr, floor_z_error)
 }
 
+fn estimate_camera_field_from_tag(pose: &pose::Pose, tag_field: &FieldTagPose) -> Vector3<f64> {
+    let r_ct = pose.rotation;
+    let r_tc = r_ct.transpose();
+    let p_tc = -r_tc * pose.translation;
+    tag_field.pos + tag_field.rot_field_from_tag * p_tc
+}
+
+fn camera_visible_side_score(pose: &pose::Pose, tag_field: &FieldTagPose) -> f64 {
+    let p_fc = estimate_camera_field_from_tag(pose, tag_field);
+    let tag_normal_field = tag_field.rot_field_from_map_tag.column(0).into_owned();
+    (p_fc - tag_field.pos).dot(&tag_normal_field)
+}
+
 fn load_tag_map(path: &Path) -> HashMap<usize, FieldTagPose> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -1355,6 +1387,7 @@ fn load_tag_map(path: &Path) -> HashMap<usize, FieldTagPose> {
             tag.pose.rotation.quaternion.y,
             tag.pose.rotation.quaternion.z,
         ));
+        let rot_field_from_map_tag = q.to_rotation_matrix().into_inner();
         out.insert(
             tag.id,
             FieldTagPose {
@@ -1363,8 +1396,8 @@ fn load_tag_map(path: &Path) -> HashMap<usize, FieldTagPose> {
                     tag.pose.translation.y,
                     tag.pose.translation.z,
                 ),
-                // Match bridge behavior for current tag-map convention.
-                rot_field_from_tag: q.to_rotation_matrix().into_inner().transpose(),
+                rot_field_from_tag: rot_field_from_map_tag * map_tag_from_solver_tag_rotation(),
+                rot_field_from_map_tag,
             },
         );
     }
@@ -1379,9 +1412,13 @@ fn resolve_tag_map_path() -> Option<PathBuf> {
         }
     }
     candidates.push(PathBuf::from("config/apriltag_map.json"));
+    candidates.push(PathBuf::from("config/2026-rebuilt-welded.json"));
     candidates.push(PathBuf::from("../config/apriltag_map.json"));
+    candidates.push(PathBuf::from("../config/2026-rebuilt-welded.json"));
     candidates.push(PathBuf::from("/home/vortex/deployments/Vortex/config/apriltag_map.json"));
+    candidates.push(PathBuf::from("/home/vortex/deployments/Vortex/config/2026-rebuilt-welded.json"));
     candidates.push(PathBuf::from("/home/jetson/deployments/Vortex/config/apriltag_map.json"));
+    candidates.push(PathBuf::from("/home/jetson/deployments/Vortex/config/2026-rebuilt-welded.json"));
 
     candidates
         .into_iter()
@@ -1405,13 +1442,29 @@ fn estimate_robot_field_from_field_pose(
     (p_fr, floor_z_error)
 }
 
+fn field_camera_pose_from_tag_pose(
+    estimate: &pose::PoseEstimate,
+    tag_field: &FieldTagPose,
+) -> pose::PoseEstimate {
+    let r_tf = tag_field.rot_field_from_tag.transpose();
+    let r_cf = estimate.pose.rotation * r_tf;
+    let t_cf = estimate.pose.translation - r_cf * tag_field.pos;
+    pose::PoseEstimate {
+        pose: pose::Pose {
+            rotation: r_cf,
+            translation: t_cf,
+        },
+        reprojection_rmse_px: estimate.reprojection_rmse_px,
+    }
+}
+
 fn tag_field_corner_points(tag_field: &FieldTagPose, tag_size_m: f64) -> [Vector3<f64>; 4] {
     let s = tag_size_m / 2.0;
     let local = [
-        Vector3::new(-s, -s, 0.0),
         Vector3::new(-s, s, 0.0),
         Vector3::new(s, s, 0.0),
         Vector3::new(s, -s, 0.0),
+        Vector3::new(-s, -s, 0.0),
     ];
     local.map(|corner| tag_field.pos + tag_field.rot_field_from_tag * corner)
 }

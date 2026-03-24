@@ -7,7 +7,7 @@
   "local_path": "F:\\Coding\\Repositories\\Vortex",
   "tag_map_path": "F:\\Coding\\Repositories\\Vortex\\config\\2026-rebuilt-welded.json",
   "onnx_model_path": "",
-  "monitor_start_cmd": "cd '/home/vortex/deployments/Vortex' && VORTEX_BRIDGE_CAMERA=1 VORTEX_BRIDGE_FRAME='/tmp/vortex_bridge_frame.jpg' VORTEX_BRIDGE_STATE='/tmp/vortex_bridge_state.json' ./target/release/orin_bridge 2>&1",
+  "monitor_start_cmd": "cd '/home/vortex/deployments/Vortex' && VORTEX_BRIDGE_CAMERA=0 VORTEX_BRIDGE_FRAME='/tmp/vortex_bridge_frame.jpg' VORTEX_BRIDGE_STATE='/tmp/vortex_bridge_state.json' ./target/release/orin_bridge 2>&1",
   "monitor_stop_cmd": "pkill -f orin_bridge || true",
   "startup_service_name": "",
   "preview_remote_path": "/tmp/vortex_bridge_frame.jpg",

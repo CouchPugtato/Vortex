@@ -17,7 +17,7 @@ pub struct PoseEstimate {
 /// estimates 3d pose from 4 image corners
 /// 
 /// # Arguments
-/// * `corners` - The 4 corners of the tag in the image (u, v). Order: TL, BL, BR, TR (or CCW).
+/// * `corners` - The 4 corners of the tag in the image (u, v). Order: TL, TR, BR, BL.
 /// * `tag_size` - The physical size of the tag (e.g., in meters).
 /// * `fx, fy, cx, cy` - Camera intrinsics.
 /// 
@@ -44,16 +44,16 @@ pub fn estimate_pose(
     // 2. define model points tag relative
     let s = camera.tag_size_m / 2.0;
     let model_points_3d = [
-        Vector3::new(-s, -s, 0.0), // 0: Top-Left
-        Vector3::new(-s,  s, 0.0), // 1: Bottom-Left
-        Vector3::new( s,  s, 0.0), // 2: Bottom-Right
-        Vector3::new( s, -s, 0.0), // 3: Top-Right
+        Vector3::new(-s, s, 0.0),  // 0: Top-Left
+        Vector3::new(s, s, 0.0),   // 1: Top-Right
+        Vector3::new(s, -s, 0.0),  // 2: Bottom-Right
+        Vector3::new(-s, -s, 0.0), // 3: Bottom-Left
     ];
     let model_points = [
-        Point2::new(-s, -s), // 0: Top-Left
-        Point2::new(-s,  s), // 1: Bottom-Left
-        Point2::new( s,  s), // 2: Bottom-Right
-        Point2::new( s, -s), // 3: Top-Right
+        Point2::new(-s, s),  // 0: Top-Left
+        Point2::new(s, s),   // 1: Top-Right
+        Point2::new(s, -s),  // 2: Bottom-Right
+        Point2::new(-s, -s), // 3: Bottom-Left
     ];
 
     // 3. solve homography such that p ~ H * P
@@ -420,10 +420,10 @@ fn fronto_parallel_initial_pose(
 fn square_model_points(tag_size_m: f64) -> [Vector3<f64>; 4] {
     let s = tag_size_m / 2.0;
     [
-        Vector3::new(-s, -s, 0.0),
         Vector3::new(-s, s, 0.0),
         Vector3::new(s, s, 0.0),
         Vector3::new(s, -s, 0.0),
+        Vector3::new(-s, -s, 0.0),
     ]
 }
 

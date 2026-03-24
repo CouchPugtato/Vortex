@@ -39,6 +39,24 @@ struct TagOut {
     corners: [[f64; 2]; 4],
     seen_fps: f64,
     seen_pct: f64,
+    debug: Option<TagDebugOut>,
+}
+
+#[derive(Serialize)]
+struct TagDebugOut {
+    selected_source: &'static str,
+    selected_camera_side_score: Option<f64>,
+    selected_camera_field_pos: Option<[f64; 3]>,
+    tag_normal_field: Option<[f64; 3]>,
+    cpu_candidates: Vec<TagCandidateDebugOut>,
+}
+
+#[derive(Serialize)]
+struct TagCandidateDebugOut {
+    index: usize,
+    reprojection_rmse_px: f64,
+    translation: [f64; 3],
+    camera_side_score: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -131,6 +149,15 @@ struct TagMapQuaternion {
 struct FieldTagPose {
     pos: Vector3<f64>,
     rot_field_from_tag: Matrix3<f64>,
+    rot_field_from_map_tag: Matrix3<f64>,
+}
+
+fn map_tag_from_solver_tag_rotation() -> Matrix3<f64> {
+    Matrix3::new(
+        0.0, 0.0, -1.0,
+        1.0, 0.0, 0.0,
+        0.0, -1.0, 0.0,
+    )
 }
 
 fn now_ms() -> u128 {
@@ -212,6 +239,7 @@ fn load_tag_map(path: &str) -> Option<(HashMap<usize, FieldTagPose>, Option<Fiel
             tag.pose.rotation.quaternion.y,
             tag.pose.rotation.quaternion.z,
         ));
+        let rot_field_from_map_tag = q.to_rotation_matrix().into_inner();
         by_id.insert(
             tag.id,
             FieldTagPose {
@@ -220,7 +248,8 @@ fn load_tag_map(path: &str) -> Option<(HashMap<usize, FieldTagPose>, Option<Fiel
                     tag.pose.translation.y,
                     tag.pose.translation.z,
                 ),
-                rot_field_from_tag: q.to_rotation_matrix().into_inner().transpose(),
+                rot_field_from_tag: rot_field_from_map_tag * map_tag_from_solver_tag_rotation(),
+                rot_field_from_map_tag,
             },
         );
     }
@@ -276,15 +305,58 @@ fn estimate_robot_field_from_field_pose(
     (p_fr, floor_z_error)
 }
 
+fn estimate_camera_field_from_tag(pose: &pose::Pose, tag_field: &FieldTagPose) -> Vector3<f64> {
+    let r_ct = pose.rotation;
+    let r_tc = r_ct.transpose();
+    let p_tc = -r_tc * pose.translation;
+    tag_field.pos + tag_field.rot_field_from_tag * p_tc
+}
+
+fn camera_visible_side_score(pose: &pose::Pose, tag_field: &FieldTagPose) -> f64 {
+    let p_fc = estimate_camera_field_from_tag(pose, tag_field);
+    let tag_normal_field = tag_field.rot_field_from_map_tag.column(0).into_owned();
+    (p_fc - tag_field.pos).dot(&tag_normal_field)
+}
+
+fn vec3_to_array(v: Vector3<f64>) -> [f64; 3] {
+    [v.x, v.y, v.z]
+}
+
+fn field_camera_pose_from_tag_pose(
+    estimate: &pose::PoseEstimate,
+    tag_field: &FieldTagPose,
+) -> pose::PoseEstimate {
+    let r_tf = tag_field.rot_field_from_tag.transpose();
+    let r_cf = estimate.pose.rotation * r_tf;
+    let t_cf = estimate.pose.translation - r_cf * tag_field.pos;
+    pose::PoseEstimate {
+        pose: pose::Pose {
+            rotation: r_cf,
+            translation: t_cf,
+        },
+        reprojection_rmse_px: estimate.reprojection_rmse_px,
+    }
+}
+
 fn tag_field_corner_points(tag_field: &FieldTagPose, tag_size_m: f64) -> [Vector3<f64>; 4] {
     let s = tag_size_m / 2.0;
     let local = [
-        Vector3::new(-s, -s, 0.0),
         Vector3::new(-s, s, 0.0),
         Vector3::new(s, s, 0.0),
         Vector3::new(s, -s, 0.0),
+        Vector3::new(-s, -s, 0.0),
     ];
     local.map(|corner| tag_field.pos + tag_field.rot_field_from_tag * corner)
+}
+
+fn env_flag(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => {
+            let lower = v.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
 }
 
 fn robust_fuse_field_pose(candidates: &[(f64, f64, f64, f64)]) -> Option<(f64, f64, usize, f64)> {
@@ -367,16 +439,20 @@ fn resolve_tag_map_path() -> String {
         }
     }
     candidates.push("config/apriltag_map.json".to_string());
+    candidates.push("config/2026-rebuilt-welded.json".to_string());
     candidates.push("../config/apriltag_map.json".to_string());
+    candidates.push("../config/2026-rebuilt-welded.json".to_string());
     candidates.push("/home/vortex/deployments/Vortex/config/apriltag_map.json".to_string());
+    candidates.push("/home/vortex/deployments/Vortex/config/2026-rebuilt-welded.json".to_string());
     candidates.push("/home/jetson/deployments/Vortex/config/apriltag_map.json".to_string());
+    candidates.push("/home/jetson/deployments/Vortex/config/2026-rebuilt-welded.json".to_string());
 
     for p in candidates {
         if fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false) {
             return p;
         }
     }
-    "config/apriltag_map.json".to_string()
+    "config/2026-rebuilt-welded.json".to_string()
 }
 
 fn main() -> Result<()> {
@@ -549,56 +625,91 @@ fn main() -> Result<()> {
         let dets = cpu.detect(&gray, width, height).unwrap_or_default();
         for det in dets {
             if let Detection::AprilTag(apr) = det {
-                // apriltag corners are not in the solver's expected TL,BL,BR,TR order.
+                // Preserve AprilTag's native corner order: TL, TR, BR, BL.
                 let c = apr.corners;
                 let corners_raw = [
-                    (c[3][0], c[3][1]), // TL
-                    (c[0][0], c[0][1]), // BL
-                    (c[1][0], c[1][1]), // BR
-                    (c[2][0], c[2][1]), // TR
+                    (c[0][0], c[0][1]), // TL
+                    (c[1][0], c[1][1]), // TR
+                    (c[2][0], c[2][1]), // BR
+                    (c[3][0], c[3][1]), // BL
                 ];
                 let tag_field = tag_map_loaded
                     .as_ref()
                     .and_then(|(map_by_id, _field_meta)| map_by_id.get(&apr.id));
+                let cpu_candidates = apr.cpu_pose_candidates(&camera_cfg, true, 50);
+                let candidate_debug: Vec<TagCandidateDebugOut> = cpu_candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, estimate)| TagCandidateDebugOut {
+                        index,
+                        reprojection_rmse_px: estimate.reprojection_rmse_px,
+                        translation: vec3_to_array(estimate.pose.translation),
+                        camera_side_score: tag_field.map(|tf| camera_visible_side_score(&estimate.pose, tf)),
+                    })
+                    .collect();
                 let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
-                for estimate in apr.cpu_pose_candidates(&camera_cfg, true, 50) {
+                for estimate in cpu_candidates.iter().cloned() {
                     let field_eval =
                         tag_field.map(|tf| estimate_robot_field_from_tag(&estimate.pose, tf, &camera_cfg));
+                    let side_penalty = tag_field
+                        .map(|tf| if camera_visible_side_score(&estimate.pose, tf) > 0.0 { 0.0 } else { 1_000.0 })
+                        .unwrap_or(0.0);
                     let ambiguity_cost = estimate.reprojection_rmse_px
-                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0);
+                        + field_eval.map(|(_, z_err)| z_err * 6.0).unwrap_or(0.0)
+                        + side_penalty;
                     match &best_estimate {
                         Some((_, _, best_cost)) if ambiguity_cost >= *best_cost => {}
                         _ => best_estimate = Some((estimate, field_eval, ambiguity_cost)),
                     }
                 }
+                let selected_source = if best_estimate.is_some() {
+                    "cpu_pose_candidates"
+                } else {
+                    "custom_pnp_fallback"
+                };
                 let selected_estimate = best_estimate
                     .map(|(estimate, field_eval, _)| (estimate, field_eval))
                     .or_else(|| {
                         pose::estimate_pose(&corners_raw, &camera_cfg, true).map(|estimate| {
+                            if let Some(tf) = tag_field {
+                                if camera_visible_side_score(&estimate.pose, tf) <= 0.0 {
+                                    return (estimate, None);
+                                }
+                            }
                             let field_eval =
                                 tag_field.map(|tf| estimate_robot_field_from_tag(&estimate.pose, tf, &camera_cfg));
                             (estimate, field_eval)
                         })
                     });
 
-                let (x, y, z, floor_z_error, reprojection_rmse_px) = if let Some((estimate, field_eval)) = selected_estimate {
+                let (x, y, z, floor_z_error, reprojection_rmse_px, debug) = if let Some((estimate, field_eval)) = selected_estimate {
                     if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                         continue;
                     }
+                    let debug = TagDebugOut {
+                        selected_source,
+                        selected_camera_side_score: tag_field.map(|tf| camera_visible_side_score(&estimate.pose, tf)),
+                        selected_camera_field_pos: tag_field
+                            .map(|tf| vec3_to_array(estimate_camera_field_from_tag(&estimate.pose, tf))),
+                        tag_normal_field: tag_field
+                            .map(|tf| vec3_to_array(tf.rot_field_from_map_tag.column(0).into_owned())),
+                        cpu_candidates: candidate_debug,
+                    };
                     if let Some(tag_field) = tag_field {
                         let field_corners = tag_field_corner_points(tag_field, camera_cfg.tag_size_m);
                         for (field_corner, image_corner) in field_corners.iter().zip(corners_raw.iter()) {
                             joint_object_points.push(*field_corner);
                             joint_image_points.push(*image_corner);
                         }
+                        let field_estimate = field_camera_pose_from_tag_pose(&estimate, tag_field);
                         match &joint_initial_pose {
-                            Some(best) if best.reprojection_rmse_px <= estimate.reprojection_rmse_px => {}
-                            _ => joint_initial_pose = Some(estimate.clone()),
+                            Some(best) if best.reprojection_rmse_px <= field_estimate.reprojection_rmse_px => {}
+                            _ => joint_initial_pose = Some(field_estimate),
                         }
                     }
                     if let Some((robot_field, z_err)) = field_eval {
                         field_candidates.push((robot_field.x, robot_field.y, z_err, estimate.pose.translation.z.abs()));
-                        (robot_field.x, robot_field.y, 0.0, z_err, estimate.reprojection_rmse_px)
+                        (robot_field.x, robot_field.y, 0.0, z_err, estimate.reprojection_rmse_px, Some(debug))
                     } else {
                         (
                             estimate.pose.translation.x,
@@ -606,10 +717,19 @@ fn main() -> Result<()> {
                             estimate.pose.translation.z,
                             0.0,
                             estimate.reprojection_rmse_px,
+                            Some(debug),
                         )
                     }
                 } else {
-                    (0.0, 0.0, 0.0, 0.0, 0.0)
+                    let debug = TagDebugOut {
+                        selected_source,
+                        selected_camera_side_score: None,
+                        selected_camera_field_pos: None,
+                        tag_normal_field: tag_field
+                            .map(|tf| vec3_to_array(tf.rot_field_from_map_tag.column(0).into_owned())),
+                        cpu_candidates: candidate_debug,
+                    };
+                    (0.0, 0.0, 0.0, 0.0, 0.0, Some(debug))
                 };
                 for i in 0..4 {
                     let a = corners_raw[i];
@@ -640,6 +760,7 @@ fn main() -> Result<()> {
                     corners: apr.corners,
                     seen_fps,
                     seen_pct,
+                    debug,
                 });
             }
         }
@@ -808,6 +929,24 @@ fn main() -> Result<()> {
                 "  - Tag ID: {} | Field X: {:.2}m | Field Y: {:.2}m | FloorErr: {:.3}m | Reproj: {:.3}px",
                 t.id, t.x, t.y, t.floor_z_error, t.reprojection_rmse_px
             );
+            if let Some(debug) = &t.debug {
+                println!(
+                    "    source={} side={:?} cam_field={:?} normal={:?}",
+                    debug.selected_source,
+                    debug.selected_camera_side_score,
+                    debug.selected_camera_field_pos,
+                    debug.tag_normal_field
+                );
+                for cand in &debug.cpu_candidates {
+                    println!(
+                        "    cand{} rmse={:.3} t={:?} side={:?}",
+                        cand.index,
+                        cand.reprojection_rmse_px,
+                        cand.translation,
+                        cand.camera_side_score
+                    );
+                }
+            }
         }
         if let Some(rp) = &state.robot_pose {
             println!(

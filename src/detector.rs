@@ -168,9 +168,9 @@ fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, heigh
 
 fn solver_corners(corners: [[f64; 2]; 4]) -> [(f64, f64); 4] {
     [
-        (corners[3][0], corners[3][1]),
         (corners[0][0], corners[0][1]),
         (corners[1][0], corners[1][1]),
         (corners[2][0], corners[2][1]),
+        (corners[3][0], corners[3][1]),
     ]
 }

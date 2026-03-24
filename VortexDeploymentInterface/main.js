@@ -816,7 +816,7 @@ async function buildMainProgram(settings) {
       throw new Error(`No Cargo.toml found in ${remoteTarget}. Deploy first.`);
     }
 
-    let total = 1;
+    let total = 2;
     try {
       const meta = await execCommand(
         conn,
@@ -831,63 +831,77 @@ async function buildMainProgram(settings) {
     emitLog(`[0/${total}] Starting remote build`);
     emitMainBuildProgress({ status: "active", percent: 0, text: `[0/${total}] Starting` });
 
-    const cmd = `bash -lc "cd '${remoteTarget}' && cargo build -vv --release --bin dumapril-taglocalization 2>&1"`;
-    const channel = await execCommand(conn, cmd, { stream: true });
-    await new Promise((resolve, reject) => {
-      let pending = "";
-      const seen = new Set();
-      const onLine = (raw) => {
-        const line = stripAnsi(raw).trim();
-        if (!line) return;
-        const bracket = line.match(/\[([0-9]+)\/([0-9]+)\]/);
-        if (bracket) {
-          const cur = Number(bracket[1]);
-          const ttl = Number(bracket[2]);
-          if (Number.isFinite(cur) && Number.isFinite(ttl) && ttl > 0) {
-            const pct = Math.max(0, Math.min(99, Math.round((cur * 100) / ttl)));
-            emitLog(line);
-            emitMainBuildProgress({ status: "active", percent: pct, text: bracket[0] });
+    const buildBins = [
+      { bin: "dumapril-taglocalization", label: "main" },
+      { bin: "orin_bridge", label: "bridge" }
+    ];
+
+    for (let buildIndex = 0; buildIndex < buildBins.length; buildIndex += 1) {
+      const { bin, label } = buildBins[buildIndex];
+      emitLog(`[${buildIndex}/${total}] Building ${label}: ${bin}`);
+      emitMainBuildProgress({
+        status: "active",
+        percent: Math.round((buildIndex * 100) / total),
+        text: `[${buildIndex}/${total}] Building ${label}`
+      });
+
+      const cmd = `bash -lc "cd '${remoteTarget}' && cargo build -vv --release --bin ${bin} 2>&1"`;
+      const channel = await execCommand(conn, cmd, { stream: true });
+      await new Promise((resolve, reject) => {
+        let pending = "";
+        const seen = new Set();
+        const onLine = (raw) => {
+          const line = stripAnsi(raw).trim();
+          if (!line) return;
+          const step = line.match(/^(Compiling|Fresh)\s+([^\s]+)\s+/);
+          if (step) {
+            const action = String(step[1]);
+            const crate = String(step[2]);
+            if (crate) seen.add(crate);
+            const synthetic = `[${buildIndex + 1}/${total}] ${label}: ${action} ${crate}`;
+            emitLog(synthetic);
+            const stageBase = (buildIndex * 100) / total;
+            const stageSpan = 100 / total;
+            const pct = Math.max(
+              0,
+              Math.min(99, Math.round(stageBase + (Math.min(seen.size, 50) / 50) * stageSpan))
+            );
+            emitMainBuildProgress({ status: "active", percent: pct, text: synthetic });
             return;
           }
-        }
-        const step = line.match(/^(Compiling|Fresh)\s+([^\s]+)\s+/);
-        if (step) {
-          const action = String(step[1]);
-          const crate = String(step[2]);
-          if (crate) seen.add(crate);
-          const cur = seen.size;
-          const synthetic = `[${cur}/${total}] ${action} ${crate}`;
-          emitLog(synthetic);
-          const pct = Math.max(0, Math.min(99, Math.round((cur * 100) / Math.max(1, total))));
-          emitMainBuildProgress({ status: "active", percent: pct, text: synthetic });
-          return;
-        }
-        if (/^Finished\b/i.test(line)) {
-          emitLog(`[${total}/${total}] ${line}`);
-          emitMainBuildProgress({ status: "active", percent: 99, text: `[${total}/${total}] Finished` });
-        }
-      };
+          if (/^Finished\b/i.test(line)) {
+            const msg = `[${buildIndex + 1}/${total}] ${label}: ${line}`;
+            emitLog(msg);
+            emitMainBuildProgress({
+              status: "active",
+              percent: Math.max(1, Math.round(((buildIndex + 1) * 100) / total) - 1),
+              text: msg
+            });
+          }
+        };
 
-      const onData = (buf) => {
-        pending += buf.toString("utf8");
-        const lines = pending.split(/\r?\n/);
-        pending = lines.pop() || "";
-        for (const ln of lines) onLine(ln);
-      };
-      channel.on("data", onData);
-      channel.stderr.on("data", onData);
-      channel.on("error", reject);
-      channel.on("close", (code) => {
-        if (pending.trim()) onLine(pending.trim());
-        if (code === 0) {
-          emitMainBuildProgress({ status: "done", percent: 100, text: "✓ Main build complete" });
-          resolve();
-        } else {
-          emitMainBuildProgress({ status: "error", percent: 0, text: "✕ Main build failed" });
-          reject(new Error(`Remote build failed with exit code ${code}`));
-        }
+        const onData = (buf) => {
+          pending += buf.toString("utf8");
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() || "";
+          for (const ln of lines) onLine(ln);
+        };
+        channel.on("data", onData);
+        channel.stderr.on("data", onData);
+        channel.on("error", reject);
+        channel.on("close", (code) => {
+          if (pending.trim()) onLine(pending.trim());
+          if (code === 0) {
+            resolve();
+          } else {
+            emitMainBuildProgress({ status: "error", percent: 0, text: `✕ ${label} build failed` });
+            reject(new Error(`Remote ${label} build failed with exit code ${code}`));
+          }
+        });
       });
-    });
+    }
+
+    emitMainBuildProgress({ status: "done", percent: 100, text: "✓ Main and bridge build complete" });
 
     await syncRemoteStartupScript(conn, settings);
     emitLog("Post-build startup script sync complete.");
@@ -1399,9 +1413,26 @@ async function syncTagMapRemote(conn, settings) {
 
 const previewManager = {
   running: false,
+  latestFrameDataUrl: null,
+  latestBridgeState: null,
+  emitTimer: null,
+  emitPending: false,
+  scheduleEmit() {
+    if (this.emitPending) return;
+    this.emitPending = true;
+    this.emitTimer = setTimeout(() => {
+      this.emitPending = false;
+      if (!this.running) return;
+      if (this.latestFrameDataUrl) emitPreviewFrame(this.latestFrameDataUrl);
+      if (this.latestBridgeState) emitBridgeState(this.latestBridgeState);
+    }, 120);
+  },
   async start(settings) {
     if (this.running) return;
     this.running = true;
+    this.latestFrameDataUrl = null;
+    this.latestBridgeState = null;
+    this.emitPending = false;
     emitPreviewState(true);
     emitLog("Preview started.");
     let conn = null;
@@ -1414,17 +1445,18 @@ const previewManager = {
         }
         const bytes = await sftpReadFile(sftp, settings.preview_remote_path);
         const mime = bytes[0] === 0x89 ? "image/png" : "image/jpeg";
-        emitPreviewFrame(`data:${mime};base64,${bytes.toString("base64")}`);
+        this.latestFrameDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
         try {
           const stateBytes = await sftpReadFile(
             sftp,
             settings.preview_state_path || "/tmp/vortex_bridge_state.json"
           );
           const parsed = JSON.parse(stateBytes.toString("utf8"));
-          emitBridgeState(parsed);
+          this.latestBridgeState = parsed;
         } catch (_stateErr) {
           // state file may not exist yet, ignore and keep preview alive
         }
+        this.scheduleEmit();
       } catch (err) {
         const msg = err?.message || String(err);
         emitLog(`Preview error: ${msg}`);
@@ -1450,6 +1482,13 @@ const previewManager = {
   },
   stop() {
     this.running = false;
+    if (this.emitTimer) {
+      clearTimeout(this.emitTimer);
+      this.emitTimer = null;
+    }
+    this.emitPending = false;
+    this.latestFrameDataUrl = null;
+    this.latestBridgeState = null;
   }
 };
 
