@@ -10,11 +10,11 @@
     "p2": 0.0016938703822554876,
     "k3": 0.004400568146699677,
     "tag_size_m": 0.16,
-    "x_offset": -0.032367,
-    "y_offset": 0.325535,
-    "z_offset": 0.43312,
-    "pitch_deg": 10,
-    "yaw_deg": 80,
+    "x_offset": 0.235,
+    "y_offset": 0,
+    "z_offset": 0.4572,
+    "pitch_deg": 0,
+    "yaw_deg": 0,
     "roll_deg": 0
   },
   "camera_profiles": {
@@ -29,11 +29,11 @@
       "p2": 0.0016938703822554876,
       "k3": 0.004400568146699677,
       "tag_size_m": 0.16,
-      "x_offset": -0.032367,
-      "y_offset": 0.325535,
-      "z_offset": 0.43312,
+      "x_offset": 0.235,
+      "y_offset": 0.2515,
+      "z_offset": 0.4572,
       "pitch_deg": 10,
-      "yaw_deg": 80,
+      "yaw_deg": 30,
       "roll_deg": 0
     },
     "1": {
@@ -65,11 +65,11 @@
       "p2": 0.0016938703822554876,
       "k3": 0.004400568146699677,
       "tag_size_m": 0.16,
-      "x_offset": -0.032367,
-      "y_offset": -0.325535,
-      "z_offset": 0.43312,
+      "x_offset": 0.235,
+      "y_offset": -0.2515,
+      "z_offset": 0.4572,
       "pitch_deg": 10,
-      "yaw_deg": -80,
+      "yaw_deg": -30,
       "roll_deg": 0
     },
     "3": {
