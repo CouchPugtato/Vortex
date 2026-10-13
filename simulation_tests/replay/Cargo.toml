@@ -1,0 +1,12 @@
+[package]
+name = "vortex-synthetic-replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+apriltag = "0.4"
+image = { version = "0.23", default-features = false, features = ["png", "jpeg"] }
+nalgebra = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

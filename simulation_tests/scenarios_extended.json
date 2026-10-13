@@ -1,0 +1,40 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "camera_index": 0,
+  "seed": 2026,
+  "cases": [
+    {"name": "near", "tag_id": 1, "distance_m": 1.0},
+    {"name": "medium", "tag_id": 1, "distance_m": 2.0},
+    {"name": "far", "tag_id": 1, "distance_m": 3.0},
+    {"name": "oblique", "tag_id": 1, "distance_m": 1.5, "lateral_m": 0.6},
+    {"name": "noisy", "tag_id": 1, "distance_m": 1.5, "noise_sigma": 5, "blur_sigma": 0.6},
+    {"name": "other_tag", "tag_id": 10, "distance_m": 1.5},
+    {"name": "blank", "tag_id": 1, "distance_m": 1.0, "hide_tags": true}
+  ],
+  "sweeps": [
+    {"name": "field_tags", "tag_ids": "all", "parameters": {
+      "distance_m": [0.75, 1.5, 3.0]
+    }},
+    {"name": "viewpoint", "tag_ids": [1, 10, 18, 26], "parameters": {
+      "distance_m": [1.0, 2.0, 3.0],
+      "lateral_m": [-0.6, 0.0, 0.6],
+      "vertical_m": [-0.3, 0.0, 0.3]
+    }},
+    {"name": "noise_brightness", "parameters": {
+      "distance_m": [1.5], "noise_sigma": [0, 3, 7, 12],
+      "brightness": [0.5, 0.75, 1.0]
+    }},
+    {"name": "blur", "parameters": {
+      "distance_m": [1.5], "blur_sigma": [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5]
+    }},
+    {"name": "combined", "parameters": {
+      "distance_m": [1.0, 2.0], "noise_sigma": [3, 7],
+      "blur_sigma": [0.3, 0.6], "brightness": [0.75, 1.0]
+    }},
+    {"name": "blank_controls", "parameters": {
+      "distance_m": [1.0], "hide_tags": [true],
+      "noise_sigma": [0, 5, 15], "brightness": [0.5, 1.0, 1.5]
+    }}
+  ]
+}
