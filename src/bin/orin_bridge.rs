@@ -2,6 +2,8 @@
 mod config;
 #[path = "../detector.rs"]
 mod detector;
+#[path = "../tag_refine.rs"]
+mod tag_refine;
 #[path = "../pose.rs"]
 mod pose;
 #[path = "../undistort.rs"]

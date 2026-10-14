@@ -6,6 +6,8 @@ mod config;
 mod detector;
 #[path = "../../../src/pose.rs"]
 mod pose;
+#[path = "../../../src/tag_refine.rs"]
+mod tag_refine;
 
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Vector3};
@@ -34,6 +36,8 @@ struct Frame {
     image: String,
     camera_position: [f64; 3],
     expected_ids: Vec<usize>,
+    #[serde(default)]
+    allowed_ids: Option<Vec<usize>>,
 }
 fn matrix(rows: [[f64; 3]; 3]) -> Matrix3<f64> {
     Matrix3::from_row_slice(&rows.into_iter().flatten().collect::<Vec<_>>())
@@ -76,9 +80,15 @@ fn main() -> Result<()> {
         let mut field_points = Vec::new();
         let mut image_points = Vec::new();
         let mut field_seeds = Vec::new();
+        let mut detection_quality = Vec::new();
+        let mut pose_candidate_diagnostics = Vec::new();
         for detection in detections {
             if let detector::Detection::AprilTag(tag_det) = detection {
                 found.push(tag_det.id);
+                detection_quality.push(json!({"id": tag_det.id,
+                    "hamming": tag_det.cpu_detection.as_ref().map(|d| d.hamming()),
+                    "decision_margin": tag_det.cpu_detection.as_ref().map(|d| d.decision_margin()),
+                    "corners": tag_det.corners}));
                 if let Some(tag) = tags.get(&tag_det.id) {
                     let r_ft = matrix(tag.rotation) * map_from_solver;
                     // Invert tag->camera and compose with tag->field, exactly as production does.
@@ -89,6 +99,9 @@ fn main() -> Result<()> {
                         .filter_map(|p| {
                             let camera_field = Vector3::from(tag.position)
                                 - r_ft * p.pose.rotation.transpose() * p.pose.translation;
+                            pose_candidate_diagnostics.push(json!({"id": tag_det.id,
+                                "reprojection_rmse_px": p.reprojection_rmse_px,
+                                "camera_error_m": (camera_field - Vector3::from(frame.camera_position)).norm()}));
                             let normal = matrix(tag.rotation).column(0).into_owned();
                             if (camera_field - Vector3::from(tag.position)).dot(&normal) <= 0. {
                                 return None;
@@ -166,7 +179,14 @@ fn main() -> Result<()> {
         let passed = if frame.expected_ids.is_empty() {
             found.is_empty()
         } else {
-            missing.is_empty() && position_ok && found.iter().all(|id| tags.contains_key(id))
+            missing.is_empty()
+                && position_ok
+                && found.iter().all(|id| {
+                    frame
+                        .allowed_ids
+                        .as_ref()
+                        .map_or_else(|| tags.contains_key(id), |ids| ids.contains(id))
+                })
         };
         if !passed {
             failed += 1;
@@ -180,7 +200,13 @@ fn main() -> Result<()> {
         );
         reports.push(
             json!({"name": frame.name, "passed": passed, "detected_ids": found,
+            "detection_quality": detection_quality,
+            "pose_candidates": pose_candidate_diagnostics,
             "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results,
+            "localization_ms": start.elapsed().as_secs_f64()*1000.0-elapsed_ms,
+            "unexpected_ids": found.iter().filter(|id| frame.allowed_ids.as_ref()
+                .map_or_else(|| !tags.contains_key(id), |ids| !ids.contains(id))).collect::<Vec<_>>(),
+            "position_passed": position_ok,
             "localization_mode": if joint.is_some() { "multi_tag" } else { "single_tag" },
             "joint_reprojection_rmse_px": raw_joint.map(|p| p.reprojection_rmse_px),
             "single_tag_diagnostic_passed": missing.is_empty()

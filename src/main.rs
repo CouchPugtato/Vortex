@@ -1,4 +1,5 @@
 mod detector;
+mod tag_refine;
 mod gpu_detector;
 mod vpi;
 mod config;

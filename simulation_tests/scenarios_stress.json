@@ -1,0 +1,24 @@
+{
+  "width": 1920, "height": 1080, "camera_index": 0, "seed": 2026,
+  "case_defaults": {"noise_seed": 2026},
+  "sweeps": [
+    {"name": "single_geometry", "tag_ids": "all", "parameters": {
+      "single_tag_only": [true], "distance_m": [0.75, 1.5, 3.0],
+      "lateral_m": [-0.6, 0.0, 0.6], "vertical_m": [-0.3, 0.3]
+    }},
+    {"name": "single_quality", "tag_ids": [1, 10, 18, 26], "parameters": {
+      "single_tag_only": [true], "distance_m": [1.0, 2.0],
+      "noise_sigma": [3, 10], "blur_sigma": [0.3, 0.8],
+      "brightness": [0.6, 1.0], "noise_seed": [11, 29, 47, 83]
+    }},
+    {"name": "false_detection", "parameters": {
+      "distance_m": [2.0], "noise_sigma": [5, 7, 12], "blur_sigma": [0.3, 0.6],
+      "noise_seed": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    }},
+    {"name": "blank_noise", "parameters": {
+      "distance_m": [1.0], "hide_tags": [true], "noise_sigma": [5, 15, 30],
+      "brightness": [0.5, 1.0],
+      "noise_seed": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    }}
+  ]
+}

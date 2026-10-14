@@ -49,13 +49,14 @@ def replay_command(args, dataset, env):
         target = ["--target", "x86_64-pc-windows-gnu"]
     else:
         target = []
-    return cmd + ["run", "--locked", "--manifest-path", HERE / "replay/Cargo.toml"] + target + [
+    return cmd + ["run", "--release", "--locked", "--manifest-path", HERE / "replay/Cargo.toml"] + target + [
         "--", dataset, args.max_error_meters]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("smoke", "extended"), default="extended")
+    parser.add_argument("--suite", choices=("smoke", "extended", "stress"), default="extended")
+    parser.add_argument("--case", help="Run one named scenario from the selected suite")
     parser.add_argument("--backend", choices=("fast", "blender"), default="fast")
     parser.add_argument("--blender", default="blender", help="Blender executable name or path")
     parser.add_argument("--mingw-root", type=Path, default=Path("C:/msys64/mingw64"))
@@ -77,9 +78,12 @@ def main():
     try:
         # Check the replay tool before spending time generating the dataset.
         replay = None if args.generate_only else replay_command(args, dataset, env)
-        scenarios = "scenarios_extended.json" if args.suite == "extended" else "scenarios.json"
-        command([sys.executable, HERE / "generate.py", "--backend", args.backend,
-                 "--scenarios", HERE / scenarios, "--output", dataset])
+        scenarios = "scenarios.json" if args.suite == "smoke" else f"scenarios_{args.suite}.json"
+        generation = [sys.executable, HERE / "generate.py", "--backend", args.backend,
+                      "--scenarios", HERE / scenarios, "--output", dataset]
+        if args.case:
+            generation += ["--case", args.case]
+        command(generation)
         if args.backend == "blender":
             command([args.blender, "--background", "--python", HERE / "render_blender.py",
                      "--", "--dataset", dataset])

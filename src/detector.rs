@@ -1,11 +1,7 @@
 use anyhow::Result;
 use apriltag::{
-    pose::TagParams,
-    Detection as AprilRawDetection,
-    Detector,
-    DetectorBuilder,
+    families::Family, pose::TagParams, Detection as AprilRawDetection, Detector, DetectorBuilder,
     Image as AprilImage,
-    families::Family,
 };
 use nalgebra::{Matrix3, Vector3};
 
@@ -28,6 +24,7 @@ pub struct AprilTagDetection {
     pub center: [f64; 2],
     pub corners: [[f64; 2]; 4],
     pub(crate) cpu_detection: Option<AprilRawDetection>,
+    pub(crate) image_patch: Option<crate::tag_refine::TagPatch>,
 }
 
 impl AprilTagDetection {
@@ -47,7 +44,16 @@ impl AprilTagDetection {
             cx: camera.cx,
             cy: camera.cy,
         };
-        det.estimate_tag_pose_orthogonal_iteration(&params, n_iters)
+        let s = camera.tag_size_m / 2.0;
+        let object_points = [
+            Vector3::new(-s, s, 0.0),
+            Vector3::new(s, s, 0.0),
+            Vector3::new(s, -s, 0.0),
+            Vector3::new(-s, -s, 0.0),
+        ];
+        let corners = solver_corners(self.corners);
+        let raw: Vec<_> = det
+            .estimate_tag_pose_orthogonal_iteration(&params, n_iters)
             .into_iter()
             .filter_map(|candidate| {
                 let rot = candidate.pose.rotation();
@@ -62,17 +68,41 @@ impl AprilTagDetection {
                     translation: Vector3::new(t_data[0], t_data[1], t_data[2]),
                 };
                 let reprojection_rmse_px =
-                    pose::reprojection_rmse_px_for_pose(&pose, &solver_corners(self.corners), camera, apply_distortion)?;
+                    pose::reprojection_rmse_px_for_pose(&pose, &corners, camera, apply_distortion)?;
                 Some(PoseEstimate {
                     pose,
                     reprojection_rmse_px,
                 })
             })
-            .collect()
+            .collect();
+        // Keep both original orientation hypotheses. Corner-only refinement can
+        // pull two starts into the same minimum before image alignment sees them.
+        let mut estimates = raw.clone();
+        for candidate in &raw {
+            if let Some(estimate) = pose::estimate_pose_from_correspondences(
+                &object_points,
+                &corners,
+                camera,
+                apply_distortion,
+                &candidate.pose,
+            ) {
+                estimates.push(estimate);
+            }
+        }
+        if let Some(estimate) = pose::estimate_pose(&corners, camera, apply_distortion) {
+            estimates.push(estimate);
+        }
+        if let Some(patch) = &self.image_patch {
+            if let Some(estimate) = patch.refine(&estimates, camera, &corners, apply_distortion) {
+                return vec![estimate];
+            }
+        }
+        estimates
     }
 
     pub fn drop_cpu_pose_source(&mut self) {
         self.cpu_detection = None;
+        self.image_patch = None;
     }
 }
 
@@ -100,22 +130,28 @@ impl CpuDetector {
         Ok(Self { inner: detector })
     }
 
-    pub fn detect(&mut self, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
+    pub fn detect(
+        &mut self,
+        gray_data: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<Detection>> {
         detect_corners(&mut self.inner, gray_data, width, height)
     }
 }
 
 fn build_inner_detector(nthreads: i32) -> Result<Detector> {
     let family = Family::tag_36h11();
-    let bits: usize = 3;
+    // Three-bit correction can turn low-contrast noise into a valid tag code.
+    let bits: usize = 2;
     let detector = DetectorBuilder::new()
-            .add_family_bits(family, bits)
-            .build()?;
+        .add_family_bits(family, bits)
+        .build()?;
 
     unsafe {
         let ptr_ptr = &detector as *const Detector as *const *mut RawDetector;
         let raw_ptr = *ptr_ptr;
-        
+
         if !raw_ptr.is_null() {
             (*raw_ptr).nthreads = nthreads;
             (*raw_ptr).quad_decimate = 2.0;
@@ -127,42 +163,176 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
     Ok(detector)
 }
 
-fn detect_corners(detector: &mut Detector, gray_data: &[u8], width: usize, height: usize) -> Result<Vec<Detection>> {
+fn detect_corners(
+    detector: &mut Detector,
+    gray_data: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<Vec<Detection>> {
+    anyhow::ensure!(
+        width > 1 && height > 1 && width.checked_mul(height) == Some(gray_data.len()),
+        "Invalid grayscale frame dimensions or buffer length"
+    );
     let mut img = unsafe { AprilImage::new_uinit(width, height)? };
-    
+    let stride = img.stride();
     let dst: &mut _ = img.as_mut();
-    
-    if dst.len() == gray_data.len() {
-        dst.copy_from_slice(gray_data);
-    } else {
-        let copy_len = std::cmp::min(dst.len(), gray_data.len());
-        dst[..copy_len].copy_from_slice(&gray_data[..copy_len]);
+    dst.fill(0);
+    for row in 0..height {
+        dst[row * stride..row * stride + width]
+            .copy_from_slice(&gray_data[row * width..(row + 1) * width]);
     }
+    let detections: Vec<_> = detector
+        .detect(&img)
+        .into_iter()
+        .filter(|det| det.decision_margin().is_finite() && det.decision_margin() >= 20.0)
+        .collect();
+    // Multiple tags constrain the pose geometrically; reserve image alignment
+    // for isolated detections instead of repeating it for every field tag.
+    let isolated = detections.len() == 1;
 
-    let detections = detector.detect(&img);
-    
     let mut results: Vec<Detection> = Vec::new();
     for det in detections {
         let corners = det.corners();
-        let c_arr = [
+        let initial_corners = [
             [corners[0][0], corners[0][1]],
             [corners[1][0], corners[1][1]],
             [corners[2][0], corners[2][1]],
             [corners[3][0], corners[3][1]],
         ];
-        
+        let c_arr = refine_border_corners(gray_data, width, height, initial_corners)
+            .unwrap_or(initial_corners);
+
         let center = det.center();
         let center_arr = [center[0], center[1]];
 
+        let image_patch = if isolated {
+            crate::tag_refine::TagPatch::new(gray_data, width, height, c_arr)
+        } else {
+            None
+        };
         results.push(Detection::AprilTag(AprilTagDetection {
             id: det.id(),
             center: center_arr,
             corners: c_arr,
             cpu_detection: Some(det),
+            image_patch,
         }));
     }
 
     Ok(results)
+}
+
+/// Fit the black/white border at subpixel precision using bilinear samples and
+/// the signed gradient's first moment. Integer gradient sampling biases small
+/// quads by a fraction of a pixel, which can flip planar pose solutions.
+fn refine_border_corners(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    corners: [[f64; 2]; 4],
+) -> Option<[[f64; 2]; 4]> {
+    let mut lines = [[0.0; 3]; 4];
+    for edge in 0..4 {
+        let a = corners[edge];
+        let b = corners[(edge + 1) % 4];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let length = dx.hypot(dy);
+        if length < 8.0 {
+            return None;
+        }
+        // Native BL/BR/TR/TL winding: this normal points toward the white margin.
+        let normal = [-dy / length, dx / length];
+        let count = (length as usize).clamp(16, 64);
+        let mut points = Vec::new();
+        for i in 0..count {
+            let t = 0.15 + 0.7 * (i as f64 + 0.5) / count as f64;
+            let base = [a[0] + t * dx, a[1] + t * dy];
+            let mut previous = sample_gray(
+                data,
+                width,
+                height,
+                base[0] - 2.0 * normal[0],
+                base[1] - 2.0 * normal[1],
+            )?;
+            let mut weight = 0.0;
+            let mut moment = 0.0;
+            for step in 1..=16 {
+                let offset = -2.0 + step as f64 * 0.25;
+                let value = sample_gray(
+                    data,
+                    width,
+                    height,
+                    base[0] + offset * normal[0],
+                    base[1] + offset * normal[1],
+                )?;
+                let gradient = value - previous;
+                weight += gradient;
+                moment += gradient * (offset - 0.125);
+                previous = value;
+            }
+            if weight < 60.0 {
+                continue;
+            }
+            let offset = moment / weight;
+            if !offset.is_finite() || offset.abs() > 1.75 {
+                continue;
+            }
+            points.push([base[0] + offset * normal[0], base[1] + offset * normal[1]]);
+        }
+        if points.len() < 8 {
+            return None;
+        }
+        let mean = [
+            points.iter().map(|p| p[0]).sum::<f64>() / points.len() as f64,
+            points.iter().map(|p| p[1]).sum::<f64>() / points.len() as f64,
+        ];
+        let mut xx = 0.0;
+        let mut xy = 0.0;
+        let mut yy = 0.0;
+        for p in points {
+            let x = p[0] - mean[0];
+            let y = p[1] - mean[1];
+            xx += x * x;
+            xy += x * y;
+            yy += y * y;
+        }
+        let angle = 0.5 * (2.0 * xy).atan2(xx - yy);
+        let n = [-angle.sin(), angle.cos()];
+        lines[edge] = [n[0], n[1], n[0] * mean[0] + n[1] * mean[1]];
+    }
+    let mut refined = corners;
+    for i in 0..4 {
+        let a = lines[(i + 3) % 4];
+        let b = lines[i];
+        let determinant = a[0] * b[1] - a[1] * b[0];
+        if determinant.abs() < 0.1 {
+            return None;
+        }
+        let point = [
+            (a[2] * b[1] - a[1] * b[2]) / determinant,
+            (a[0] * b[2] - a[2] * b[0]) / determinant,
+        ];
+        if (point[0] - corners[i][0]).hypot(point[1] - corners[i][1]) > 2.5 {
+            return None;
+        }
+        refined[i] = point;
+    }
+    Some(refined)
+}
+
+fn sample_gray(data: &[u8], width: usize, height: usize, x: f64, y: f64) -> Option<f64> {
+    if x < 0.0 || y < 0.0 || x >= (width - 1) as f64 || y >= (height - 1) as f64 {
+        return None;
+    }
+    let ix = x.floor() as usize;
+    let iy = y.floor() as usize;
+    let fx = x - ix as f64;
+    let fy = y - iy as f64;
+    let top = data[iy * width + ix] as f64 * (1.0 - fx) + data[iy * width + ix + 1] as f64 * fx;
+    let bottom = data[(iy + 1) * width + ix] as f64 * (1.0 - fx)
+        + data[(iy + 1) * width + ix + 1] as f64 * fx;
+    Some(top * (1.0 - fy) + bottom * fy)
 }
 
 fn solver_corners(corners: [[f64; 2]; 4]) -> [(f64, f64); 4] {
@@ -172,4 +342,66 @@ fn solver_corners(corners: [[f64; 2]; 4]) -> [(f64, f64); 4] {
         (corners[2][0], corners[2][1]),
         (corners[3][0], corners[3][1]),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_tags_in_frames_with_padded_native_rows() {
+        let tag = image::load_from_memory(include_bytes!(
+            "../simulation_tests/reference/tag36h11_1.png"
+        ))
+        .unwrap()
+        .to_luma8();
+        let tag = image::imageops::resize(&tag, 400, 400, image::imageops::FilterType::Nearest);
+        let mut frame = image::GrayImage::from_pixel(641, 481, image::Luma([255]));
+        image::imageops::overlay(&mut frame, &tag, 120, 40);
+        let mut detector = CpuDetector::new(1).unwrap();
+        let results = detector.detect(frame.as_raw(), 641, 481).unwrap();
+        assert!(results
+            .iter()
+            .any(|d| matches!(d,Detection::AprilTag(tag) if tag.id==1)));
+        assert!(detector.detect(&[0; 4], 641, 481).is_err());
+    }
+
+    #[test]
+    fn rejects_low_contrast_even_when_the_tag_code_is_valid() {
+        let tag = image::load_from_memory(include_bytes!(
+            "../simulation_tests/reference/tag36h11_1.png"
+        ))
+        .unwrap()
+        .to_luma8();
+        let mut tag = image::imageops::resize(&tag, 400, 400, image::imageops::FilterType::Nearest);
+        for pixel in tag.pixels_mut() {
+            pixel[0] = if pixel[0] == 0 { 120 } else { 130 };
+        }
+        let mut detector = CpuDetector::new(1).unwrap();
+        assert!(detector.detect(tag.as_raw(), 400, 400).unwrap().is_empty());
+    }
+
+    #[test]
+    fn border_refinement_removes_fractional_pixel_bias() {
+        let (width, height) = (120, 100);
+        let mut data = vec![255u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let cover_x = ((x as f64 + 0.5).min(80.75) - (x as f64 - 0.5).max(30.25)).max(0.0);
+                let cover_y = ((y as f64 + 0.5).min(70.80) - (y as f64 - 0.5).max(25.40)).max(0.0);
+                data[y * width + x] = (255.0 * (1.0 - cover_x * cover_y)).round() as u8;
+            }
+        }
+        let initial = [[30.8, 71.3], [81.3, 71.3], [81.3, 25.9], [30.8, 25.9]];
+        let expected = [
+            [30.25, 70.80],
+            [80.75, 70.80],
+            [80.75, 25.40],
+            [30.25, 25.40],
+        ];
+        let corners = refine_border_corners(&data, width, height, initial).unwrap();
+        for (point, truth) in corners.iter().zip(expected) {
+            assert!((point[0] - truth[0]).hypot(point[1] - truth[1]) < 0.03);
+        }
+    }
 }

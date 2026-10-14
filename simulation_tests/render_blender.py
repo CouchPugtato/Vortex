@@ -78,7 +78,9 @@ def main():
         for plane, tag in zip(planes, manifest["tags"]):
             normal = Matrix(tag["rotation"]).col[0]
             eye_delta = obj.location - plane.location
-            plane.hide_render = frame["case"].get("hide_tags", False) or eye_delta.dot(normal) <= 0
+            plane.hide_render = (frame["case"].get("hide_tags", False) or eye_delta.dot(normal) <= 0
+                                 or (frame["case"].get("single_tag_only", False)
+                                     and tag["id"] != frame["case"]["tag_id"]))
         scene.render.filepath = str(root / frame["image"])
         bpy.ops.render.render(write_still=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(root / "scene.blend"))

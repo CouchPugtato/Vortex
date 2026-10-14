@@ -19,7 +19,8 @@ for frame in manifest["frames"]:
     image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise FileNotFoundError(path)
-    images.append((path, degrade(image, frame["case"], rng)))
+    noise_rng = np.random.default_rng(frame["case"]["noise_seed"]) if "noise_seed" in frame["case"] else rng
+    images.append((path, degrade(image, frame["case"], noise_rng)))
 for path, image in images:
     if not cv2.imwrite(str(path), image):
         raise OSError(path)

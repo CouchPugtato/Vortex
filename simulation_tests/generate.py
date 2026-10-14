@@ -15,7 +15,8 @@ MAP_FROM_SOLVER = np.array([[0, 0, -1], [1, 0, 0], [0, -1, 0]], dtype=float)
 
 def expand_cases(spec, tag_ids):
     """Expand configurable Cartesian sweeps into named, reproducible cases."""
-    cases = [dict(case, group=case.get("group", "baseline")) for case in spec.get("cases", [])]
+    defaults = spec.get("case_defaults", {})
+    cases = [{**defaults, **case, "group": case.get("group", "baseline")} for case in spec.get("cases", [])]
     for sweep in spec.get("sweeps", []):
         ids = sweep.get("tag_ids", [1])
         if ids == "all":
@@ -28,7 +29,9 @@ def expand_cases(spec, tag_ids):
         if "name" in parameters or "tag_id" in parameters or "group" in parameters:
             raise ValueError("Sweep parameters cannot override name, tag_id, or group")
         for i, values in enumerate(product(ids, *parameters.values())):
-            cases.append(dict(zip(parameters, values[1:]), tag_id=values[0],
+            values_by_name = dict(defaults)
+            values_by_name.update(zip(parameters, values[1:]))
+            cases.append(dict(values_by_name, tag_id=values[0],
                               name=f"{sweep['name']}_{i:04d}", group=sweep["name"]))
     if not cases:
         raise ValueError("Scenario suite is empty")
@@ -104,6 +107,8 @@ def render_fast(frame, tags, camera, width, height, textures):
     if frame["case"].get("hide_tags"):
         return image, expected
     for tag in sorted(tags, key=lambda t: np.linalg.norm(np.array(t["position"])-eye), reverse=True):
+        if frame["case"].get("single_tag_only") and tag["id"] != frame["case"]["tag_id"]:
+            continue
         normal = np.array(tag["rotation"])[:, 0]
         if np.dot(eye - tag["position"], normal) <= 0:
             continue
@@ -133,6 +138,7 @@ def main():
     parser.add_argument("--field", type=Path, default=HERE.parent / "config/2026-rebuilt-welded.json")
     parser.add_argument("--scenarios", type=Path, default=HERE / "scenarios.json")
     parser.add_argument("--output", type=Path, default=HERE / "generated/fast")
+    parser.add_argument("--case", help="Generate one named case (requires explicit noise_seed for noisy cases)")
     args = parser.parse_args()
     spec = json.loads(args.scenarios.read_text())
     runtime = json.loads(args.config.read_text())
@@ -163,6 +169,12 @@ def main():
     frames = []
     names = set()
     cases = expand_cases(spec, by_id)
+    if args.case:
+        cases = [case for case in cases if case["name"] == args.case]
+        if not cases:
+            raise ValueError(f"Unknown case: {args.case}")
+        if cases[0].get("noise_sigma", 0) and "noise_seed" not in cases[0]:
+            raise ValueError("Noisy case needs an explicit noise_seed for isolated reproduction")
     for i, case in enumerate(cases):
         name = case["name"]
         if not name or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in name) or name in names:
@@ -177,11 +189,18 @@ def main():
         image, expected = render_fast(frame, tags, camera, width, height, textures)
         frame["projected_ids"] = expected
         frame["expected_ids"] = [] if case.get("hide_tags") else [case["tag_id"]]
+        if case.get("hide_tags"):
+            frame["allowed_ids"] = []
+        elif case.get("single_tag_only"):
+            frame["allowed_ids"] = [case["tag_id"]]
         if frame["expected_ids"] and case["tag_id"] not in expected:
             raise ValueError(f"Target tag is too small or outside image: {name}")
         if args.backend == "fast":
-            cv2.imwrite(str(out / frame["image"]), degrade(image, case, rng))
+            noise_rng = np.random.default_rng(case["noise_seed"]) if "noise_seed" in case else rng
+            cv2.imwrite(str(out / frame["image"]), degrade(image, case, noise_rng))
         frames.append(frame)
+        if len(cases) >= 128 and (i + 1) % 128 == 0:
+            print(f"Prepared {i + 1}/{len(cases)} images", flush=True)
     (out / "runtime_config.json").write_text(json.dumps(runtime, indent=2))
     manifest = {"schema_version": 1, "backend": args.backend, "width": width, "height": height,
                 "camera_index": spec["camera_index"], "seed": spec.get("seed", 2026),

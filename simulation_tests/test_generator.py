@@ -11,6 +11,50 @@ from generate import HERE, camera_pose, project, tag_geometry, expand_cases, tag
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_stress_suite_coverage_and_seeded_cases(self):
+        tags = {t["ID"] for t in json.loads((HERE.parent / "config/2026-rebuilt-welded.json").read_text())["tags"]}
+        cases = expand_cases(json.loads((HERE / "scenarios_stress.json").read_text()), tags)
+        self.assertEqual(len(cases), 1024)
+        self.assertEqual(len({c["name"] for c in cases}), 1024)
+        self.assertEqual(sum(c.get("single_tag_only", False) for c in cases), 832)
+        self.assertEqual({c["tag_id"] for c in cases if c["group"] == "single_geometry"}, tags)
+        self.assertTrue(all("noise_seed" in c for c in cases))
+
+    def test_case_defaults_can_be_overridden(self):
+        spec = {"case_defaults": {"noise_seed": 2026}, "cases": [
+            {"name": "custom", "group": "custom", "noise_seed": 42}],
+            "sweeps": [{"name": "grid", "parameters": {"distance_m": [1], "noise_seed": [7]}}]}
+        cases = expand_cases(spec, {1})
+        self.assertEqual([c["noise_seed"] for c in cases], [42, 7])
+        self.assertEqual(cases[0]["group"], "custom")
+
+    def test_single_tag_scene_and_isolated_noise_reproduction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = {"width": 1920, "height": 1080, "camera_index": 0, "seed": 2026,
+                    "cases": [{"name": "single", "tag_id": 1, "distance_m": 1.0,
+                               "single_tag_only": True, "noise_sigma": 3, "noise_seed": 42},
+                              {"name": "other_seed", "tag_id": 1, "distance_m": 1.0,
+                               "single_tag_only": True, "noise_sigma": 3, "noise_seed": 43}]}
+            spec_path = root / "spec.json"
+            spec_path.write_text(json.dumps(spec))
+            for folder, selector in [("all", []), ("one", ["--case", "single"])]:
+                subprocess.run([sys.executable, str(HERE / "generate.py"), "--scenarios", str(spec_path),
+                                "--output", str(root / folder), *selector], check=True,
+                               stdout=subprocess.DEVNULL)
+            full = json.loads((root / "all/manifest.json").read_text())
+            one = json.loads((root / "one/manifest.json").read_text())
+            f = full["frames"][0]
+            self.assertEqual(f["allowed_ids"], [1])
+            self.assertEqual(f["projected_ids"], [1])
+            self.assertEqual((root / "all" / f["image"]).read_bytes(),
+                             (root / "one" / one["frames"][0]["image"]).read_bytes())
+            self.assertNotEqual((root / "all" / f["image"]).read_bytes(),
+                                (root / "all" / full["frames"][1]["image"]).read_bytes())
+            detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11))
+            _, ids, _ = detector.detectMarkers(cv2.imread(str(root / "all" / f["image"])))
+            self.assertEqual(ids.ravel().tolist(), [1])
+
     def test_texture_matches_official_apriltag_orientation(self):
         reference = cv2.imread(str(HERE / "reference/tag36h11_1.png"), cv2.IMREAD_GRAYSCALE)
         self.assertIsNotNone(reference)

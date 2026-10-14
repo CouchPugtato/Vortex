@@ -389,7 +389,7 @@ fn distort_normalized_point(p: (f64, f64), camera: &CameraConfig) -> (f64, f64) 
     (x * radial + x_tan, y * radial + y_tan)
 }
 
-fn undistort_normalized_point(pixel: (f64, f64), camera: &CameraConfig) -> (f64, f64) {
+pub(crate) fn undistort_normalized_point(pixel: (f64, f64), camera: &CameraConfig) -> (f64, f64) {
     let x_dist = (pixel.0 - camera.cx) / camera.fx;
     let y_dist = (pixel.1 - camera.cy) / camera.fy;
     let mut x = x_dist;
