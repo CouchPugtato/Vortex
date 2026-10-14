@@ -42,8 +42,12 @@ With AdvantageScope closed, `python chassis_sim/setup_advantagescope.py` adds a
 
 Both topics use WPILib Pose3d structs (meters, field X/Y, Z up). Error and timing
 topics are under `/VortexSim`. Errors compare against the chassis at camera capture
-time; the live robot may move ahead of the delayed ghost. `PoseAgeMs` shows its age.
-An empty ghost array and `Valid=false` mean localization failed.
+time. `/VortexSim/RawVision` preserves the delayed, unmodified vision pose.
+The displayed `/VortexSim/Ghost` advances that estimate using timestamped drive
+commands at about 50 Hz, without using actual chassis positions. `PoseAgeMs` shows
+raw frame age; `PredictionHorizonMs` shows the compensated time. Prediction stops
+on missing poses, reset, or frames older than 250 ms (`PredictedValid=false`).
+Errors and failure captures always use raw vision; prediction cannot hide failures.
 
 Click the camera preview: **W/S** forward/back, **A/D** strafe, **Q/E** or **Left/Right arrows** turn,
 **Space** stop. Losing focus stops movement. Reset returns to the starting pose.
@@ -64,7 +68,7 @@ The production config is never overwritten.
 
 The camera defaults to 960×540, scaling intrinsics from 1920×1080. Override
 `--calibration-width`/`--calibration-height` if the calibration uses another size.
-`--camera-hz 20` controls sampling (default 20 FPS); actual throughput depends on
+`--camera-hz 40` controls sampling (default 40 FPS); actual throughput depends on
 CPU localization. Chassis/Actual publishes continuously at about 50 Hz, including
 while stationary. A second simulator using the same NT4 port is rejected.
 The camera uses a persistent Vortex process and raw grayscale frames. `LatencyMs`

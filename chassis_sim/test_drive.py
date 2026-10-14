@@ -64,6 +64,7 @@ class HarnessTests(unittest.TestCase):
             actual = client.getStructTopic('/VortexSim/Actual', Pose3d).subscribe(
                 Pose3d(), ntcore.PubSubOptions(keepDuplicates=True, sendAll=True, periodic=.02))
             ghost = client.getStructArrayTopic('/VortexSim/Ghost', Pose3d).subscribe([])
+            raw = client.getStructArrayTopic('/VortexSim/RawVision', Pose3d).subscribe([])
             camera = client.getStructTopic('/VortexSim/Camera', Pose3d).subscribe(Pose3d())
             client.setServer('127.0.0.1', port4)
             client.startClient4('vortex-sim-test')
@@ -88,11 +89,23 @@ class HarnessTests(unittest.TestCase):
                     server.publish_actual([3, 2, 0])
                     time.sleep(.025)
                 self.assertGreater(actual.getAtomic().time, previous)
+                deadline = time.monotonic()+2
+                while time.monotonic() < deadline:
+                    server.publish_result(result, display_raw=False)
+                    server.publish_display((np.array([3.2, 2., 0]), np.eye(3)), .1)
+                    if raw.get() and ghost.get() and ghost.get()[0].X() == 3.2:
+                        break
+                    time.sleep(.02)
+                self.assertEqual(raw.get()[0].X(), 3.)
+                self.assertEqual(ghost.get()[0].X(), 3.2)
+                self.assertEqual(server.entries['PositionErrorM'].getDouble(-1), 0.)
+                self.assertEqual(server.entries['PredictionHorizonMs'].getDouble(-1), 100.)
                 server.publish_result((None, None, {}, np.array([3, 2, 0]), .1))
                 deadline = time.monotonic() + 2
                 while ghost.get() and time.monotonic() < deadline:
                     time.sleep(.02)
                 self.assertEqual(ghost.get(), [])
+                self.assertEqual(raw.get(), [])
             finally:
                 client.stopClient()
                 server.instance.stopServer()

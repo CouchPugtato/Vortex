@@ -22,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "simulation_tests"))
 from generate import render_fast, tag_geometry, tag_texture
 from run import replay_command
+from ghost_prediction import GhostPredictor
 
 MOUNT_KEYS = ("x_offset", "y_offset", "z_offset", "roll_deg", "pitch_deg", "yaw_deg")
 
@@ -321,14 +322,19 @@ class Telemetry:
             ntcore.PubSubOptions(periodic=.02, keepDuplicates=True, sendAll=True))
         self.ghost = self.instance.getStructArrayTopic("/VortexSim/Ghost", Pose3d).publish(
             ntcore.PubSubOptions(periodic=.02, keepDuplicates=True, sendAll=True))
+        self.raw_vision = self.instance.getStructArrayTopic("/VortexSim/RawVision", Pose3d).publish(
+            ntcore.PubSubOptions(periodic=.02, keepDuplicates=True, sendAll=True))
         self.camera_pose = self.instance.getStructTopic("/VortexSim/Camera", Pose3d).publish(
             ntcore.PubSubOptions(periodic=.02, keepDuplicates=True, sendAll=True))
         self.entries = {name: self.instance.getEntry("/VortexSim/" + name) for name in
                         ("Valid", "PositionErrorM", "HeadingErrorDeg", "LatencyMs", "PoseAgeMs",
-                         "RenderMs", "VortexMs", "CameraFPS", "LoopFPS", "CapturesSaved", "CaptureDropped")}
+                         "RenderMs", "VortexMs", "CameraFPS", "LoopFPS", "CapturesSaved", "CaptureDropped",
+                         "PredictedValid", "PredictionHorizonMs")}
         self.result_times = deque(maxlen=100)
         self.entries["Valid"].setBoolean(False)
         self.ghost.set([])
+        self.raw_vision.set([])
+        self.entries["PredictedValid"].setBoolean(False)
 
     @staticmethod
     def pose(position, rotation):
@@ -344,7 +350,7 @@ class Telemetry:
             self.camera_pose.set(self.pose(position, optical_rotation @ optical_from_nwu))
         self.instance.flush()
 
-    def publish_result(self, result):
+    def publish_result(self, result, display_raw=True):
         ghost, _, report, captured, latency = result
         self.entries["Valid"].setBoolean(ghost is not None)
         self.entries["LatencyMs"].setDouble(latency * 1000)
@@ -360,7 +366,10 @@ class Telemetry:
         if len(self.result_times) > 1:
             self.entries["CameraFPS"].setDouble((len(self.result_times)-1) /
                                                max(now-self.result_times[0], 1e-6))
-        self.ghost.set([] if ghost is None else [self.pose(*ghost)])
+        self.raw_vision.set([] if ghost is None else [self.pose(*ghost)])
+        # Headless callers display raw vision; the GUI updates this at drive rate.
+        if display_raw:
+            self.publish_display(ghost, 0.)
         if ghost is not None:
             p, r = ghost
             self.entries["PositionErrorM"].setDouble(float(np.linalg.norm(p - [*captured[:2], 0.])))
@@ -369,6 +378,12 @@ class Telemetry:
         else:
             for name in ("PositionErrorM", "HeadingErrorDeg"):
                 self.entries[name].setDouble(float("nan"))
+        self.instance.flush()
+
+    def publish_display(self, ghost, horizon):
+        self.ghost.set([] if ghost is None else [self.pose(*ghost)])
+        self.entries["PredictedValid"].setBoolean(ghost is not None)
+        self.entries["PredictionHorizonMs"].setDouble(horizon*1000 if ghost is not None else float('nan'))
         self.instance.flush()
 
 
@@ -418,12 +433,24 @@ def gui(harness, telemetry):
     ttk.Label(root, textvariable=capture_count).grid(row=12, column=2, columnspan=2)
     preview.bind("<Button-1>", lambda _: preview.focus_set())
     keys = set()
+    predictor = GhostPredictor()
+    generation = 0
+    pending_generation = 0
     preview.bind("<KeyPress>", lambda e: keys.add(e.keysym.lower()))
     preview.bind("<KeyRelease>", lambda e: keys.discard(e.keysym.lower()))
     preview.bind("<FocusOut>", lambda _: keys.clear())
     def reset():
+        nonlocal generation, result_captured_at
         keys.clear()
         harness.chassis = harness.initial.copy()
+        generation += 1
+        predictor.clear()
+        result_captured_at = None
+        telemetry.raw_vision.set([])
+        telemetry.entries["Valid"].setBoolean(False)
+        for name in ("PositionErrorM", "HeadingErrorDeg", "PoseAgeMs"):
+            telemetry.entries[name].setDouble(float('nan'))
+        telemetry.publish_display(None, 0.)
     ttk.Button(root, text="Reset chassis", command=reset).grid(row=8, column=0)
     def save():
         mounts = read_mounts()
@@ -443,11 +470,12 @@ def gui(harness, telemetry):
     pool = ThreadPoolExecutor(max_workers=1)
     pending = None
     last = time.perf_counter()
+    physics_at = last+.02
     sample_at = 0.
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, sample_at, captured_at, result_captured_at, last_capture, notification_until
+        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation
         now = time.perf_counter()
         if harness.capture is not None:
             counts = harness.capture.status()
@@ -468,21 +496,35 @@ def gui(harness, telemetry):
                 notification_until = 0.
         else:
             capture_count.set('Captures disabled')
-        dt, last = min(now - last, .1), now
-        telemetry.entries["LoopFPS"].setDouble(1 / max(dt, 1e-6))
         if "space" in keys:
             keys.clear()
-        harness.chassis = step(harness.chassis, (int("w" in keys)-int("s" in keys))*2,
-                               (int("a" in keys)-int("d" in keys))*2,
-                               (int(bool(keys & {"q", "left"}))-int(bool(keys & {"e", "right"})))*1.5, dt, harness.field)
+        commands = ((int("w" in keys)-int("s" in keys))*2,
+                    (int("a" in keys)-int("d" in keys))*2,
+                    (int(bool(keys & {"q", "left"}))-int(bool(keys & {"e", "right"})))*1.5)
+        # Poll camera completion more often than physics: otherwise a 17 ms
+        # worker takes two 20 ms callbacks and caps sampling at 25 FPS.
+        if now >= physics_at:
+            physics_at = max(physics_at+.02, now)
+            previous = last
+            dt, last = min(now-last, .1), now
+            telemetry.entries["LoopFPS"].setDouble(1 / max(now-previous, 1e-6))
+            if now-dt > previous:
+                predictor.record(previous, now-dt, 0., 0., 0.)
+            predictor.record(now-dt, now, *commands)
+            harness.chassis = step(harness.chassis, *commands, dt, harness.field)
         live_mounts = read_mounts()
         telemetry.publish_actual(harness.chassis, live_mounts[0] if live_mounts else None)
         if pending is not None and pending.done():
             try:
                 result = pending.result()
-                telemetry.publish_result(result)
+                if pending_generation != generation:
+                    pending = None
+                    root.after(1, tick)
+                    return
+                telemetry.publish_result(result, display_raw=False)
                 result_captured_at = captured_at
                 ghost, image, report, _, latency = result
+                predictor.observe(ghost, captured_at)
                 # Tk accepts uncompressed PPM; avoid PNG compression in the drive loop.
                 rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 ppm = f"P6\n{image.shape[1]} {image.shape[0]}\n255\n".encode() + rgb.tobytes()
@@ -496,6 +538,8 @@ def gui(harness, telemetry):
                 if report.get('pipeline_error'):
                     status.set(status.get()+f" | {report['pipeline_error']}")
             except Exception as error:
+                predictor.observe(None, now)
+                telemetry.raw_vision.set([])
                 telemetry.ghost.set([])
                 telemetry.entries["Valid"].setBoolean(False)
                 for name in ("PositionErrorM", "HeadingErrorDeg"):
@@ -504,13 +548,18 @@ def gui(harness, telemetry):
             pending = None
         if result_captured_at is not None:
             telemetry.entries["PoseAgeMs"].setDouble((now-result_captured_at)*1000)
+        # Commands cover physics ticks, not time spent displaying the preview.
+        telemetry.publish_display(predictor.predict(last) if result_captured_at is not None and
+                                  now-result_captured_at <= predictor.max_age else None,
+                                  last-result_captured_at if result_captured_at is not None else 0.)
         if pending is None and now >= sample_at:
             mounts = live_mounts
             if mounts:
                 pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts)
-                captured_at = now
+                captured_at = last
+                pending_generation = generation
             sample_at = max(sample_at + 1 / harness.args.camera_hz, now)
-        root.after(max(1, 20-round((time.perf_counter()-now)*1000)), tick)
+        root.after(max(1, 5-round((time.perf_counter()-now)*1000)), tick)
     def close():
         root.destroy()
     root.protocol("WM_DELETE_WINDOW", close)
@@ -541,7 +590,7 @@ def main():
     parser.add_argument("--calibration-height", type=int, default=1080)
     parser.add_argument("--start-tag", type=int, default=18)
     parser.add_argument("--start-distance", type=float, default=1.5, help="Initial horizontal distance from target tag, meters")
-    parser.add_argument("--camera-hz", type=float, default=20)
+    parser.add_argument("--camera-hz", type=float, default=40)
     parser.add_argument("--renderer", choices=('field', 'fast'), default='field',
                         help="Depth-tested full field (default), or lightweight tag-only fixtures")
     parser.add_argument("--field-asset", type=Path, help="AdvantageScope Field3d asset folder or model.glb")
