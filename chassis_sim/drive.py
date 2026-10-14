@@ -336,7 +336,7 @@ def gui(harness, telemetry):
     root = tk.Tk()
     root.title("Vortex chassis simulator")
     ttk.Label(root, text="Camera preview — open AdvantageScope for the 3D field and chassis.\n"
-              "Click camera to drive: W/S forward, A/D or Left/Right strafe, Q/E turn. Space stops.").grid(columnspan=4)
+              "Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.").grid(columnspan=4)
     variables = {}
     for col, (title, mount) in enumerate((("Actual mount", harness.actual), ("Vortex assumed mount", harness.assumed))):
         ttk.Label(root, text=title).grid(row=1, column=col * 2, columnspan=2)
@@ -387,8 +387,8 @@ def gui(harness, telemetry):
         if "space" in keys:
             keys.clear()
         harness.chassis = step(harness.chassis, (int("w" in keys)-int("s" in keys))*2,
-                               (int(bool(keys & {"a", "left"}))-int(bool(keys & {"d", "right"})))*2,
-                               (int("q" in keys)-int("e" in keys))*1.5, dt, harness.field)
+                               (int("a" in keys)-int("d" in keys))*2,
+                               (int(bool(keys & {"q", "left"}))-int(bool(keys & {"e", "right"})))*1.5, dt, harness.field)
         live_mounts = read_mounts()
         telemetry.publish_actual(harness.chassis, live_mounts[0] if live_mounts else None)
         if pending is not None and pending.done():

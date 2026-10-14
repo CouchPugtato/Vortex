@@ -45,7 +45,7 @@ topics are under `/VortexSim`. Errors compare against the chassis at camera capt
 time; the live robot may move ahead of the delayed ghost. `PoseAgeMs` shows its age.
 An empty ghost array and `Valid=false` mean localization failed.
 
-Click the camera preview: **W/S** forward/back, **A/D** or **Left/Right arrows** strafe, **Q/E** turn,
+Click the camera preview: **W/S** forward/back, **A/D** strafe, **Q/E** or **Left/Right arrows** turn,
 **Space** stop. Losing focus stops movement. Reset returns to the starting pose.
 The default spawn faces tag 18 at 1.5 m, clear of the trench structure.
 Use `--start-tag ID` and `--start-distance METERS` to change it.
