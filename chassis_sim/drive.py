@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import threading
+import hashlib
 
 import cv2
 import numpy as np
@@ -216,37 +217,77 @@ class Harness:
                         camera=self.camera, tags=self.tags, frames=[])
         self.replay = StreamReplay(self.command[0], manifest, self.env, self.root)
         self.field_renderer = None
+        self.field_asset = None
         if getattr(args, 'renderer', 'field') == 'field':
             from field_renderer import FieldRenderer, find_field_asset
             try:
-                self.field_renderer = FieldRenderer(find_field_asset(getattr(args, 'field_asset', None)),
+                self.field_asset = find_field_asset(getattr(args, 'field_asset', None))
+                self.field_renderer = FieldRenderer(self.field_asset,
                     self.camera, self.width, self.height, self.tags, self.textures)
                 print(f"Field camera GPU: {self.field_renderer.renderer}", flush=True)
             except Exception:
                 self.replay.close()
                 raise
+        self.capture = None
+        if not getattr(args, 'no_capture', False):
+            from failure_capture import CapturePolicy, FailureCapture
+            revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=HERE.parent,
+                                      capture_output=True, text=True).stdout.strip() if shutil.which('git') else 'unknown'
+            source_hashes = {name: hashlib.sha256((HERE.parent/name).read_bytes()).hexdigest()
+                for name in ('src/detector.rs', 'src/pose.rs', 'src/tag_refine.rs', 'src/config.rs',
+                             'simulation_tests/replay/src/main.rs', 'simulation_tests/replay/Cargo.lock',
+                             'chassis_sim/drive.py', 'chassis_sim/field_renderer.py', 'chassis_sim/failure_capture.py')}
+            asset = None if self.field_asset is None else dict(path=str(self.field_asset),
+                model_sha256=hashlib.sha256((self.field_asset/'model.glb').read_bytes()).hexdigest(),
+                config=json.loads((self.field_asset/'config.json').read_text(encoding='utf-8')))
+            context = dict(camera=self.camera, tags=self.tags, field_map=raw_field, runtime_config=raw,
+                           renderer='field' if self.field_renderer else 'fast', asset=asset,
+                           code_revision=revision, source_sha256=source_hashes)
+            policy = CapturePolicy(position_m=getattr(args, 'capture_position_m', .2),
+                heading_deg=getattr(args, 'capture_heading_deg', 5.),
+                cooldown_s=getattr(args, 'capture_cooldown', 5.), max_cases=getattr(args, 'capture_max_cases', 50),
+                max_bytes=int(getattr(args, 'capture_max_mb', 1024)*1024*1024))
+            self.capture = FailureCapture(getattr(args, 'capture_dir', HERE/'generated/captures'), self.root.name, context, policy)
+            print(f"Failure captures: {self.capture.session}", flush=True)
 
     def close(self):
+        if self.capture is not None:
+            self.capture.close()
         self.replay.close()
         if self.field_renderer is not None:
             self.field_renderer.close()
 
     def localize(self, chassis, actual, assumed):
         started = time.perf_counter()
+        from failure_capture import utc_now
+        captured_utc = utc_now()
         position, rotation = camera_pose(chassis, actual)
         frame = {"name": "live", "image": "camera.png", "case": {},
                  "camera_position": position.tolist(), "camera_rotation": rotation.tolist(),
                  "expected_ids": []}
         if self.field_renderer is not None:
-            image = self.field_renderer.render(position, rotation)
+            if self.capture is not None:
+                image, visibility = self.field_renderer.render(position, rotation, with_visibility=True)
+            else:
+                image, visibility = self.field_renderer.render(position, rotation), []
         else:
             background = ground_background(position, rotation, self.floor_camera, self.floor_width,
                                            self.floor_height, self.field, self.rays)
             background = cv2.resize(background, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-            image, _ = render_fast(frame, self.tags, self.camera, self.width, self.height,
+            image, expected = render_fast(frame, self.tags, self.camera, self.width, self.height,
                                    self.textures, background=background, roi=True)
+            # Fast rendering has no opaque field structures. Test only the known
+            # fully visible tags; retain all mapped IDs as allowed for cropped tags.
+            visibility = [dict(id=t['id'], visible_fraction=1., clearly_visible=t['id'] in expected)
+                          for t in self.tags]
         rendered_at = time.perf_counter()
-        report = self.replay.request(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        try:
+            report = self.replay.request(gray)
+        except Exception as error:
+            if self.capture is None:
+                raise
+            report = dict(joint_pose=None, poses=[], detected_ids=[], pipeline_error=str(error))
         report["render_ms"] = (rendered_at-started)*1000
         report["vortex_ms"] = (time.perf_counter()-rendered_at)*1000
         estimate = report["joint_pose"]
@@ -254,6 +295,12 @@ class Harness:
             estimate = min(report["poses"], key=lambda p: p["reprojection_rmse_px"])
         ghost = None if estimate is None else robot_pose(
             estimate["camera_position"], estimate["camera_rotation"], assumed)
+        if self.capture is not None:
+            self.capture.observe(dict(gray=gray, image=image, ghost=ghost, chassis=chassis.copy(),
+                report=dict(report), actual_mount=dict(actual), assumed_mount=dict(assumed),
+                camera_position=position.tolist(), camera_rotation=rotation.tolist(), visibility=visibility,
+                monotonic_s=started, captured_utc=captured_utc))
+            report['capture'] = self.capture.status()
         return ghost, image, report, chassis.copy(), time.perf_counter() - started
 
 
@@ -278,7 +325,7 @@ class Telemetry:
             ntcore.PubSubOptions(periodic=.02, keepDuplicates=True, sendAll=True))
         self.entries = {name: self.instance.getEntry("/VortexSim/" + name) for name in
                         ("Valid", "PositionErrorM", "HeadingErrorDeg", "LatencyMs", "PoseAgeMs",
-                         "RenderMs", "VortexMs", "CameraFPS", "LoopFPS")}
+                         "RenderMs", "VortexMs", "CameraFPS", "LoopFPS", "CapturesSaved", "CaptureDropped")}
         self.result_times = deque(maxlen=100)
         self.entries["Valid"].setBoolean(False)
         self.ghost.set([])
@@ -303,6 +350,9 @@ class Telemetry:
         self.entries["LatencyMs"].setDouble(latency * 1000)
         self.entries["RenderMs"].setDouble(report.get("render_ms", 0.))
         self.entries["VortexMs"].setDouble(report.get("vortex_ms", 0.))
+        capture = report.get('capture', {})
+        self.entries['CapturesSaved'].setDouble(capture.get('saved', 0))
+        self.entries['CaptureDropped'].setDouble(capture.get('dropped', 0))
         now = time.perf_counter()
         self.result_times.append(now)
         while len(self.result_times) > 2 and self.result_times[0] < now-1:
@@ -349,6 +399,23 @@ def gui(harness, telemetry):
     ttk.Label(root, textvariable=status).grid(row=9, columnspan=4)
     preview = tk.Label(root, takefocus=True)
     preview.grid(row=10, columnspan=4)
+    notification = tk.StringVar(value='')
+    banner = tk.Label(root, textvariable=notification, anchor='w', justify='left',
+                      wraplength=min(harness.width, 960), padx=8, pady=5)
+    banner.grid(row=11, columnspan=4, sticky='ew')
+    banner.grid_remove()
+    last_capture = None
+    notification_until = 0.
+    def open_capture():
+        if last_capture is not None:
+            if os.name == 'nt':
+                os.startfile(last_capture)
+            else:
+                subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', last_capture])
+    open_button = ttk.Button(root, text='Open last capture', command=open_capture, state='disabled')
+    open_button.grid(row=12, column=0, columnspan=2)
+    capture_count = tk.StringVar(value='Captures: 0')
+    ttk.Label(root, textvariable=capture_count).grid(row=12, column=2, columnspan=2)
     preview.bind("<Button-1>", lambda _: preview.focus_set())
     keys = set()
     preview.bind("<KeyPress>", lambda e: keys.add(e.keysym.lower()))
@@ -380,8 +447,27 @@ def gui(harness, telemetry):
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, sample_at, captured_at, result_captured_at
+        nonlocal pending, last, sample_at, captured_at, result_captured_at, last_capture, notification_until
         now = time.perf_counter()
+        if harness.capture is not None:
+            counts = harness.capture.status()
+            capture_count.set(f"Captures: {counts['total']} total ({counts['saved']} this session)")
+            for event in harness.capture.take_notifications():
+                last_capture = event['path']
+                action = 'updated' if event['updated'] else 'captured'
+                reasons = ', '.join(reason.replace('_', ' ') for reason in event['reasons'])
+                category = ' [mount experiment]' if event['experiment'] else ''
+                notification.set(f"Bad pose {action}{category}: {reasons}\n{last_capture}")
+                banner.configure(background='#fff3cd', foreground='#664d03')
+                banner.grid()
+                open_button.configure(state='normal')
+                notification_until = now+2
+            if notification_until and now >= notification_until:
+                notification.set('')
+                banner.grid_remove()
+                notification_until = 0.
+        else:
+            capture_count.set('Captures disabled')
         dt, last = min(now - last, .1), now
         telemetry.entries["LoopFPS"].setDouble(1 / max(dt, 1e-6))
         if "space" in keys:
@@ -404,6 +490,11 @@ def gui(harness, telemetry):
                 preview.configure(image=preview.image)
                 status.set(f"Tags: {report['detected_ids']} | {'pose valid' if ghost is not None else 'no pose'} | "
                            f"frame {latency*1000:.0f} ms (render {report['render_ms']:.0f}, Vortex {report['vortex_ms']:.0f})")
+                if 'capture' in report:
+                    info = report['capture']
+                    status.set(status.get()+f" | captures {info['saved']}"+(f" | {info['error']}" if info['error'] else ''))
+                if report.get('pipeline_error'):
+                    status.set(status.get()+f" | {report['pipeline_error']}")
             except Exception as error:
                 telemetry.ghost.set([])
                 telemetry.entries["Valid"].setBoolean(False)
@@ -454,6 +545,13 @@ def main():
     parser.add_argument("--renderer", choices=('field', 'fast'), default='field',
                         help="Depth-tested full field (default), or lightweight tag-only fixtures")
     parser.add_argument("--field-asset", type=Path, help="AdvantageScope Field3d asset folder or model.glb")
+    parser.add_argument('--no-capture', action='store_true', help='Disable automatic regression capture')
+    parser.add_argument('--capture-dir', type=Path, default=HERE/'generated/captures')
+    parser.add_argument('--capture-position-m', type=float, default=.2)
+    parser.add_argument('--capture-heading-deg', type=float, default=5.)
+    parser.add_argument('--capture-cooldown', type=float, default=5., help='Minimum seconds between case writes')
+    parser.add_argument('--capture-max-cases', type=int, default=50, help='Maximum new cases per session')
+    parser.add_argument('--capture-max-mb', type=float, default=1024., help='Total capture directory size limit')
     parser.add_argument("--mingw-root", type=Path, default=Path("C:/msys64/mingw64"))
     parser.add_argument("--replay-executable", type=Path)
     parser.add_argument("--headless-frames", type=int, default=0, help="Finite integration check without GUI")
@@ -469,6 +567,13 @@ def main():
     if args.advantagescope and not args.advantagescope.is_file():
         parser.error("--advantagescope must name an installed executable")
     args.max_error_meters = .20
+    from failure_capture import CapturePolicy
+    try:
+        CapturePolicy(position_m=args.capture_position_m, heading_deg=args.capture_heading_deg,
+                      cooldown_s=args.capture_cooldown, max_cases=args.capture_max_cases,
+                      max_bytes=int(args.capture_max_mb*1024*1024))
+    except (ValueError, OverflowError) as error:
+        parser.error(str(error))
     if min(args.width, args.calibration_width, args.calibration_height) <= 0 or not math.isfinite(args.camera_hz) or args.camera_hz <= 0 or args.headless_frames < 0 or not math.isfinite(args.start_distance) or args.start_distance <= 0:
         parser.error("Dimensions and rate must be positive; headless frame count cannot be negative")
     harness = Harness(args)

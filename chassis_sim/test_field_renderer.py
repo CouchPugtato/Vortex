@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 
 from drive import HERE, StreamReplay, camera_pose
+from failure_capture import FailureCapture
+from replay_captures import replay_cases
 from field_renderer import GPUScene, asset_transform, find_field_asset, projection
 from generate import tag_geometry, tag_texture
 from setup_advantagescope import configure
@@ -84,9 +86,11 @@ class FieldOcclusionTests(unittest.TestCase):
         tag = next(t for t in self.tags if t['id'] == 18)
         base = np.array([tag['position'][0], tag['position'][1]-1.5, np.pi/2])
         eye, r = camera_pose(base, mount)
-        clear = self.scene.render(eye, r)
-        blocked = self.scene.render(eye, r, blockers=[(
-            np.array([tag['position'][0], tag['position'][1]-.75, 1.]), [1., .15, 2.])])
+        clear, clear_labels = self.scene.render(eye, r, with_visibility=True)
+        blocked, blocked_labels = self.scene.render(eye, r, blockers=[(
+            np.array([tag['position'][0], tag['position'][1]-.75, 1.]), [1., .15, 2.])], with_visibility=True)
+        self.assertTrue(next(label for label in clear_labels if label['id'] == 18)['clearly_visible'])
+        self.assertFalse(next(label for label in blocked_labels if label['id'] == 18)['clearly_visible'])
         farther = base.copy()
         farther[1] -= .5
         far_eye, far_r = camera_pose(farther, mount)
@@ -105,6 +109,25 @@ class FieldOcclusionTests(unittest.TestCase):
                 self.assertNotIn(18, detect(blocked))
                 self.assertIn(18, detect(tags_only))
                 self.assertNotIn(18, detect(field_blocked))
+                # Emulate an old bad prediction, then verify the stored pixels can
+                # be replayed independently and pass with the current solver.
+                report = replay.request(cv2.cvtColor(clear, cv2.COLOR_BGR2GRAY))
+                capture = FailureCapture(Path(tmp)/'captures', 'test', dict(
+                    camera=self.camera, tags=self.tags, renderer='field'))
+                record = dict(gray=cv2.cvtColor(clear, cv2.COLOR_BGR2GRAY), image=clear,
+                    ghost=(np.array([base[0]+1,base[1],0]), np.eye(3)), chassis=base.copy(),
+                    report=report, visibility=clear_labels, actual_mount=mount, assumed_mount=mount,
+                    camera_position=eye.tolist(), camera_rotation=r.tolist(),
+                    monotonic_s=0., captured_utc='2026-10-14T20:00:00+00:00')
+                try:
+                    capture.observe(record)
+                    capture.observe(dict(record,monotonic_s=.1))
+                finally:
+                    capture.close()
+                case = next((Path(tmp)/'captures').rglob('capture.json')).parent
+                outcome = replay_cases(case, executable)
+                self.assertEqual(outcome['total'], 1)
+                self.assertEqual(outcome['passed'], 1)
             finally:
                 replay.close()
 

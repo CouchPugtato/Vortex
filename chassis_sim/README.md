@@ -86,4 +86,45 @@ camera inside an obstacle. Frames pass through production CPU detection/pose cod
 ground truth only scores the output. Vortex's GPU detector and live camera capture
 are not exercised.
 Saved mounts and native error logs live in ignored `generated/`. Interactive frames
-stay in memory; use the synthetic test runner for image datasets and replay reports.
+stay in memory except for automatically captured failures.
+
+## Failure capture
+
+Enabled by default. Cases go to `chassis_sim/generated/captures/SESSION/regressions/`;
+mount mismatches go to `experiments/`. Triggers are >20 cm position error, >5° heading
+error, invalid output, invented IDs, or missing pose with clearly visible tags.
+Visibility uses renderer depth, independent of Vortex. Ground truth is from image
+capture time. Occluded or too-small tags alone do not trigger a missing-pose case.
+
+Two bad frames confirm a failure; two good frames end it.
+A two-second banner announces completed saves and worse-example updates, with
+the failure reason and case path. **Open last capture** opens that folder even after
+the banner disappears. A persistent counter shows total saved cases in the capture
+directory (including experiments), plus this session's count. Replacements don't
+increase the count; queued or failed writes don't announce saves.
+
+A stationary episode saves
+one case, with at most two substantially worse replacements. New cases require a
+5-second cooldown and 0.5 m movement, 10° rotation, or changed mounts. Similar images
+are deduplicated across sessions. Default limits: 50 cases/session, 1 GiB total, and
+two pending background writes. Disk errors appear in the GUI; driving continues.
+
+Each case contains the exact grayscale input PNG, color preview, replay manifest,
+ground truth, both mounts, detection diagnostics, visibility, thresholds, field/config
+snapshots, asset hash, and code hashes. Optional before/recovery frames are bounded.
+Cases start unreviewed and are not automatically added to the permanent suite.
+
+```text
+python chassis_sim/replay_captures.py chassis_sim/generated/captures
+python chassis_sim/replay_captures.py PATH_TO_ONE_CASE
+python chassis_sim/promote_capture.py PATH_TO_REVIEWED_CASE simulation_tests/captured_cases/CASE_NAME
+python chassis_sim/replay_captures.py simulation_tests/captured_cases
+```
+
+Replay uses current Vortex on saved pixels and checks chassis position and heading;
+no regeneration is needed. Experiments are skipped unless `--include-experiments`
+is supplied and cannot be promoted as detector regressions. Use `--no-capture` to
+disable saving. Limits and thresholds can be changed with `--capture-position-m`,
+`--capture-heading-deg`, `--capture-cooldown`, `--capture-max-cases`,
+`--capture-max-mb`, and `--capture-dir`. `CapturesSaved` and `CaptureDropped` are
+published to AdvantageScope. Use the synthetic test runner for generated datasets.
