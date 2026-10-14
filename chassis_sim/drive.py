@@ -400,6 +400,11 @@ def gui(harness, telemetry):
             timer = None
     root = tk.Tk()
     root.title("Vortex chassis simulator")
+    root.geometry(f"{min(1000, root.winfo_screenwidth()-80)}x{min(850, root.winfo_screenheight()-100)}")
+    root.minsize(600, 450)
+    for column in range(4):
+        root.columnconfigure(column, weight=1)
+    root.rowconfigure(10, weight=1)
     ttk.Label(root, text="Camera preview — open AdvantageScope for the 3D field and chassis.\n"
               "Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.").grid(columnspan=4)
     variables = {}
@@ -411,14 +416,41 @@ def gui(harness, telemetry):
             ttk.Entry(root, textvariable=var, width=12).grid(row=row, column=col * 2 + 1)
             variables[col, key] = var
     status = tk.StringVar(value="Connect AdvantageScope to 127.0.0.1 (NT4)")
-    ttk.Label(root, textvariable=status).grid(row=9, columnspan=4)
-    preview = tk.Label(root, takefocus=True)
-    preview.grid(row=10, columnspan=4)
+    status_label = ttk.Label(root, textvariable=status, wraplength=900)
+    status_label.grid(row=9, columnspan=4, sticky='ew')
+    # Canvas image items don't set the widget's requested size. Camera resolution
+    # therefore cannot force the window to grow or prevent it from shrinking.
+    preview = tk.Canvas(root, takefocus=True, background='#181818',
+                        width=1, height=1, highlightthickness=0)
+    preview.grid(row=10, columnspan=4, sticky='nsew')
+    preview_item = preview.create_image(0, 0, anchor='center')
+    preview_frame = None
+    def redraw_preview(event=None):
+        if preview_frame is None:
+            return
+        width, height = max(1, preview.winfo_width()), max(1, preview.winfo_height())
+        source_height, source_width = preview_frame.shape[:2]
+        scale = min(width/source_width, height/source_height)
+        size = (max(1, round(source_width*scale)), max(1, round(source_height*scale)))
+        image = preview_frame if size == (source_width, source_height) else cv2.resize(
+            preview_frame, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        # Tk accepts uncompressed PPM; avoid PNG compression in the drive loop.
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        ppm = f"P6\n{size[0]} {size[1]}\n255\n".encode() + rgb.tobytes()
+        preview.image = tk.PhotoImage(data=ppm, format="PPM")
+        preview.itemconfigure(preview_item, image=preview.image)
+        preview.coords(preview_item, width/2, height/2)
+    preview.bind('<Configure>', redraw_preview)
     notification = tk.StringVar(value='')
     banner = tk.Label(root, textvariable=notification, anchor='w', justify='left',
                       wraplength=min(harness.width, 960), padx=8, pady=5)
     banner.grid(row=11, columnspan=4, sticky='ew')
     banner.grid_remove()
+    def resize_text(event):
+        if event.widget is root:
+            status_label.configure(wraplength=max(1, event.width-16))
+            banner.configure(wraplength=max(1, event.width-16))
+    root.bind('<Configure>', resize_text)
     last_capture = None
     notification_until = 0.
     def open_capture():
@@ -475,7 +507,7 @@ def gui(harness, telemetry):
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation
+        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame
         now = time.perf_counter()
         if harness.capture is not None:
             counts = harness.capture.status()
@@ -525,11 +557,8 @@ def gui(harness, telemetry):
                 result_captured_at = captured_at
                 ghost, image, report, _, latency = result
                 predictor.observe(ghost, captured_at)
-                # Tk accepts uncompressed PPM; avoid PNG compression in the drive loop.
-                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                ppm = f"P6\n{image.shape[1]} {image.shape[0]}\n255\n".encode() + rgb.tobytes()
-                preview.image = tk.PhotoImage(data=ppm, format="PPM")
-                preview.configure(image=preview.image)
+                preview_frame = image
+                redraw_preview()
                 status.set(f"Tags: {report['detected_ids']} | {'pose valid' if ghost is not None else 'no pose'} | "
                            f"frame {latency*1000:.0f} ms (render {report['render_ms']:.0f}, Vortex {report['vortex_ms']:.0f})")
                 if 'capture' in report:
