@@ -142,6 +142,8 @@ fn evaluate_frame(
                                 - r_ft * p.pose.rotation.transpose() * p.pose.translation;
                             pose_candidate_diagnostics.push(json!({"id": tag_det.id,
                                 "reprojection_rmse_px": p.reprojection_rmse_px,
+                                "camera_position": [camera_field.x, camera_field.y, camera_field.z],
+                                "camera_rotation": rotation_rows(&(r_ft * p.pose.rotation.transpose())),
                                 "camera_error_m": (camera_field - Vector3::from(frame.camera_position)).norm()}));
                             let normal = matrix(tag.rotation).column(0).into_owned();
                             if (camera_field - Vector3::from(tag.position)).dot(&normal) <= 0. {

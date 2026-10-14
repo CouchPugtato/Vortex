@@ -165,6 +165,7 @@ impl GpuDetector {
                                 [d.corners[3].x as f64, d.corners[3].y as f64],
                             ],
                             cpu_detection: None,
+                            cpu_secondary_detection: None,
                             image_patch: None,
                         }));
                     }

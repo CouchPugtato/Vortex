@@ -2,3 +2,11 @@ generated/
 .venv/
 __pycache__/
 replay/target/
+captured_cases/**/vortex-stderr.log
+captured_cases/**/capture_replay_report.json
+captured_cases/**/report.json
+captured_cases/**/summary.json
+captured_cases/**/failures.json
+captured_cases/**/*.tmp
+captured_cases/**/*.json
+captured_cases/**/*.png

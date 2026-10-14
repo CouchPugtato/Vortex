@@ -42,9 +42,11 @@ Edit `scenarios_extended.json` or `scenarios_stress.json` to change the sweeps. 
 
 Stress cases have explicit noise seeds. Reproduce one with `python simulation_tests/run.py --suite stress --case single_quality_0000`. Single-tag scenes render exactly one tag and reject detections of any other ID, including IDs present elsewhere in the field map. The position-error limit remains 20 cm.
 
-The position-error limit remains **0.20 m** (`--max-error-meters`). Latest results: **256/256 extended** and **1,018/1,024 stress**. All false detections are eliminated and no required tags are missed. Six isolated-tag pose errors remain at 3 m. All 11 generator checks and nine Rust regression tests pass.
+The position-error limit remains **0.20 m** (`--max-error-meters`). Latest results: **256/256 extended** and **1,019/1,024 stress**. All false detections are eliminated and no required tags are missed. Five isolated-tag pose errors remain at 3 m. All 11 generator checks and ten Rust regression tests pass.
 
-The CPU pipeline now checks decoding contrast, refines borders, and aligns small isolated tags against their pixel patterns. Reports include detection quality, pose candidates, and localization time. Image alignment is skipped for multi-tag views. Jetson performance remains unverified.
+The CPU pipeline checks contrast, detects quads at full resolution, and uses a matching coarse hypothesis for small or weak isolated tags. It refines borders and aligns small tags against their pixel patterns. Reports include detection quality, candidate poses, and localization time. Image alignment is skipped for multi-tag views. Jetson performance remains unverified.
+
+Four reviewed field-camera captures are frozen in `captured_cases/`. Run `python chassis_sim/replay_captures.py simulation_tests/captured_cases` to verify their original 20 cm position and 5° heading limits. Current unreviewed captures improve from **0/20 to 14/20**; six pose errors remain.
 
 ## Scope
 

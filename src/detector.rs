@@ -24,6 +24,7 @@ pub struct AprilTagDetection {
     pub center: [f64; 2],
     pub corners: [[f64; 2]; 4],
     pub(crate) cpu_detection: Option<AprilRawDetection>,
+    pub(crate) cpu_secondary_detection: Option<AprilRawDetection>,
     pub(crate) image_patch: Option<crate::tag_refine::TagPatch>,
 }
 
@@ -52,9 +53,9 @@ impl AprilTagDetection {
             Vector3::new(-s, -s, 0.0),
         ];
         let corners = solver_corners(self.corners);
-        let raw: Vec<_> = det
-            .estimate_tag_pose_orthogonal_iteration(&params, n_iters)
-            .into_iter()
+        let raw: Vec<_> = std::iter::once(det)
+            .chain(self.cpu_secondary_detection.as_ref())
+            .flat_map(|source| source.estimate_tag_pose_orthogonal_iteration(&params, n_iters))
             .filter_map(|candidate| {
                 let rot = candidate.pose.rotation();
                 let t = candidate.pose.translation();
@@ -102,6 +103,7 @@ impl AprilTagDetection {
 
     pub fn drop_cpu_pose_source(&mut self) {
         self.cpu_detection = None;
+        self.cpu_secondary_detection = None;
         self.image_patch = None;
     }
 }
@@ -122,12 +124,17 @@ pub enum Detection {
 
 pub struct CpuDetector {
     inner: Detector,
+    secondary: Detector,
 }
 
 impl CpuDetector {
     pub fn new(nthreads: i32) -> Result<Self> {
-        let detector = build_inner_detector(nthreads)?;
-        Ok(Self { inner: detector })
+        let detector = build_inner_detector(nthreads, 1.0)?;
+        let secondary = build_inner_detector(nthreads, 2.0)?;
+        Ok(Self {
+            inner: detector,
+            secondary,
+        })
     }
 
     pub fn detect(
@@ -136,11 +143,17 @@ impl CpuDetector {
         width: usize,
         height: usize,
     ) -> Result<Vec<Detection>> {
-        detect_corners(&mut self.inner, gray_data, width, height)
+        detect_corners(
+            &mut self.inner,
+            &mut self.secondary,
+            gray_data,
+            width,
+            height,
+        )
     }
 }
 
-fn build_inner_detector(nthreads: i32) -> Result<Detector> {
+fn build_inner_detector(nthreads: i32, decimate: f32) -> Result<Detector> {
     let family = Family::tag_36h11();
     // Three-bit correction can turn low-contrast noise into a valid tag code.
     let bits: usize = 2;
@@ -154,7 +167,9 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
 
         if !raw_ptr.is_null() {
             (*raw_ptr).nthreads = nthreads;
-            (*raw_ptr).quad_decimate = 2.0;
+            // Small, oblique field tags can lose both their border and code at
+            // half resolution. Keep quad extraction at the input resolution.
+            (*raw_ptr).quad_decimate = decimate;
             (*raw_ptr).quad_sigma = 0.0;
             (*raw_ptr).refine_edges = 1;
         }
@@ -165,6 +180,7 @@ fn build_inner_detector(nthreads: i32) -> Result<Detector> {
 
 fn detect_corners(
     detector: &mut Detector,
+    secondary: &mut Detector,
     gray_data: &[u8],
     width: usize,
     height: usize,
@@ -189,9 +205,44 @@ fn detect_corners(
     // Multiple tags constrain the pose geometrically; reserve image alignment
     // for isolated detections instead of repeating it for every field tag.
     let isolated = detections.len() == 1;
+    // Different quad sampling can seed different planar pose minima. Retain a
+    // matching half-resolution hypothesis only for small isolated tags; the
+    // full-resolution detection still determines IDs, corners, and image fitting.
+    let small_isolated = isolated
+        && (detections[0].decision_margin() < 160.0 || {
+            let c = detections[0].corners();
+            (0..4)
+                .map(|i| (c[i][0] - c[(i + 1) % 4][0]).hypot(c[i][1] - c[(i + 1) % 4][1]))
+                .sum::<f64>()
+                / 4.0
+                <= 40.0
+        });
+    let mut secondary_detections = if small_isolated {
+        secondary.detect(&img)
+    } else {
+        Vec::new()
+    };
 
     let mut results: Vec<Detection> = Vec::new();
-    for det in detections {
+    for mut det in detections {
+        let full_center = det.center();
+        let mut cpu_secondary_detection = secondary_detections
+            .iter()
+            .position(|candidate| {
+                let center = candidate.center();
+                candidate.id() == det.id()
+                    && candidate.decision_margin() >= 20.0
+                    && (center[0] - full_center[0]).hypot(center[1] - full_center[1]) < 5.0
+            })
+            .map(|i| secondary_detections.swap_remove(i));
+        // Weak edge contrast is more sensitive to pixel noise. If the coarser
+        // detector independently agrees on this tag, retain its denoised quad
+        // and original pose seeds rather than fitting the noisy fine-grid quad.
+        if det.decision_margin() < 160.0 {
+            if let Some(coarse) = cpu_secondary_detection.take() {
+                det = coarse;
+            }
+        }
         let corners = det.corners();
         let initial_corners = [
             [corners[0][0], corners[0][1]],
@@ -215,6 +266,7 @@ fn detect_corners(
             center: center_arr,
             corners: c_arr,
             cpu_detection: Some(det),
+            cpu_secondary_detection,
             image_patch,
         }));
     }
@@ -379,6 +431,51 @@ mod tests {
         }
         let mut detector = CpuDetector::new(1).unwrap();
         assert!(detector.detect(tag.as_raw(), 400, 400).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dim_noisy_tag_retains_stable_pose_after_full_resolution_detection() {
+        let frame = image::load_from_memory(include_bytes!(
+            "../simulation_tests/reference/dim_noisy_tag.png"
+        ))
+        .unwrap()
+        .to_luma8();
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../config/config.json")).unwrap();
+        let mut camera: CameraConfig = serde_json::from_value(config["camera"].clone()).unwrap();
+        camera.fx = 590.2919154759219;
+        camera.fy = 591.8160873557966;
+        camera.cx = 960.2348193847832;
+        camera.cy = 472.7595158081418;
+        camera.tag_size_m = 0.16;
+        camera.k1 = 0.;
+        camera.k2 = 0.;
+        camera.k3 = 0.;
+        camera.p1 = 0.;
+        camera.p2 = 0.;
+        let mut detector = CpuDetector::new(1).unwrap();
+        let detections = detector
+            .detect(
+                frame.as_raw(),
+                frame.width() as usize,
+                frame.height() as usize,
+            )
+            .unwrap();
+        let tag = detections
+            .iter()
+            .find_map(|d| match d {
+                Detection::AprilTag(tag) if tag.id == 1 => Some(tag),
+                _ => None,
+            })
+            .expect("dim tag should still decode");
+        let best = tag
+            .cpu_pose_candidates(&camera, true, 50)
+            .into_iter()
+            .min_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px))
+            .unwrap();
+        let camera_in_tag = -best.pose.rotation.transpose() * best.pose.translation;
+        let error = (camera_in_tag - Vector3::new(0., 0., -2.)).norm();
+        assert!(error < 0.20, "dim noisy tag camera error: {error}");
     }
 
     #[test]
