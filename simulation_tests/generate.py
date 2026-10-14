@@ -90,6 +90,13 @@ def degrade(image, case, rng):
     return np.clip(image, 0, 255).astype(np.uint8)
 
 
+def tag_texture(dictionary, tag_id):
+    # OpenCV's AprilTag dictionary is rotated 180 degrees relative to official
+    # AprilRobotics images. Match native AprilTag pose/corner conventions.
+    marker = cv2.rotate(cv2.aruco.generateImageMarker(dictionary, tag_id, 320), cv2.ROTATE_180)
+    return cv2.copyMakeBorder(marker, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+
+
 def render_fast(frame, tags, camera, width, height, textures):
     image = np.full((height, width), 180, dtype=np.uint8)
     eye, r = np.array(frame["camera_position"]), np.array(frame["camera_rotation"])
@@ -149,8 +156,7 @@ def main():
     textures = {}
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     for tag in tags:
-        texture = cv2.copyMakeBorder(cv2.aruco.generateImageMarker(dictionary, tag["id"], 320),
-                                     40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+        texture = tag_texture(dictionary, tag["id"])
         textures[tag["id"]] = texture
         cv2.imwrite(str(out / "textures" / f"{tag['id']}.png"), texture)
     rng = np.random.default_rng(spec.get("seed", 2026))

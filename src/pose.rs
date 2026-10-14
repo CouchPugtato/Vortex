@@ -17,7 +17,7 @@ pub struct PoseEstimate {
 /// estimates 3d pose from 4 image corners
 /// 
 /// # Arguments
-/// * `corners` - The 4 corners of the tag in the image (u, v). Order: TL, TR, BR, BL.
+/// * `corners` - Native AprilTag corners (u, v), ordered BL, BR, TR, TL.
 /// * `tag_size` - The physical size of the tag (e.g., in meters).
 /// * `fx, fy, cx, cy` - Camera intrinsics.
 /// 
@@ -44,16 +44,16 @@ pub fn estimate_pose(
     // 2. define model points tag relative
     let s = camera.tag_size_m / 2.0;
     let model_points_3d = [
-        Vector3::new(-s, s, 0.0),  // 0: Top-Left
-        Vector3::new(s, s, 0.0),   // 1: Top-Right
-        Vector3::new(s, -s, 0.0),  // 2: Bottom-Right
-        Vector3::new(-s, -s, 0.0), // 3: Bottom-Left
+        Vector3::new(-s, s, 0.0),  // 0: Bottom-Left
+        Vector3::new(s, s, 0.0),   // 1: Bottom-Right
+        Vector3::new(s, -s, 0.0),  // 2: Top-Right
+        Vector3::new(-s, -s, 0.0), // 3: Top-Left
     ];
     let model_points = [
-        Point2::new(-s, s),  // 0: Top-Left
-        Point2::new(s, s),   // 1: Top-Right
-        Point2::new(s, -s),  // 2: Bottom-Right
-        Point2::new(-s, -s), // 3: Bottom-Left
+        Point2::new(-s, s),  // 0: Bottom-Left
+        Point2::new(s, s),   // 1: Bottom-Right
+        Point2::new(s, -s),  // 2: Top-Right
+        Point2::new(-s, -s), // 3: Top-Left
     ];
 
     // 3. solve homography such that p ~ H * P
@@ -184,6 +184,30 @@ pub fn estimate_pose_from_correspondences(
     )
 }
 
+/// Refine the best field-pose seeds against every observed corner. Seed ranking
+/// uses image reprojection only; no known camera/robot position is required.
+pub fn estimate_pose_from_correspondence_candidates(
+    object_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+    apply_distortion: bool,
+    initial_poses: &[Pose],
+) -> Option<PoseEstimate> {
+    if object_points.len() != image_points.len() || object_points.len() < 4 {
+        return None;
+    }
+    let mut ranked: Vec<_> = initial_poses.iter().filter_map(|initial| {
+        let cost = reprojection_cost(&pose_to_params(initial), object_points, image_points,
+                                     camera, apply_distortion)?;
+        cost.is_finite().then_some((cost, initial))
+    }).collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    ranked.into_iter().take(3).filter_map(|(_, initial)| {
+        estimate_pose_from_correspondences(object_points, image_points, camera,
+                                           apply_distortion, initial)
+    }).min_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px))
+}
+
 pub fn reprojection_rmse_px_for_pose(
     pose: &Pose,
     corners: &[(f64, f64)],
@@ -208,10 +232,6 @@ fn refine_pose_pnp(
     apply_distortion: bool,
 ) -> Option<Pose> {
     let mut params = pose_to_params(initial_pose);
-
-    if params[5] <= 1e-6 {
-        return None;
-    }
 
     let mut lambda = 1e-3;
     let mut best_cost =
@@ -333,10 +353,8 @@ fn params_to_pose(params: &DVector<f64>) -> Option<Pose> {
 
     let rotation = Rotation3::new(Vector3::new(params[0], params[1], params[2]));
     let translation = Vector3::new(params[3], params[4], params[5]);
-    if translation.z <= 1e-6 {
-        return None;
-    }
-
+    // A field-origin translation may be behind the camera. Visibility is checked
+    // per transformed object point in project_point, not at the coordinate origin.
     Some(Pose {
         rotation: rotation.into_inner(),
         translation,
@@ -464,4 +482,58 @@ fn select_best_pose_estimate<const N: usize>(
         }
     }
     best_pose
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera() -> CameraConfig {
+        CameraConfig {
+            fx: 600.0, fy: 590.0, cx: 960.0, cy: 540.0,
+            k1: 0.0, k2: 0.0, p1: 0.0, p2: 0.0, k3: 0.0,
+            tag_size_m: 0.16, x_offset: 0.0, y_offset: 0.0, z_offset: 0.0,
+            pitch_deg: 0.0, yaw_deg: 0.0, roll_deg: 0.0,
+        }
+    }
+
+    fn field_points() -> Vec<Vector3<f64>> {
+        [-0.5, 0.5].into_iter().flat_map(|x| {
+            square_model_points(0.16).map(|p| p + Vector3::new(x, 0.0, 10.0))
+        }).collect()
+    }
+
+    #[test]
+    fn refines_visible_field_points_with_negative_origin_depth() {
+        let c = camera();
+        let points = field_points();
+        let truth = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, -8.0) };
+        let pixels: Vec<_> = points.iter().map(|p| project_point(p, &truth, &c, false).unwrap()).collect();
+        let seed = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.03, -0.02, -7.9) };
+        let result = estimate_pose_from_correspondences(&points, &pixels, &c, false, &seed).unwrap();
+        assert!((result.pose.translation - truth.translation).norm() < 1e-5);
+        assert!(result.reprojection_rmse_px < 1e-4);
+    }
+
+    #[test]
+    fn rejects_points_behind_camera_even_when_origin_is_in_front() {
+        let c = camera();
+        let points = vec![Vector3::new(0.0, 0.0, -10.0); 4];
+        let seed = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, 1.0) };
+        assert!(estimate_pose_from_correspondences(&points, &[(960.0, 540.0); 4], &c, false, &seed).is_none());
+    }
+
+    #[test]
+    fn field_origin_shift_preserves_projection() {
+        let c = camera();
+        let points = field_points();
+        let truth = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, -8.0) };
+        let pixels: Vec<_> = points.iter().map(|p| project_point(p, &truth, &c, false).unwrap()).collect();
+        let offset = Vector3::new(12.0, -3.0, 20.0);
+        let shifted: Vec<_> = points.iter().map(|p| p + offset).collect();
+        let shifted_pose = Pose { rotation: truth.rotation, translation: truth.translation - offset };
+        let estimate = estimate_pose_from_correspondence_candidates(&shifted, &pixels, &c, false, &[shifted_pose]).unwrap();
+        assert!(estimate.reprojection_rmse_px < 1e-8);
+        assert!((estimate.pose.translation + offset - truth.translation).norm() < 1e-8);
+    }
 }

@@ -7,10 +7,17 @@ import unittest
 from pathlib import Path
 import cv2
 import numpy as np
-from generate import HERE, camera_pose, project, tag_geometry, expand_cases
+from generate import HERE, camera_pose, project, tag_geometry, expand_cases, tag_texture
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_texture_matches_official_apriltag_orientation(self):
+        reference = cv2.imread(str(HERE / "reference/tag36h11_1.png"), cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(reference)
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        actual = cv2.resize(tag_texture(dictionary, 1), (10, 10), interpolation=cv2.INTER_NEAREST)
+        np.testing.assert_array_equal(actual, reference)
+
     def test_extended_suite_coverage(self):
         tags = {t["ID"] for t in json.loads((HERE.parent / "config/2026-rebuilt-welded.json").read_text())["tags"]}
         cases = expand_cases(json.loads((HERE / "scenarios_extended.json").read_text()), tags)

@@ -1074,7 +1074,7 @@ fn spawn_camera_pipeline(
                 let mut processed_detections = Vec::new();
                 let mut joint_object_points: Vec<Vector3<f64>> = Vec::new();
                 let mut joint_image_points: Vec<(f64, f64)> = Vec::new();
-                let mut joint_initial_pose: Option<pose::PoseEstimate> = None;
+                let mut joint_initial_poses: Vec<pose::Pose> = Vec::new();
 
                 for detector in &mut detectors {
                     let raw_dets = match detector.detect(&pixels, width, height, &processing_config) {
@@ -1091,7 +1091,7 @@ fn spawn_camera_pipeline(
                     for det in raw_dets {
                         match det {
                             Detection::AprilTag(apr_det) => {
-                                // Preserve AprilTag's native corner order: TL, TR, BR, BL.
+                                // Preserve AprilTag's native corner order: BL, BR, TR, TL.
                                 let c = apr_det.corners;
                                 let corners_raw = [
                                     (c[0][0], c[0][1]),
@@ -1103,6 +1103,12 @@ fn spawn_camera_pipeline(
                                 let tag_field = tag_map_by_id.get(&apr_det.id);
                                 let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
                                 for estimate in apr_det.cpu_pose_candidates(&effective_config, true, 50) {
+                                    if let Some(tf) = tag_field {
+                                        if estimate.reprojection_rmse_px <= MAX_TAG_REPROJECTION_RMSE_PX
+                                            && camera_visible_side_score(&estimate.pose, tf) > 0.0 {
+                                            joint_initial_poses.push(field_camera_pose_from_tag_pose(&estimate, tf).pose);
+                                        }
+                                    }
                                     let field_eval = tag_field.map(|tf| {
                                         estimate_robot_field_from_tag(&estimate.pose, tf, &effective_config)
                                     });
@@ -1145,10 +1151,7 @@ fn spawn_camera_pipeline(
                                             joint_image_points.push(*image_corner);
                                         }
                                         let field_estimate = field_camera_pose_from_tag_pose(&estimate, tag_field);
-                                        match &joint_initial_pose {
-                                            Some(best) if best.reprojection_rmse_px <= field_estimate.reprojection_rmse_px => {}
-                                            _ => joint_initial_pose = Some(field_estimate),
-                                        }
+                                        joint_initial_poses.push(field_estimate.pose);
                                     }
                                     if let Some((p_field_robot, z_err)) = field_eval {
                                         (p_field_robot.x, p_field_robot.y, 0.0, z_err)
@@ -1243,17 +1246,13 @@ fn spawn_camera_pipeline(
                 }
 
                 let joint_robot_pose = if joint_object_points.len() >= 8 {
-                    joint_initial_pose
-                        .as_ref()
-                        .and_then(|initial| {
-                            pose::estimate_pose_from_correspondences(
-                                &joint_object_points,
-                                &joint_image_points,
-                                &camera_config,
-                                true,
-                                &initial.pose,
-                            )
-                        })
+                    pose::estimate_pose_from_correspondence_candidates(
+                            &joint_object_points,
+                            &joint_image_points,
+                            &camera_config,
+                            true,
+                            &joint_initial_poses,
+                        )
                         .and_then(|estimate| {
                             if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                                 None

@@ -73,6 +73,9 @@ fn main() -> Result<()> {
         let mut found = Vec::new();
         let mut valid = Vec::new();
         let mut errors = Vec::new();
+        let mut field_points = Vec::new();
+        let mut image_points = Vec::new();
+        let mut field_seeds = Vec::new();
         for detection in detections {
             if let detector::Detection::AprilTag(tag_det) = detection {
                 found.push(tag_det.id);
@@ -90,6 +93,12 @@ fn main() -> Result<()> {
                             if (camera_field - Vector3::from(tag.position)).dot(&normal) <= 0. {
                                 return None;
                             }
+                            let r_cf = p.pose.rotation * r_ft.transpose();
+                            field_seeds.push(pose::Pose {
+                                rotation: r_cf,
+                                translation: p.pose.translation
+                                    - r_cf * Vector3::from(tag.position),
+                            });
                             Some((p.reprojection_rmse_px, camera_field))
                         })
                         .min_by(|a, b| a.0.total_cmp(&b.0));
@@ -99,6 +108,19 @@ fn main() -> Result<()> {
                             errors.push(error);
                         }
                         valid.push(tag_det.id);
+                        let s = manifest.camera.tag_size_m / 2.;
+                        for (local, pixel) in [
+                            Vector3::new(-s, s, 0.),
+                            Vector3::new(s, s, 0.),
+                            Vector3::new(s, -s, 0.),
+                            Vector3::new(-s, -s, 0.),
+                        ]
+                        .iter()
+                        .zip(tag_det.corners.iter())
+                        {
+                            field_points.push(Vector3::from(tag.position) + r_ft * local);
+                            image_points.push((pixel[0], pixel[1]));
+                        }
                         results.push(
                             json!({"id": tag_det.id, "camera_position": [xyz.x, xyz.y, xyz.z],
                             "camera_error_m": error, "reprojection_rmse_px": rmse}),
@@ -112,12 +134,39 @@ fn main() -> Result<()> {
             .iter()
             .filter(|id| !valid.contains(id))
             .collect();
+        let raw_joint = if field_points.len() >= 8 {
+            pose::estimate_pose_from_correspondence_candidates(
+                &field_points,
+                &image_points,
+                &manifest.camera,
+                true,
+                &field_seeds,
+            )
+        } else {
+            None
+        };
+        let joint = raw_joint
+            .as_ref()
+            .filter(|p| p.reprojection_rmse_px <= 2.)
+            .map(|p| {
+                let xyz = -p.pose.rotation.transpose() * p.pose.translation;
+                let error = (xyz - Vector3::from(frame.camera_position)).norm();
+                (
+                    error,
+                    json!({"camera_position": [xyz.x, xyz.y, xyz.z],
+                        "camera_error_m": error, "reprojection_rmse_px": p.reprojection_rmse_px,
+                        "tags_used": field_points.len() / 4}),
+                )
+            });
+        let position_ok = if let Some((error, _)) = &joint {
+            error.is_finite() && *error <= max_error
+        } else {
+            errors.iter().all(|e| e.is_finite() && *e <= max_error)
+        };
         let passed = if frame.expected_ids.is_empty() {
             found.is_empty()
         } else {
-            missing.is_empty()
-                && errors.iter().all(|e| e.is_finite() && *e <= max_error)
-                && found.iter().all(|id| tags.contains_key(id))
+            missing.is_empty() && position_ok && found.iter().all(|id| tags.contains_key(id))
         };
         if !passed {
             failed += 1;
@@ -131,13 +180,18 @@ fn main() -> Result<()> {
         );
         reports.push(
             json!({"name": frame.name, "passed": passed, "detected_ids": found,
-            "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results}),
+            "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results,
+            "localization_mode": if joint.is_some() { "multi_tag" } else { "single_tag" },
+            "joint_reprojection_rmse_px": raw_joint.map(|p| p.reprojection_rmse_px),
+            "single_tag_diagnostic_passed": missing.is_empty()
+                && errors.iter().all(|e| e.is_finite() && *e <= max_error),
+            "joint_pose": joint.map(|(_, value)| value)}),
         );
     }
     fs::write(
         root.join("report.json"),
         serde_json::to_vec_pretty(&json!({
-            "scope": "production CPU detection and single-tag camera field localization",
+            "scope": "production CPU detection and multi-tag camera field localization with single-tag fallback",
             "frames": reports, "failed": failed, "max_camera_error_m": max_error
         }))?,
     )?;

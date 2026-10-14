@@ -1,6 +1,6 @@
 # Vortex synthetic tests
 
-Test CPU AprilTag detection and camera localization using generated images—no robot or logs required.
+Test CPU AprilTag detection and multi-tag camera localization using generated images—no robot or logs required.
 
 ## Run
 
@@ -30,7 +30,7 @@ rustup target add x86_64-pc-windows-gnu --toolchain stable
 
 - Extended suite: **256 scenarios** covering all 32 tags, distance, viewing angle, noise, blur, brightness, and blank images.
 - Smoke suite: **7 scenarios**.
-- Generator checks: **7 automated tests**:
+- Generator checks: **8 automated tests**:
 
 ```text
 python -m unittest discover -s simulation_tests -p test_*.py
@@ -38,8 +38,8 @@ python -m unittest discover -s simulation_tests -p test_*.py
 
 Edit `scenarios_extended.json` to change the sweeps. Outputs go into `generated/`, with per-frame results in `report.json` and group counts in `summary.json`. Generation-only runs produce images without testing Vortex.
 
-The default position-error limit is **0.20 m** (`--max-error-meters`). The verified extended run passed **125/256** scenarios; 131 exceeded this limit. All seven generator checks passed.
+The default position-error limit is **0.20 m** (`--max-error-meters`). The corrected extended run passed **255/256** scenarios. All final camera position estimates meet the limit; the remaining case reports a false tag ID 46 under combined blur and noise. All eight generator checks and three Rust pose regression tests pass.
 
 ## Scope
 
-Tests use ideal pinhole cameras and the production CPU detector. Live capture, robot mounting transforms, multi-tag fusion, telemetry, YOLO, and GPU performance are outside this harness. Blender rendering remains unverified on this machine.
+Tests use ideal pinhole cameras, official tag orientation, the production CPU detector, and the production multi-tag pose solver. Replay scores the joint pose when available, with single-tag fallback; individual-tag errors remain in the report. Live capture, robot mounting transforms, telemetry, YOLO, and GPU performance are outside this harness. Blender rendering remains unverified on this machine.
