@@ -15,12 +15,12 @@ pub struct PoseEstimate {
 }
 
 /// estimates 3d pose from 4 image corners
-/// 
+///
 /// # Arguments
 /// * `corners` - Native AprilTag corners (u, v), ordered BL, BR, TR, TL.
 /// * `tag_size` - The physical size of the tag (e.g., in meters).
 /// * `fx, fy, cx, cy` - Camera intrinsics.
-/// 
+///
 /// # Returns
 /// a pose struct containing the rotation matrix and translation vector (x, y, z).
 pub fn estimate_pose(
@@ -29,17 +29,17 @@ pub fn estimate_pose(
     apply_distortion: bool,
 ) -> Option<PoseEstimate> {
     // 1. normalize image coordinates
-    let image_points: Vec<Point2<f64>> = corners.iter().map(|p| {
-        let (x, y) = if apply_distortion {
-            undistort_normalized_point(*p, camera)
-        } else {
-            (
-                (p.0 - camera.cx) / camera.fx,
-                (p.1 - camera.cy) / camera.fy,
-            )
-        };
-        Point2::new(x, y)
-    }).collect();
+    let image_points: Vec<Point2<f64>> = corners
+        .iter()
+        .map(|p| {
+            let (x, y) = if apply_distortion {
+                undistort_normalized_point(*p, camera)
+            } else {
+                ((p.0 - camera.cx) / camera.fx, (p.1 - camera.cy) / camera.fy)
+            };
+            Point2::new(x, y)
+        })
+        .collect();
 
     // 2. define model points tag relative
     let s = camera.tag_size_m / 2.0;
@@ -65,26 +65,18 @@ pub fn estimate_pose(
         let v = image_points[i].y;
 
         // Row 1
-        a_data.extend_from_slice(&[
-            -X, -Y, -1.0, 
-             0.0, 0.0, 0.0, 
-             u*X, u*Y, u
-        ]);
+        a_data.extend_from_slice(&[-X, -Y, -1.0, 0.0, 0.0, 0.0, u * X, u * Y, u]);
         // Row 2
-        a_data.extend_from_slice(&[
-             0.0, 0.0, 0.0, 
-            -X, -Y, -1.0, 
-             v*X, v*Y, v
-        ]);
+        a_data.extend_from_slice(&[0.0, 0.0, 0.0, -X, -Y, -1.0, v * X, v * Y, v]);
     }
 
     let a = DMatrix::from_row_slice(8, 9, &a_data);
-    
+
     // solve Ah=0 via svd/eigen
     let ata = a.transpose() * &a; // 9x9 matrix
-    
+
     let eigen = SymmetricEigen::new(ata);
-    
+
     // Find index of smallest eigenvalue
     let mut min_val = f64::MAX;
     let mut min_idx = 0;
@@ -94,13 +86,11 @@ pub fn estimate_pose(
             min_idx = i;
         }
     }
-    
+
     let h_vec = eigen.eigenvectors.column(min_idx);
-    
+
     let mut h = Matrix3::new(
-        h_vec[0], h_vec[1], h_vec[2],
-        h_vec[3], h_vec[4], h_vec[5],
-        h_vec[6], h_vec[7], h_vec[8],
+        h_vec[0], h_vec[1], h_vec[2], h_vec[3], h_vec[4], h_vec[5], h_vec[6], h_vec[7], h_vec[8],
     );
 
     // 4. decompose homography
@@ -108,38 +98,40 @@ pub fn estimate_pose(
     // R = [r1 r2 r3], t
     // h1 ~ r1, h2 ~ r2, h3 ~ t
     // Constraint: ||r1|| = 1, ||r2|| = 1.
-    
+
     // scale estimation: avg(norm(h1), norm(h2))
-    
+
     let norm_h1 = h.column(0).norm();
     let norm_h2 = h.column(1).norm();
     let scale = (norm_h1 + norm_h2) / 2.0;
-    
-    if scale.abs() < 1e-6 { return None; }
+
+    if scale.abs() < 1e-6 {
+        return None;
+    }
 
     let mut t = h.column(2) / scale;
-    
+
     let r1 = h.column(0) / scale;
     let r2 = h.column(1) / scale;
     let r3 = r1.cross(&r2);
-    
+
     // enforce orthogonality via svd
     let r_raw = Matrix3::from_columns(&[r1, r2, r3]);
     let r_svd = r_raw.svd(true, true);
     if let (Some(u), Some(v_t)) = (r_svd.u, r_svd.v_t) {
         let mut R = u * v_t;
-        
+
         // ensure det(R) = 1 (proper rotation)
         if R.determinant() < 0.0 {
             // det=-1 implies reflection
-             R = -R; // This flips det for 3x3
+            R = -R; // This flips det for 3x3
         }
-        
+
         // fix ambiguity: t.z > 0
         // t.z < 0 implies H sign wrong
         if t.z < 0.0 {
             t = -t;
-            
+
             let c0 = -R.column(0);
             let c1 = -R.column(1);
             let c2 = R.column(2).into_owned();
@@ -196,16 +188,33 @@ pub fn estimate_pose_from_correspondence_candidates(
     if object_points.len() != image_points.len() || object_points.len() < 4 {
         return None;
     }
-    let mut ranked: Vec<_> = initial_poses.iter().filter_map(|initial| {
-        let cost = reprojection_cost(&pose_to_params(initial), object_points, image_points,
-                                     camera, apply_distortion)?;
-        cost.is_finite().then_some((cost, initial))
-    }).collect();
+    let mut ranked: Vec<_> = initial_poses
+        .iter()
+        .filter_map(|initial| {
+            let cost = reprojection_cost(
+                &pose_to_params(initial),
+                object_points,
+                image_points,
+                camera,
+                apply_distortion,
+            )?;
+            cost.is_finite().then_some((cost, initial))
+        })
+        .collect();
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-    ranked.into_iter().take(3).filter_map(|(_, initial)| {
-        estimate_pose_from_correspondences(object_points, image_points, camera,
-                                           apply_distortion, initial)
-    }).min_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px))
+    ranked
+        .into_iter()
+        .take(3)
+        .filter_map(|(_, initial)| {
+            estimate_pose_from_correspondences(
+                object_points,
+                image_points,
+                camera,
+                apply_distortion,
+                initial,
+            )
+        })
+        .min_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px))
 }
 
 pub fn reprojection_rmse_px_for_pose(
@@ -234,14 +243,29 @@ fn refine_pose_pnp(
     let mut params = pose_to_params(initial_pose);
 
     let mut lambda = 1e-3;
-    let mut best_cost =
-        reprojection_cost(&params, model_points, image_points, camera, apply_distortion)?;
+    let mut best_cost = reprojection_cost(
+        &params,
+        model_points,
+        image_points,
+        camera,
+        apply_distortion,
+    )?;
 
     for _ in 0..20 {
-        let residuals =
-            reprojection_residuals(&params, model_points, image_points, camera, apply_distortion)?;
-        let jacobian =
-            numerical_jacobian(&params, model_points, image_points, camera, apply_distortion)?;
+        let residuals = reprojection_residuals(
+            &params,
+            model_points,
+            image_points,
+            camera,
+            apply_distortion,
+        )?;
+        let jacobian = numerical_jacobian(
+            &params,
+            model_points,
+            image_points,
+            camera,
+            apply_distortion,
+        )?;
         let jt = jacobian.transpose();
         let mut normal = &jt * &jacobian;
         for i in 0..6 {
@@ -255,9 +279,13 @@ fn refine_pose_pnp(
         }
 
         let candidate = &params + delta;
-        let Some(candidate_cost) =
-            reprojection_cost(&candidate, model_points, image_points, camera, apply_distortion)
-        else {
+        let Some(candidate_cost) = reprojection_cost(
+            &candidate,
+            model_points,
+            image_points,
+            camera,
+            apply_distortion,
+        ) else {
             lambda *= 10.0;
             continue;
         };
@@ -410,16 +438,14 @@ pub(crate) fn undistort_normalized_point(pixel: (f64, f64), camera: &CameraConfi
     (x, y)
 }
 
-fn fronto_parallel_initial_pose(
-    corners: &[(f64, f64); 4],
-    camera: &CameraConfig,
-) -> Option<Pose> {
-    let side_len_px = (
-        ((corners[0].0 - corners[1].0).powi(2) + (corners[0].1 - corners[1].1).powi(2)).sqrt() +
-        ((corners[1].0 - corners[2].0).powi(2) + (corners[1].1 - corners[2].1).powi(2)).sqrt() +
-        ((corners[2].0 - corners[3].0).powi(2) + (corners[2].1 - corners[3].1).powi(2)).sqrt() +
-        ((corners[3].0 - corners[0].0).powi(2) + (corners[3].1 - corners[0].1).powi(2)).sqrt()
-    ) / 4.0;
+fn fronto_parallel_initial_pose(corners: &[(f64, f64); 4], camera: &CameraConfig) -> Option<Pose> {
+    let side_len_px = (((corners[0].0 - corners[1].0).powi(2)
+        + (corners[0].1 - corners[1].1).powi(2))
+    .sqrt()
+        + ((corners[1].0 - corners[2].0).powi(2) + (corners[1].1 - corners[2].1).powi(2)).sqrt()
+        + ((corners[2].0 - corners[3].0).powi(2) + (corners[2].1 - corners[3].1).powi(2)).sqrt()
+        + ((corners[3].0 - corners[0].0).powi(2) + (corners[3].1 - corners[0].1).powi(2)).sqrt())
+        / 4.0;
     if side_len_px <= 1e-6 {
         return None;
     }
@@ -490,27 +516,50 @@ mod tests {
 
     fn camera() -> CameraConfig {
         CameraConfig {
-            fx: 600.0, fy: 590.0, cx: 960.0, cy: 540.0,
-            k1: 0.0, k2: 0.0, p1: 0.0, p2: 0.0, k3: 0.0,
-            tag_size_m: 0.16, x_offset: 0.0, y_offset: 0.0, z_offset: 0.0,
-            pitch_deg: 0.0, yaw_deg: 0.0, roll_deg: 0.0,
+            fx: 600.0,
+            fy: 590.0,
+            cx: 960.0,
+            cy: 540.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+            k3: 0.0,
+            tag_size_m: 0.16,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            z_offset: 0.0,
+            pitch_deg: 0.0,
+            yaw_deg: 0.0,
+            roll_deg: 0.0,
         }
     }
 
     fn field_points() -> Vec<Vector3<f64>> {
-        [-0.5, 0.5].into_iter().flat_map(|x| {
-            square_model_points(0.16).map(|p| p + Vector3::new(x, 0.0, 10.0))
-        }).collect()
+        [-0.5, 0.5]
+            .into_iter()
+            .flat_map(|x| square_model_points(0.16).map(|p| p + Vector3::new(x, 0.0, 10.0)))
+            .collect()
     }
 
     #[test]
     fn refines_visible_field_points_with_negative_origin_depth() {
         let c = camera();
         let points = field_points();
-        let truth = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, -8.0) };
-        let pixels: Vec<_> = points.iter().map(|p| project_point(p, &truth, &c, false).unwrap()).collect();
-        let seed = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.03, -0.02, -7.9) };
-        let result = estimate_pose_from_correspondences(&points, &pixels, &c, false, &seed).unwrap();
+        let truth = Pose {
+            rotation: Matrix3::identity(),
+            translation: Vector3::new(0.0, 0.0, -8.0),
+        };
+        let pixels: Vec<_> = points
+            .iter()
+            .map(|p| project_point(p, &truth, &c, false).unwrap())
+            .collect();
+        let seed = Pose {
+            rotation: Matrix3::identity(),
+            translation: Vector3::new(0.03, -0.02, -7.9),
+        };
+        let result =
+            estimate_pose_from_correspondences(&points, &pixels, &c, false, &seed).unwrap();
         assert!((result.pose.translation - truth.translation).norm() < 1e-5);
         assert!(result.reprojection_rmse_px < 1e-4);
     }
@@ -519,20 +568,46 @@ mod tests {
     fn rejects_points_behind_camera_even_when_origin_is_in_front() {
         let c = camera();
         let points = vec![Vector3::new(0.0, 0.0, -10.0); 4];
-        let seed = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, 1.0) };
-        assert!(estimate_pose_from_correspondences(&points, &[(960.0, 540.0); 4], &c, false, &seed).is_none());
+        let seed = Pose {
+            rotation: Matrix3::identity(),
+            translation: Vector3::new(0.0, 0.0, 1.0),
+        };
+        assert!(estimate_pose_from_correspondences(
+            &points,
+            &[(960.0, 540.0); 4],
+            &c,
+            false,
+            &seed
+        )
+        .is_none());
     }
 
     #[test]
     fn field_origin_shift_preserves_projection() {
         let c = camera();
         let points = field_points();
-        let truth = Pose { rotation: Matrix3::identity(), translation: Vector3::new(0.0, 0.0, -8.0) };
-        let pixels: Vec<_> = points.iter().map(|p| project_point(p, &truth, &c, false).unwrap()).collect();
+        let truth = Pose {
+            rotation: Matrix3::identity(),
+            translation: Vector3::new(0.0, 0.0, -8.0),
+        };
+        let pixels: Vec<_> = points
+            .iter()
+            .map(|p| project_point(p, &truth, &c, false).unwrap())
+            .collect();
         let offset = Vector3::new(12.0, -3.0, 20.0);
         let shifted: Vec<_> = points.iter().map(|p| p + offset).collect();
-        let shifted_pose = Pose { rotation: truth.rotation, translation: truth.translation - offset };
-        let estimate = estimate_pose_from_correspondence_candidates(&shifted, &pixels, &c, false, &[shifted_pose]).unwrap();
+        let shifted_pose = Pose {
+            rotation: truth.rotation,
+            translation: truth.translation - offset,
+        };
+        let estimate = estimate_pose_from_correspondence_candidates(
+            &shifted,
+            &pixels,
+            &c,
+            false,
+            &[shifted_pose],
+        )
+        .unwrap();
         assert!(estimate.reprojection_rmse_px < 1e-8);
         assert!((estimate.pose.translation + offset - truth.translation).norm() < 1e-8);
     }

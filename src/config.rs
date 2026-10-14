@@ -1,20 +1,40 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-fn default_smoothing_alpha() -> f64 { 0.1 }
-fn default_resolution_scale_factor() -> f32 { 1.0 }
-fn default_black_level_offset() -> f64 { 7.0 }
-fn default_sensor_gain() -> f64 { 2.0 }
-fn default_red_balance() -> f64 { 1200.0 }
-fn default_blue_balance() -> f64 { 1976.0 }
-fn default_yolo_obj_width_m() -> f64 { 0.3 }
-fn default_yolo_obj_height_m() -> f64 { 0.3 }
-fn default_confidence_threshold() -> f64 { 0.25 }
-fn default_use_nn() -> bool { true }
+fn default_smoothing_alpha() -> f64 {
+    0.1
+}
+fn default_resolution_scale_factor() -> f32 {
+    1.0
+}
+fn default_black_level_offset() -> f64 {
+    7.0
+}
+fn default_sensor_gain() -> f64 {
+    2.0
+}
+fn default_red_balance() -> f64 {
+    1200.0
+}
+fn default_blue_balance() -> f64 {
+    1976.0
+}
+fn default_yolo_obj_width_m() -> f64 {
+    0.3
+}
+fn default_yolo_obj_height_m() -> f64 {
+    0.3
+}
+fn default_confidence_threshold() -> f64 {
+    0.25
+}
+fn default_use_nn() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct CameraConfig {
@@ -49,7 +69,10 @@ pub struct CameraConfig {
 pub struct ProcessingConfig {
     #[serde(default = "default_smoothing_alpha")]
     pub smoothing_alpha: f64,
-    #[serde(default = "default_resolution_scale_factor", alias = "gpu_scale_factor")]
+    #[serde(
+        default = "default_resolution_scale_factor",
+        alias = "gpu_scale_factor"
+    )]
     pub resolution_scale_factor: f32,
 
     #[serde(default = "default_black_level_offset")]
@@ -66,9 +89,15 @@ pub struct ProcessingConfig {
 pub struct ObjectDetectionConfig {
     #[serde(default = "default_use_nn")]
     pub use_nn: bool,
-    #[serde(default = "default_yolo_obj_width_m", alias = "processing_yolo_obj_width_m")]
+    #[serde(
+        default = "default_yolo_obj_width_m",
+        alias = "processing_yolo_obj_width_m"
+    )]
     pub yolo_obj_width_m: f64,
-    #[serde(default = "default_yolo_obj_height_m", alias = "processing_yolo_obj_height_m")]
+    #[serde(
+        default = "default_yolo_obj_height_m",
+        alias = "processing_yolo_obj_height_m"
+    )]
     pub yolo_obj_height_m: f64,
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f64,

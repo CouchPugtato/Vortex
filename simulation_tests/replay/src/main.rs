@@ -42,8 +42,14 @@ struct Frame {
 fn matrix(rows: [[f64; 3]; 3]) -> Matrix3<f64> {
     Matrix3::from_row_slice(&rows.into_iter().flatten().collect::<Vec<_>>())
 }
+fn rotation_rows(r: &Matrix3<f64>) -> [[f64; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| r[(i, j)]))
+}
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--stream") {
+        return stream();
+    }
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(
         args.next()
@@ -57,8 +63,6 @@ fn main() -> Result<()> {
     if manifest.schema_version != 1 || manifest.frames.is_empty() {
         bail!("Unsupported or empty manifest");
     }
-    let tags: HashMap<_, _> = manifest.tags.iter().map(|t| (t.id, t)).collect();
-    let map_from_solver = Matrix3::new(0., 0., -1., 1., 0., 0., 0., -1., 0.);
     let mut detector = detector::CpuDetector::new(1)?;
     let mut reports = Vec::new();
     let mut failed = 0;
@@ -69,30 +73,67 @@ fn main() -> Result<()> {
         if img.width() != manifest.width || img.height() != manifest.height {
             bail!("Incorrect dimensions: {}", frame.image);
         }
-        let start = Instant::now();
-        let detections =
-            detector.detect(img.as_raw(), img.width() as usize, img.height() as usize)?;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
-        let mut results = Vec::new();
-        let mut found = Vec::new();
-        let mut valid = Vec::new();
-        let mut errors = Vec::new();
-        let mut field_points = Vec::new();
-        let mut image_points = Vec::new();
-        let mut field_seeds = Vec::new();
-        let mut detection_quality = Vec::new();
-        let mut pose_candidate_diagnostics = Vec::new();
-        for detection in detections {
-            if let detector::Detection::AprilTag(tag_det) = detection {
-                found.push(tag_det.id);
-                detection_quality.push(json!({"id": tag_det.id,
+        let report = evaluate_frame(&manifest, frame, &img, &mut detector, max_error)?;
+        if report["passed"] != true {
+            failed += 1;
+        }
+        println!(
+            "{} {}: detected {}",
+            if report["passed"] == true {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            frame.name,
+            report["detected_ids"]
+        );
+        reports.push(report);
+    }
+    fs::write(
+        root.join("report.json"),
+        serde_json::to_vec_pretty(&json!({
+            "scope": "production CPU detection and multi-tag camera field localization with single-tag fallback",
+            "frames": reports, "failed": failed, "max_camera_error_m": max_error
+        }))?,
+    )?;
+    if failed > 0 {
+        bail!("{failed} replay cases failed; see report.json");
+    }
+    Ok(())
+}
+
+fn evaluate_frame(
+    manifest: &Manifest,
+    frame: &Frame,
+    img: &image::GrayImage,
+    detector: &mut detector::CpuDetector,
+    max_error: f64,
+) -> Result<serde_json::Value> {
+    let tags: HashMap<_, _> = manifest.tags.iter().map(|t| (t.id, t)).collect();
+    let map_from_solver = Matrix3::new(0., 0., -1., 1., 0., 0., 0., -1., 0.);
+    let start = Instant::now();
+    let detections = detector.detect(img.as_raw(), img.width() as usize, img.height() as usize)?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
+    let mut results = Vec::new();
+    let mut found = Vec::new();
+    let mut valid = Vec::new();
+    let mut errors = Vec::new();
+    let mut field_points = Vec::new();
+    let mut image_points = Vec::new();
+    let mut field_seeds = Vec::new();
+    let mut detection_quality = Vec::new();
+    let mut pose_candidate_diagnostics = Vec::new();
+    for detection in detections {
+        if let detector::Detection::AprilTag(tag_det) = detection {
+            found.push(tag_det.id);
+            detection_quality.push(json!({"id": tag_det.id,
                     "hamming": tag_det.cpu_detection.as_ref().map(|d| d.hamming()),
                     "decision_margin": tag_det.cpu_detection.as_ref().map(|d| d.decision_margin()),
                     "corners": tag_det.corners}));
-                if let Some(tag) = tags.get(&tag_det.id) {
-                    let r_ft = matrix(tag.rotation) * map_from_solver;
-                    // Invert tag->camera and compose with tag->field, exactly as production does.
-                    let best = tag_det
+            if let Some(tag) = tags.get(&tag_det.id) {
+                let r_ft = matrix(tag.rotation) * map_from_solver;
+                // Invert tag->camera and compose with tag->field, exactly as production does.
+                let best = tag_det
                         .cpu_pose_candidates(&manifest.camera, true, 50)
                         .into_iter()
                         .filter(|p| p.reprojection_rmse_px <= 2.)
@@ -112,94 +153,86 @@ fn main() -> Result<()> {
                                 translation: p.pose.translation
                                     - r_cf * Vector3::from(tag.position),
                             });
-                            Some((p.reprojection_rmse_px, camera_field))
+                            Some((p.reprojection_rmse_px, camera_field, r_cf.transpose()))
                         })
                         .min_by(|a, b| a.0.total_cmp(&b.0));
-                    if let Some((rmse, xyz)) = best {
-                        let error = (xyz - Vector3::from(frame.camera_position)).norm();
-                        if frame.expected_ids.contains(&tag_det.id) {
-                            errors.push(error);
-                        }
-                        valid.push(tag_det.id);
-                        let s = manifest.camera.tag_size_m / 2.;
-                        for (local, pixel) in [
-                            Vector3::new(-s, s, 0.),
-                            Vector3::new(s, s, 0.),
-                            Vector3::new(s, -s, 0.),
-                            Vector3::new(-s, -s, 0.),
-                        ]
-                        .iter()
-                        .zip(tag_det.corners.iter())
-                        {
-                            field_points.push(Vector3::from(tag.position) + r_ft * local);
-                            image_points.push((pixel[0], pixel[1]));
-                        }
-                        results.push(
-                            json!({"id": tag_det.id, "camera_position": [xyz.x, xyz.y, xyz.z],
-                            "camera_error_m": error, "reprojection_rmse_px": rmse}),
-                        );
+                if let Some((rmse, xyz, r_fc)) = best {
+                    let error = (xyz - Vector3::from(frame.camera_position)).norm();
+                    if frame.expected_ids.contains(&tag_det.id) {
+                        errors.push(error);
                     }
+                    valid.push(tag_det.id);
+                    let s = manifest.camera.tag_size_m / 2.;
+                    for (local, pixel) in [
+                        Vector3::new(-s, s, 0.),
+                        Vector3::new(s, s, 0.),
+                        Vector3::new(s, -s, 0.),
+                        Vector3::new(-s, -s, 0.),
+                    ]
+                    .iter()
+                    .zip(tag_det.corners.iter())
+                    {
+                        field_points.push(Vector3::from(tag.position) + r_ft * local);
+                        image_points.push((pixel[0], pixel[1]));
+                    }
+                    results.push(
+                        json!({"id": tag_det.id, "camera_position": [xyz.x, xyz.y, xyz.z],
+                            "camera_rotation": rotation_rows(&r_fc),
+                            "camera_error_m": error, "reprojection_rmse_px": rmse}),
+                    );
                 }
             }
         }
-        let missing: Vec<_> = frame
-            .expected_ids
-            .iter()
-            .filter(|id| !valid.contains(id))
-            .collect();
-        let raw_joint = if field_points.len() >= 8 {
-            pose::estimate_pose_from_correspondence_candidates(
-                &field_points,
-                &image_points,
-                &manifest.camera,
-                true,
-                &field_seeds,
-            )
-        } else {
-            None
-        };
-        let joint = raw_joint
-            .as_ref()
-            .filter(|p| p.reprojection_rmse_px <= 2.)
-            .map(|p| {
-                let xyz = -p.pose.rotation.transpose() * p.pose.translation;
-                let error = (xyz - Vector3::from(frame.camera_position)).norm();
-                (
-                    error,
-                    json!({"camera_position": [xyz.x, xyz.y, xyz.z],
+    }
+    let missing: Vec<_> = frame
+        .expected_ids
+        .iter()
+        .filter(|id| !valid.contains(id))
+        .collect();
+    let raw_joint = if field_points.len() >= 8 {
+        pose::estimate_pose_from_correspondence_candidates(
+            &field_points,
+            &image_points,
+            &manifest.camera,
+            true,
+            &field_seeds,
+        )
+    } else {
+        None
+    };
+    let joint = raw_joint
+        .as_ref()
+        .filter(|p| p.reprojection_rmse_px <= 2.)
+        .map(|p| {
+            let xyz = -p.pose.rotation.transpose() * p.pose.translation;
+            let error = (xyz - Vector3::from(frame.camera_position)).norm();
+            (
+                error,
+                json!({"camera_position": [xyz.x, xyz.y, xyz.z],
+                        "camera_rotation": rotation_rows(&p.pose.rotation.transpose()),
                         "camera_error_m": error, "reprojection_rmse_px": p.reprojection_rmse_px,
                         "tags_used": field_points.len() / 4}),
-                )
-            });
-        let position_ok = if let Some((error, _)) = &joint {
-            error.is_finite() && *error <= max_error
-        } else {
-            errors.iter().all(|e| e.is_finite() && *e <= max_error)
-        };
-        let passed = if frame.expected_ids.is_empty() {
-            found.is_empty()
-        } else {
-            missing.is_empty()
-                && position_ok
-                && found.iter().all(|id| {
-                    frame
-                        .allowed_ids
-                        .as_ref()
-                        .map_or_else(|| tags.contains_key(id), |ids| ids.contains(id))
-                })
-        };
-        if !passed {
-            failed += 1;
-        }
-        println!(
-            "{} {}: detected {:?}, missing {:?}",
-            if passed { "PASS" } else { "FAIL" },
-            frame.name,
-            found,
-            missing
-        );
-        reports.push(
-            json!({"name": frame.name, "passed": passed, "detected_ids": found,
+            )
+        });
+    let position_ok = if let Some((error, _)) = &joint {
+        error.is_finite() && *error <= max_error
+    } else {
+        errors.iter().all(|e| e.is_finite() && *e <= max_error)
+    };
+    let passed = if frame.expected_ids.is_empty() {
+        found.is_empty()
+    } else {
+        missing.is_empty()
+            && position_ok
+            && found.iter().all(|id| {
+                frame
+                    .allowed_ids
+                    .as_ref()
+                    .map_or_else(|| tags.contains_key(id), |ids| ids.contains(id))
+            })
+    };
+    Ok(
+        json!({"name": frame.name, "passed": passed, "detected_ids": found,
             "detection_quality": detection_quality,
             "pose_candidates": pose_candidate_diagnostics,
             "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results,
@@ -212,17 +245,63 @@ fn main() -> Result<()> {
             "single_tag_diagnostic_passed": missing.is_empty()
                 && errors.iter().all(|e| e.is_finite() && *e <= max_error),
             "joint_pose": joint.map(|(_, value)| value)}),
-        );
+    )
+}
+
+// One JSON initialization line, then fixed-size grayscale frames. No image files or
+// detector restarts between frames; diagnostic native stdout is ignored by the client.
+fn stream() -> Result<()> {
+    use std::io::{BufRead, Read, Write};
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut header = String::new();
+    input.read_line(&mut header)?;
+    let manifest: Manifest = serde_json::from_str(&header)?;
+    if manifest.schema_version != 1 || manifest.width < 2 || manifest.height < 2 {
+        bail!("Invalid stream configuration");
     }
-    fs::write(
-        root.join("report.json"),
-        serde_json::to_vec_pretty(&json!({
-            "scope": "production CPU detection and multi-tag camera field localization with single-tag fallback",
-            "frames": reports, "failed": failed, "max_camera_error_m": max_error
-        }))?,
-    )?;
-    if failed > 0 {
-        bail!("{failed} replay cases failed; see report.json");
+    let size = (manifest.width as usize)
+        .checked_mul(manifest.height as usize)
+        .filter(|s| *s <= 32 * 1024 * 1024)
+        .context("Frame size too large")?;
+    let mut detector = detector::CpuDetector::new(1)?;
+    let frame = Frame {
+        name: "live".into(),
+        image: String::new(),
+        camera_position: [0.; 3],
+        expected_ids: vec![],
+        allowed_ids: None,
+    };
+    loop {
+        let mut pixels = vec![0u8; size];
+        // EOF before the first byte is a clean shutdown; a partial frame is an error.
+        if input.read(&mut pixels[..1])? == 0 {
+            break;
+        }
+        input.read_exact(&mut pixels[1..])?;
+        let img = image::GrayImage::from_raw(manifest.width, manifest.height, pixels)
+            .context("Invalid grayscale frame")?;
+        let mut report = evaluate_frame(&manifest, &frame, &img, &mut detector, 0.20)?;
+        // Live streaming has no ground truth. Only the dataset mode scores poses.
+        if let Some(object) = report.as_object_mut() {
+            for key in ["passed", "position_passed", "single_tag_diagnostic_passed"] {
+                object.remove(key);
+            }
+            for key in ["poses", "pose_candidates"] {
+                if let Some(values) = object.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    for value in values {
+                        if let Some(pose) = value.as_object_mut() {
+                            pose.remove("camera_error_m");
+                        }
+                    }
+                }
+            }
+            if let Some(pose) = object.get_mut("joint_pose").and_then(|v| v.as_object_mut()) {
+                pose.remove("camera_error_m");
+            }
+        }
+        println!("VORTEX_FRAME {}", serde_json::to_string(&report)?);
+        std::io::stdout().flush()?;
     }
     Ok(())
 }

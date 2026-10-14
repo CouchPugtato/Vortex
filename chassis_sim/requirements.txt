@@ -1,0 +1,7 @@
+-r ../simulation_tests/requirements.txt
+pyntcore>=2026,<2027
+robotpy-wpimath>=2026,<2027
+moderngl>=5.12,<6
+trimesh>=4.5,<5
+scipy>=1.14,<2
+Pillow>=10,<13

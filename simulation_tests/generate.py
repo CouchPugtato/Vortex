@@ -100,8 +100,9 @@ def tag_texture(dictionary, tag_id):
     return cv2.copyMakeBorder(marker, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
 
 
-def render_fast(frame, tags, camera, width, height, textures):
-    image = np.full((height, width), 180, dtype=np.uint8)
+def render_fast(frame, tags, camera, width, height, textures, background=None, roi=False):
+    image = (np.full((height, width), 180, dtype=np.uint8)
+             if background is None else background.copy())
     eye, r = np.array(frame["camera_position"]), np.array(frame["camera_rotation"])
     expected = []
     if frame["case"].get("hide_tags"):
@@ -122,12 +123,29 @@ def render_fast(frame, tags, camera, width, height, textures):
             expected.append(tag["id"])
         # 320px black-border tag plus a 40px white margin, physically scaled.
         padded, _ = project(corners(tag, camera["tag_size_m"] * 1.25), eye, r, camera)
+        if roi:
+            # Live rendering only warps the visible tag rectangle, rather than the
+            # entire camera frame twice for every tag in the field map.
+            if not np.all(np.isfinite(padded)):
+                continue
+            x0 = max(0, int(np.floor(padded[:, 0].min()))-1)
+            y0 = max(0, int(np.floor(padded[:, 1].min()))-1)
+            x1 = min(width, int(np.ceil(padded[:, 0].max()))+2)
+            y1 = min(height, int(np.ceil(padded[:, 1].max()))+2)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            target = image[y0:y1, x0:x1]
+            padded = padded - np.array([x0, y0], dtype=np.float32)
+            warp_size = (x1-x0, y1-y0)
+        else:
+            target, warp_size = image, (width, height)
         src = np.array([[0, 0], [399, 0], [399, 399], [0, 399]], np.float32)
         h = cv2.getPerspectiveTransform(src, padded)
-        warped = cv2.warpPerspective(textures[tag["id"]], h, (width, height),
+        warped = cv2.warpPerspective(textures[tag["id"]], h, warp_size,
                                      flags=cv2.INTER_LINEAR, borderValue=180)
-        mask = cv2.warpPerspective(np.full((400, 400), 255, np.uint8), h, (width, height))
-        image[mask > 250] = warped[mask > 250]
+        mask = cv2.warpPerspective(np.full((400, 400), 255, np.uint8), h, warp_size)
+        target[mask > 250] = (warped[mask > 250] if image.ndim == 2
+                             else warped[mask > 250, None])
     return image, expected
 
 
