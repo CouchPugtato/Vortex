@@ -7,16 +7,16 @@ const crypto = require("crypto");
 const { LAUNCHER, buildDeviceConfig } = require("./launch-config");
 const { stageProject } = require("./staging-deploy");
 const { operateRelease, releaseStatus } = require("./activation-deploy");
+const { initializeJetson } = require("./initialize-deploy");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const JOB_PATH = path.join(app.getPath("userData"), "pending_deployment_job.json");
 const LEGACY_REPO_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
 const LEGACY_APP_CONFIG_PATH = path.join(__dirname, "vortex_config.json");
 const LEGACY_USERDATA_CONFIG_PATH = path.join(app.getPath("userData"), "vortex_config.json");
-const FIXED_SSH = Object.freeze({
+const DEFAULT_SSH = Object.freeze({
   port: "22",
-  user: "vortex",
-  pass: "redstorm"
+  user: "vortex"
 });
 const serviceGuard = {
   activeCount: 0,
@@ -144,9 +144,9 @@ function isDetectionLine(line) {
 function defaultAppConfig() {
   return {
     host: "192.168.55.1",
-    port: FIXED_SSH.port,
-    user: FIXED_SSH.user,
-    pass: FIXED_SSH.pass,
+    port: DEFAULT_SSH.port,
+    user: DEFAULT_SSH.user,
+    pass: "",
     remote_path: "/home/vortex/deployments",
     local_path: path.resolve(__dirname, ".."),
     tag_map_path: path.join("..", "config", "2026-rebuilt-welded.json"),
@@ -171,13 +171,17 @@ function defaultAppConfig() {
   };
 }
 
-function withFixedSshConfig(cfg) {
-  return {
-    ...(cfg || {}),
-    port: FIXED_SSH.port,
-    user: FIXED_SSH.user,
-    pass: FIXED_SSH.pass
-  };
+const sessionPasswords = new Map();
+function withSshConfig(cfg = {}) {
+  const user = cfg.user || DEFAULT_SSH.user;
+  const port = String(cfg.port || DEFAULT_SSH.port);
+  const host = String(cfg.host || "192.168.55.1").trim();
+  if (!/^[a-z_][a-z0-9_-]*$/.test(user) || user === "root") throw new Error("Use a non-root Jetson account");
+  if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new Error("Invalid SSH port");
+  if (!host || /[\s\x00-\x1f\x7f]/.test(host)) throw new Error("Invalid Jetson address");
+  const key = `${host}:${port}:${user}`;
+  if (typeof cfg.pass === "string" && cfg.pass) sessionPasswords.set(key, cfg.pass);
+  return { ...cfg, host, user, port, pass: sessionPasswords.get(key) || "" };
 }
 
 function normalizeServiceName(name) {
@@ -194,7 +198,7 @@ function hasManagedService(settings) {
 
 async function stopManagedStartupService(settings, reason = "operation") {
   if (!hasManagedService(settings)) return;
-  const cfg = withFixedSshConfig(settings);
+  const cfg = withSshConfig(settings);
   const serviceName = normalizeServiceName(cfg.startup_service_name);
   const conn = await connectSsh(cfg);
   try {
@@ -211,7 +215,7 @@ async function stopManagedStartupService(settings, reason = "operation") {
 
 async function startManagedStartupService(settings, reason = "exit") {
   if (!hasManagedService(settings)) return;
-  const cfg = withFixedSshConfig(settings);
+  const cfg = withSshConfig(settings);
   const serviceName = normalizeServiceName(cfg.startup_service_name);
   const conn = await connectSsh(cfg);
   try {
@@ -228,7 +232,7 @@ async function startManagedStartupService(settings, reason = "exit") {
 
 async function beginManagedToolActivity(settings, label) {
   if (!hasManagedService(settings)) return;
-  serviceGuard.lastSettings = withFixedSshConfig(settings);
+  serviceGuard.lastSettings = withSshConfig(settings);
   const wasIdle = serviceGuard.activeCount === 0;
   if (wasIdle) {
     await stopManagedStartupService(serviceGuard.lastSettings, label);
@@ -490,7 +494,7 @@ async function waitForJetsonReconnect(settings, timeoutMs = 180000) {
 }
 
 async function setJetsonPowerLimit(settings, requestedWatts) {
-  const cfg = withFixedSshConfig(settings);
+  const cfg = withSshConfig(settings);
   const conn = await connectSsh(settings);
   try {
     const req = Number(requestedWatts);
@@ -620,7 +624,7 @@ async function setJetsonPowerLimit(settings, requestedWatts) {
 function connectSsh(settings) {
   return new Promise((resolve, reject) => {
     const conn = new Client();
-    const cfg = withFixedSshConfig(settings);
+    const cfg = withSshConfig(settings);
     conn
       .on("ready", () => resolve(conn))
       .on("error", (err) => reject(err))
@@ -930,7 +934,7 @@ const previewManager = {
           sftp = null;
         }
         if (msg.includes("All configured authentication methods failed")) {
-          emitLog("Authentication failed. Fixed credentials are vortex/redstorm on port 22.");
+          emitLog("Authentication failed. Check the Jetson address, account and SSH password in Jetson Setup.");
           this.running = false;
         }
         await new Promise((r) => setTimeout(r, 450));
@@ -957,7 +961,9 @@ const previewManager = {
 };
 
 ipcMain.handle("bootstrap", async () => {
-  const appCfg = withFixedSshConfig({ ...defaultAppConfig(), ...(await readPersistedAppConfig()) });
+  const appCfg = withSshConfig({ ...defaultAppConfig(), ...(await readPersistedAppConfig()) });
+  appCfg.pass = "";
+  delete appCfg.admin_password;
   delete appCfg.preview_camera_index;
   appCfg.local_path = resolvePathFromAppDir(appCfg.local_path, path.resolve(__dirname, ".."));
   appCfg.tag_map_path = resolvePathFromAppDir(
@@ -1104,7 +1110,9 @@ ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath)
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
   buildDeviceConfig(appConfig || {});
-  const sanitized = withFixedSshConfig({ ...(appConfig || {}) });
+  const sanitized = withSshConfig({ ...(appConfig || {}) });
+  sanitized.pass = "";
+  delete sanitized.admin_password;
   delete sanitized.preview_camera_index;
   sanitized.local_path = portablePathFromAppDir(sanitized.local_path);
   sanitized.tag_map_path = portablePathFromAppDir(sanitized.tag_map_path);
@@ -1172,7 +1180,8 @@ ipcMain.handle("deploy-start", async (_evt, settings) => startStaging(settings))
 ipcMain.handle("build-main-start", async (_evt, settings) => startStaging(settings));
 
 function jobEndpoint(settings) {
-  return { host: settings.host, user: FIXED_SSH.user, port: FIXED_SSH.port,
+  const connection = withSshConfig(settings);
+  return { host: connection.host, user: connection.user, port: connection.port,
     target: inferRemoteDeployFolder(settings.remote_path, settings.local_path) };
 }
 
@@ -1185,10 +1194,12 @@ function jobPersistence(settings) {
 
 function activationDependencies(settings) {
   return { connect: connectSsh, execChecked, log: emitLog, progress: emitDeployProgress,
-    user: FIXED_SSH.user, ...(settings ? jobPersistence(settings) : {}) };
+    user: settings ? withSshConfig(settings).user : DEFAULT_SSH.user, ...(settings ? jobPersistence(settings) : {}) };
 }
 
 async function resumeDeployment(settings) {
+  // Refresh can supply a newly entered SSH password to an attachment already reconnecting.
+  withSshConfig(settings);
   if (stagingInFlight) return { ok: true, attached: true };
   if (!fsSync.existsSync(JOB_PATH)) return { ok: true, attached: false };
   // Claim attachment before the first await, including concurrent Refresh/startup requests.
@@ -1200,7 +1211,7 @@ async function resumeDeployment(settings) {
       stagingInFlight = false;
       return { ok: false, error: "Saved job belongs to another device or deployment folder. Restore those connection settings to reconnect." };
     }
-    if (!["stage", "activate", "rollback"].includes(saved.job?.kind)) throw new Error("Invalid saved deployment job");
+    if (!["stage", "activate", "rollback", "initialize"].includes(saved.job?.kind)) throw new Error("Invalid saved deployment job");
   } catch (error) {
     stagingInFlight = false;
     throw error;
@@ -1209,11 +1220,12 @@ async function resumeDeployment(settings) {
   emitDeployProgress({ status: "active", percent: 2, text: "Reconnecting to saved job..." });
   const target = saved.endpoint.target;
   const deps = { ...activationDependencies(settings), resume: saved.job };
-  const work = saved.job.kind === "stage" ?
+  const work = saved.job.kind === "initialize" ?
+    initializeJetson(settings, target, "", { ...deps, appDir: __dirname }) : saved.job.kind === "stage" ?
     stageProject({ ...settings, build_profile: saved.job.build_profile }, target, { ...deps, appDir: __dirname }) :
     operateRelease(settings, target, saved.job.kind, saved.job.release_id, deps);
   work.then(async (result) => {
-    if (saved.job.kind === "stage") {
+    if (["stage", "initialize"].includes(saved.job.kind)) {
       const config = await readPersistedAppConfig();
       await writeJson(APP_CONFIG_PATH, { ...config, last_ready_release: result.release_id });
       emitReleaseState({ ready: [result.release_id] });
@@ -1226,6 +1238,29 @@ async function resumeDeployment(settings) {
 }
 
 ipcMain.handle("deployment-resume", async (_evt, settings) => resumeDeployment(settings));
+
+ipcMain.handle("jetson-initialize", async (_evt, settings, administratorPassword) => {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || monitorManager.conn || serviceGuard.activeCount) {
+    return { ok: false, error: "Finish/reconnect the current operation and stop diagnostics before initializing" };
+  }
+  try {
+    buildDeviceConfig(settings);
+    withSshConfig(settings);
+    if (typeof administratorPassword !== "string" || /[\r\n\0]/.test(administratorPassword)) throw new Error("Invalid administrator password");
+  } catch (error) { return { ok: false, error: error.message }; }
+  stagingInFlight = true;
+  initializeJetson(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), administratorPassword, {
+    ...activationDependencies(settings), appDir: __dirname, getSftp, upload: sftpFastPut
+  }).then(async (result) => {
+    const config = await readPersistedAppConfig();
+    await writeJson(APP_CONFIG_PATH, { ...config, last_ready_release: result.release_id });
+    emitReleaseState(await releaseStatus({ ...settings, last_ready_release: result.release_id },
+      inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies()));
+  }).catch((error) => emitLog(`Jetson initialization: ${error.message}`))
+    .finally(() => { stagingInFlight = false; });
+  administratorPassword = "";
+  return { ok: true };
+});
 
 ipcMain.handle("release-status", async (_evt, settings) => {
   const resumed = await resumeDeployment(settings);
@@ -1275,7 +1310,7 @@ ipcMain.handle("monitor-start", async (_evt, settings) => {
     const msg = err?.message || String(err);
     emitLog(`Monitor start failed: ${msg}`);
     if (msg.includes("All configured authentication methods failed")) {
-      emitLog("Authentication failed. Fixed credentials are vortex/redstorm on port 22.");
+      emitLog("Authentication failed. Check the Jetson address, account and SSH password in Jetson Setup.");
     }
     emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
     return { ok: false, error: msg };

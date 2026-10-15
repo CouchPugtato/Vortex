@@ -9,10 +9,10 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { Writable } = require("node:stream");
 
-function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" }), operation = async () => ({ state: "active" })) {
+function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" }), operation = async () => ({ state: "active" }), initialize = async () => ({ state: "ready", release_id: "new" })) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-deployment-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [], activationCalls = [];
+  const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [], activationCalls = [], initializeCalls = [];
   const overview = { ready: ["new"], active: { kind: "none" }, previous: { kind: "none" } };
   class FakeClient extends EventEmitter {
     connect() { queueMicrotask(() => this.emit("ready")); return this; }
@@ -49,6 +49,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
     clearTimeout, require(name) {
       if (name === "electron") return electron;
       if (name === "ssh2") return { Client: FakeClient };
+      if (name === "./initialize-deploy") return { initializeJetson: async (...args) => { initializeCalls.push(args); return initialize(...args); } };
       if (name === "./launch-config") return require("../launch-config");
       if (name === "./activation-deploy") return {
         operateRelease: async (...args) => { activationCalls.push(args); return operation(...args); },
@@ -60,7 +61,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
   const source = fs.readFileSync(path.join(appDir, "main.js"), "utf8");
   vm.runInNewContext(source+"\nmodule.exports = { APP_CONFIG_PATH, stopManagedStartupService, " +
     "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging, JOB_PATH, resumeDeployment };", sandbox);
-  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, overview, directory, connection: new FakeClient() };
+  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, initializeCalls, overview, directory, connection: new FakeClient() };
 }
 
 const settings = { local_path: "C:/source/Vortex", remote_path: "/home/vortex/deployments",
@@ -211,4 +212,45 @@ test("saved job persistence contains only job identity and device location", asy
   assert(!fs.readFileSync(h.JOB_PATH, "utf8").includes("redstorm"));
   await callbacks.finished();
   assert.equal(fs.existsSync(h.JOB_PATH), false);
+});
+
+
+test("Initialize Jetson uses the shared operation guard and passes administrator credentials separately", async (t) => {
+  let finish;
+  const h = harness(t, () => 0, undefined, undefined, () => new Promise((resolve) => { finish = resolve; }));
+  const handler = h.handlers.get("jetson-initialize");
+  const cfg = { ...settings, user: "operator", port: "2222", pass: "ssh-secret" };
+  assert.equal((await handler(null, cfg, "sudo-secret")).ok, true);
+  assert.equal(h.initializeCalls[0][2], "sudo-secret");
+  assert.equal(h.initializeCalls[0][3].user, "operator");
+  assert.equal(h.initializeCalls[0][0].admin_password, undefined);
+  assert.equal((await handler(null, cfg, "sudo-secret")).ok, false);
+  assert.equal(h.startStaging(cfg).ok, false);
+  assert.equal((await h.handlers.get("release-operate")(null, cfg, "activate", "new")).ok, false);
+  finish({ state: "ready", release_id: "new" });
+  for (let i = 0; i < 30 && !fs.existsSync(h.APP_CONFIG_PATH); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test("SSH connection settings are editable and passwords are excluded from saved preferences", async (t) => {
+  const h = harness(t);
+  await h.handlers.get("save-app-config")(null, { ...settings, user: "operator", port: "2222", pass: "ssh-secret", admin_password: "sudo-secret" });
+  const saved = JSON.parse(fs.readFileSync(h.APP_CONFIG_PATH));
+  assert.equal(saved.user, "operator");
+  assert.equal(saved.port, "2222");
+  assert.equal(saved.pass, "");
+  assert.equal(saved.admin_password, undefined);
+  assert(!fs.readFileSync(h.APP_CONFIG_PATH, "utf8").includes("secret"));
+});
+
+test("saved initialization reattaches through the app without requiring a sudo password again", async (t) => {
+  let finish;
+  const h = harness(t, () => 0, undefined, undefined, () => new Promise((resolve) => { finish = resolve; }));
+  savedJob(h, { kind: "initialize", operation_id: "initialize-original", release_id: "new", build_profile: "cpu" });
+  assert.equal((await h.resumeDeployment(settings)).attached, true);
+  assert.equal(h.initializeCalls[0][2], "");
+  assert.equal(h.initializeCalls[0][3].resume.operation_id, "initialize-original");
+  finish({ state: "ready", release_id: "new" });
+  for (let i = 0; i < 30 && !fs.existsSync(h.APP_CONFIG_PATH); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 20));
 });

@@ -64,7 +64,7 @@ class JobTests(unittest.TestCase):
 
     def test_lingering_required_before_recording_or_starting_a_job(self):
         self.linger = "no"
-        with self.assertRaisesRegex(ValueError, "enable-linger"): self.start()
+        with self.assertRaisesRegex(ValueError, "Initialize Jetson"): self.start()
         self.assertFalse((self.root/"jobs").exists())
         self.assertFalse(any(c[0] == "systemd-run" for c, _ in self.calls))
 

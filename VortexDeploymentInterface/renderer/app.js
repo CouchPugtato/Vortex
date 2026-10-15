@@ -18,6 +18,17 @@ const CAMERA_ACTIVE_MS = 4000;
 const TAG_OVERLAY_STICKY_MS = 450;
 
 const el = {
+  jetsonSetup: document.querySelector("#jetsonSetup"),
+  jetsonHost: document.querySelector("#jetsonHost"),
+  jetsonPort: document.querySelector("#jetsonPort"),
+  jetsonUser: document.querySelector("#jetsonUser"),
+  jetsonPassword: document.querySelector("#jetsonPassword"),
+  setupLocal: document.querySelector("#setupLocal"),
+  browseSetupLocal: document.querySelector("#browseSetupLocal"),
+  setupRemote: document.querySelector("#setupRemote"),
+  setupService: document.querySelector("#setupService"),
+  administratorPassword: document.querySelector("#administratorPassword"),
+  initializeJetson: document.querySelector("#initializeJetson"),
   runtimePath: document.querySelector("#runtimePath"),
   jetsonWatts: document.querySelector("#jetsonWatts"),
   applyJetsonWatts: document.querySelector("#applyJetsonWatts"),
@@ -138,6 +149,7 @@ function pushPreviewFrame(dataUrl) {
 }
 
 function setDeployIndicator(stateKind, text, percent = null) {
+  el.initializeJetson.disabled = stateKind === "active";
   el.deployBtn.disabled = stateKind === "active";
   el.activateRelease.disabled = stateKind === "active";
   el.rollbackRelease.disabled = stateKind === "active";
@@ -250,6 +262,13 @@ function setBuildIndicator(stateKind, text, percent = null) {
 
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
+  el.jetsonHost.value = cfg.host || "192.168.55.1";
+  el.jetsonPort.value = cfg.port || "22";
+  el.jetsonUser.value = cfg.user || "vortex";
+  el.setupLocal.value = cfg.local_path || "";
+  el.setupRemote.value = cfg.remote_path || "/home/vortex/deployments";
+  el.setupService.value = cfg.startup_service_name || "vortex-vision.service";
+  if (!cfg.pass) el.jetsonSetup.open = true;
   if (cfg.last_ready_release && ![...el.readyRelease.options].some((option) => option.value === cfg.last_ready_release)) {
     el.readyRelease.add(new Option(cfg.last_ready_release, cfg.last_ready_release));
     el.readyRelease.value = cfg.last_ready_release;
@@ -344,6 +363,13 @@ function readAppConfigFromUI() {
   const udpPort = el.udpPort?.value ?? state.appConfig?.vortex_udp_port ?? 5809;
   return {
     ...state.appConfig,
+    host: el.jetsonHost.value.trim(),
+    port: el.jetsonPort.value.trim(),
+    user: el.jetsonUser.value.trim(),
+    pass: el.jetsonPassword.value,
+    local_path: el.setupLocal.value.trim(),
+    remote_path: el.setupRemote.value.trim(),
+    startup_service_name: el.setupService.value.trim(),
     preview_camera_index: normalizedCam,
     runtime_config_path: el.runtimePath.value.trim(),
     tag_map_path: tagMapPath,
@@ -1040,6 +1066,28 @@ async function init() {
   state.runtimeConfig = boot.runtimeConfig;
   renderRuntimeFormForCurrentCamera();
   await loadTagMapFromPath(state.tagMapPath, { log: false });
+
+  el.browseSetupLocal.addEventListener("click", async () => {
+    const folder = await window.vortexApi.chooseFolder();
+    if (folder) el.setupLocal.value = folder;
+  });
+  el.initializeJetson.addEventListener("click", async () => {
+    let password = el.administratorPassword.value;
+    el.administratorPassword.value = "";
+    try {
+      const cfg = readAppConfigFromUI();
+      await window.vortexApi.saveAppConfig(cfg);
+      state.runtimeConfig = readRuntimeConfigFromForm();
+      await window.vortexApi.saveRuntimeConfig(el.runtimePath.value.trim(), state.runtimeConfig);
+      setDeployIndicator("active", "Preparing Jetson initialization...", 0);
+      const response = await window.vortexApi.initializeJetson(cfg, password);
+      if (!response?.ok) throw new Error(response?.error || "Initialization could not start");
+      appendLog("Jetson initialization started. Setup progress and logs will appear here.");
+    } catch (error) {
+      setDeployIndicator("error", error.message, 0);
+      appendLog(error.message);
+    } finally { password = ""; }
+  });
 
   if (state.appConfig.monitor_start_cmd === "") {
     const applied = await window.vortexApi.applyMonitorPreset(readAppConfigFromUI(), "main_cam_0");

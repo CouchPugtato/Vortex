@@ -12,19 +12,12 @@ fn main() {
     if has_gpu_feature {
         println!("cargo:warning=Enabling VPI compilation...");
         
-        // determine include path
-        let include_path = if std::path::Path::new(vpi_path_3).exists() {
-            format!("{}/include", vpi_path_3)
-        } else {
-            format!("{}/include", vpi_path_2)
-        };
-        
-        // determine lib path
-        let lib_path = if std::path::Path::new(vpi_path_3).exists() {
-             format!("{}/lib64", vpi_path_3)
-        } else {
-             format!("{}/lib64", vpi_path_2)
-        };
+        // NVIDIA packages use lib/<arch>; older installations can use lib64.
+        let lib_path = [vpi_path_3, vpi_path_2]
+            .iter()
+            .flat_map(|root| [format!("{}/lib64", root), format!("{}/lib/aarch64-linux-gnu", root)])
+            .find(|directory| std::path::Path::new(directory).join("libnvvpi.so").is_file())
+            .expect("GPU profile requires JetPack VPI 2 or 3 development libraries");
 
         println!("cargo:rustc-link-search=native={}", lib_path);
         println!("cargo:rustc-link-lib=nvvpi");

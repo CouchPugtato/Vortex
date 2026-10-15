@@ -10,6 +10,32 @@
     <div class="app-shell">
       <section class="left-panel">
         <section class="card block">
+          <details id="jetsonSetup">
+            <summary>Jetson Setup</summary>
+            <label for="jetsonHost">Jetson address</label>
+            <div class="row"><input id="jetsonHost" placeholder="192.168.55.1" aria-label="Jetson address" />
+              <input id="jetsonPort" value="22" type="number" min="1" max="65535" aria-label="SSH port" /></div>
+            <label for="jetsonUser">Jetson account</label>
+            <input id="jetsonUser" autocomplete="username" placeholder="vortex" />
+            <label for="jetsonPassword">SSH password</label>
+            <input id="jetsonPassword" type="password" autocomplete="off" placeholder="Kept for this app session only" />
+            <label for="setupLocal">Project source folder</label>
+            <div class="row"><input id="setupLocal" /><button id="browseSetupLocal">Browse</button></div>
+            <label for="setupRemote">Deployment parent folder on Jetson</label>
+            <input id="setupRemote" placeholder="/home/vortex/deployments" />
+            <label for="setupService">Startup service</label>
+            <input id="setupService" placeholder="vortex-vision.service" />
+            <label for="administratorPassword">Administrator password (sudo)</label>
+            <input id="administratorPassword" type="password" autocomplete="off" placeholder="Leave empty for passwordless sudo" />
+            <div class="row"><button id="initializeJetson" class="accent">Initialize Jetson</button></div>
+            <div class="hint">Use the sudo password for this Jetson account. Setup downloads dependencies,
+              builds and verifies a release, and prepares startup. The Jetson needs internet access,
+              an installed Ubuntu/JetPack image, and SSH enabled. Passwords are not saved.
+              Select Activate afterward to start the prepared release. Existing deployments can use
+              this flow to update managed-service setup.</div>
+          </details>
+        </section>
+        <section class="card block">
           <h2>Runtime Config</h2>
           <label>Config Path</label>
           <div class="row">

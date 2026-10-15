@@ -22,6 +22,7 @@ MAX_BYTES = 2 * 1024**3
 MAX_MANIFEST = 2 * 1024**2
 ROOT_FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", "run_vortex.sh"}
 SCRIPT_FILES = {"scripts/run_vortex.py", "scripts/deploy_release.py", "scripts/activate_release.py",
+                "scripts/initialize_jetson.py",
                 "simulation_tests/reference/dim_noisy_tag.png"}
 RESOURCE_FILES = {"config/device.json", "config/config.json", "config/apriltag_map.json",
                   "config/2026-rebuilt-welded.json", "models/rockpaperscizzors.engine"}
@@ -37,11 +38,13 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def atomic_json(path, data):
+def atomic_json(path, data, mode=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            if mode is not None:
+                os.chmod(temporary, mode)
             json.dump(data, stream, indent=2, allow_nan=False)
             stream.write("\n")
             stream.flush()
@@ -185,9 +188,11 @@ def package_release(source, output, device_config, runtime_config=None, tag_map=
         finally:
             temporary.unlink(missing_ok=True)
         copy_regular(snapshot/"scripts/deploy_release.py", output/"controller.py")
+        copy_regular(snapshot/"scripts/initialize_jetson.py", output/"initialize_jetson.py")
     metadata = dict(schema_version=1, release_id=identity, archive_sha256=sha256(archive),
                     archive_bytes=archive.stat().st_size, controller_sha256=sha256(output/"controller.py"),
-                    build_profile=device["build_profile"], git=provenance)
+                    build_profile=device["build_profile"], git=provenance,
+                    initializer_sha256=sha256(output/"initialize_jetson.py"))
     atomic_json(output/"package.json", metadata)
     return metadata
 
@@ -364,7 +369,7 @@ def start_job(root, identity, kind, release=None, checksum=None, execute=subproc
     env = user_systemd_env()
     linger = execute(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"],
                      env=env, capture_output=True, text=True, check=True, timeout=15)
-    require(linger.stdout.strip() == "yes", "Persistent deployment jobs need user lingering. Run once: sudo loginctl enable-linger " + str(os.getuid()))
+    require(linger.stdout.strip() == "yes", "Persistent deployment jobs need user lingering. Use Initialize Jetson in the deployment app to enable it.")
     execute(["systemctl", "--user", "show-environment"], env=env, capture_output=True,
             text=True, check=True, timeout=15)
     jobs = child(root, "jobs")
@@ -412,8 +417,11 @@ def supervised_status(root, identity, job, execute=subprocess.run):
         data = read_json(descriptor)
         expected = "vortex-job-"+hashlib.sha256((str(root)+"/"+identity).encode()).hexdigest()[:32]+".service"
         require(data["unit"] == expected and data["job_id"] == identity, "Invalid managed job descriptor")
-        response = execute(["systemctl", "--user", "show", expected, "-p", "ActiveState", "-p", "Result",
-                            "-p", "ExecMainStatus", "-p", "LoadState"], env=user_systemd_env(), capture_output=True, text=True, timeout=15)
+        manager = data.get("manager", "user")
+        require(manager in ("user", "system") and (manager != "system" or data.get("kind") == "initialize"), "Invalid job manager")
+        response = execute(["systemctl", *(["--user"] if manager == "user" else []), "show", expected, "-p", "ActiveState", "-p", "Result",
+                            "-p", "ExecMainStatus", "-p", "LoadState"], env=user_systemd_env() if manager == "user" else None,
+                           capture_output=True, text=True, timeout=15)
         values = dict(line.split("=", 1) for line in response.stdout.splitlines() if "=" in line)
         require(response.returncode == 0 or values.get("LoadState") == "not-found",
                 "Cannot inspect deployment job manager; reconnect before retrying")

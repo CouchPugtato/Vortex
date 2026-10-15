@@ -31,6 +31,7 @@
       "staging-deploy.js",
       "activation-deploy.js",
       "job-progress.js",
+      "initialize-deploy.js",
       "preload.js",
       "renderer/**/*",
       "package.json"

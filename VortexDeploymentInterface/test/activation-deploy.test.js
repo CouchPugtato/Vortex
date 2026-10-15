@@ -48,7 +48,7 @@ test("first activation prepares the managed service without hiding sudo errors",
     if (command.startsWith("sudo ")) throw new Error("a password is required");
     return checked(conn, command);
   };
-  await assert.rejects(operateRelease(settings, remote, "activate", "new", failed.deps), /Run this once on the Jetson with sudo/);
+  await assert.rejects(operateRelease(settings, remote, "activate", "new", failed.deps), /Initialize Jetson/);
   assert(!failed.commands.some((command) => command.includes(" start-job ")));
 });
 

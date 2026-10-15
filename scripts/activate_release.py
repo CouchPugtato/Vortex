@@ -502,7 +502,7 @@ def status(root, operation_id=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("activate", "rollback", "recover", "service-run", "install-service", "status"))
+    parser.add_argument("action", choices=("activate", "rollback", "recover", "service-run", "install-service", "status", "preflight"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--release-id")
     parser.add_argument("--operation-id")
@@ -525,6 +525,9 @@ def main(argv=None):
             result = status(root, args.operation_id)
             if args.operation_id:
                 result = deployment.supervised_status(root, args.operation_id, result)
+        elif args.action == "preflight":
+            require(args.release_id is not None, "--release-id is required")
+            result = native_preflight(root, args.release_id)
         else:
             result = activate(root, args.release_id, args.action == "rollback", args.operation_id)
         print(json.dumps(result, allow_nan=False))

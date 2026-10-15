@@ -49,7 +49,7 @@ async function operateRelease(settings, remoteTarget, action, release, deps) {
           `--legacy-root ${quote(remoteTarget)} --service ${quote(name)} --user ${quote(deps.user || "vortex")}`;
         try { await checked(`sudo -n ${install}`); }
         catch (error) {
-          throw new Error(`Managed service preparation failed. Run this once on the Jetson with sudo: sudo ${install}. ${error.message}`);
+          throw new Error("Managed service setup needs administrator access. Open Jetson Setup and use Initialize Jetson, then retry Activate.");
         }
       }
       const command = `python3 ${quote(root+"/deploy_release.py")} start-job --kind ${quote(action)} --root ${quote(root)} --job-id ${quote(operation)}` +

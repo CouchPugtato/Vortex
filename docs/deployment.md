@@ -6,6 +6,46 @@ without replacing files in the running installation or stopping its service.
 camera health. **Rollback** restores the previous release/configuration. A ready
 release remains **not activated** until Activate is selected.
 
+## Initialize a Jetson from the app
+
+Users do not need an SSH terminal. Open **Jetson Setup**, enter the device address,
+SSH port/account/password, project source folder, deployment parent folder, and
+startup service name. Enter the account's sudo password in **Administrator password**
+(or leave it empty for passwordless sudo), select the intended build profile, and
+click **Initialize Jetson**. The SSH account must already exist and have administrator
+permission. Flashing JetPack/Ubuntu and enabling SSH remain image setup tasks.
+
+Initialization supports Ubuntu 20.04/22.04/24.04 on aarch64 and x86_64, requires
+Python 3/systemd/sudo on the device and at least 6 GiB free after extraction, and
+downloads packages/toolchains/dependencies using the Jetson's internet connection.
+Architecture, OS, disk space and selected GPU/TensorRT prerequisites are checked
+before package installation. NVIDIA components must already match the installed
+JetPack; setup reports missing components and does not change the chosen profile.
+VPI 2/3 layouts supported by this project's build are checked, including NVIDIA's
+`lib/aarch64-linux-gnu` layout. These checks are not hardware certification.
+
+The app uploads/checksums a source snapshot and setup controllers, then submits a
+root-owned systemd job. The sudo password goes through SSH stdin without a PTY;
+it is excluded from command arguments, files, logs, and saved preferences. SSH
+passwords are kept only for the app session, so enter them again after reopening
+before using **Refresh Releases**. Existing saved SSH credentials are read for
+migration; saving preferences clears the stored password.
+
+The initializer installs native build dependencies, the pinned Rust release and
+locked Cargo dependencies, enables lingering/user-manager access, grants camera
+group membership, and builds through the regular offline staging path as the
+runtime account. Native library/image-smoke checks also run as that account. It
+then installs or updates the stable service/controller and its restricted service
+permissions. Initialization shares the deployment lock and app operation guard.
+
+Progress and logs reconnect using the existing saved-job flow without resubmitting
+setup or requesting the sudo password again. Setup has a three-hour limit and
+never restarts itself. A failed or interrupted setup keeps its logs; after
+inspecting its result, retry **Initialize Jetson** to perform a new attempt.
+Package/toolchain changes already completed are retained. Existing live-release
+files and selection are preserved. Initialization prepares a release and startup
+configuration; click **Activate** afterward to start and check real cameras.
+
 ## Stage a release
 
 Select the intended camera, networking, build profile, runtime configuration, and
@@ -61,13 +101,10 @@ resubmits the saved operation. **Refresh Releases** retries attachment after a
 longer outage; pending jobs block new deployment operations in that desktop.
 Connection settings must still match the saved device and deployment folder.
 
-The Jetson needs `dbus-user-session` and a persistent user manager. Bootstrap and
-managed-service setup enable [user lingering](https://www.freedesktop.org/software/systemd/man/252/loginctl.html).
-For an existing installation, run this once before staging:
-
-```text
-sudo loginctl enable-linger vortex
-```
+The Jetson needs `dbus-user-session` and a persistent user manager. **Initialize
+Jetson**, bootstrap and managed-service setup enable
+[user lingering](https://www.freedesktop.org/software/systemd/man/252/loginctl.html).
+Use Initialize Jetson for an existing installation that has not enabled it yet.
 
 Jobs retain `jobs/ID.unit.json` supervisor metadata, `ID.controller.log`, and the
 existing status/build logs. Staging has a two-hour limit; activation has a five-minute
@@ -214,17 +251,16 @@ require recompilation; changing source, toolchain pin, or profile does.
 ## Migrating an existing Jetson
 
 Stage Release requires Python, the pinned Rust toolchain, native build libraries,
-and cached Cargo dependencies on the Jetson. It does not provision dependencies or
-install a service. A new device still needs the bootstrap script after JetPack is
-installed and an initial project copy is available. Missing offline dependencies
-need explicit online provisioning using the command above.
+and cached Cargo dependencies on the Jetson. Use **Initialize Jetson** to prepare
+these prerequisites and the managed service without a terminal. The standalone
+bootstrap script remains available for operators who prefer it.
 
 Existing source deployments continue running until Activate. First-time service
 preparation requires root privileges; Activate attempts noninteractive sudo and
-reports a concrete setup command if permission is unavailable. Run that command
-once in an SSH terminal using sudo, then retry Activate. The updated bootstrap also
-performs this preparation. Existing packages from before this feature must be
-restaged because they lack the health/smoke modules.
+directs users to **Jetson Setup → Initialize Jetson** if permission is unavailable.
+That flow also updates controllers when a new release needs privileged setup.
+Existing packages from before this feature must be restaged to include the updated
+controllers and initialization module.
 
 The installer supports migration of the existing `run_vortex.sh` systemd unit.
 It rejects unexpected launch commands and service drop-ins rather than discarding
@@ -237,8 +273,9 @@ root; ordinary Activate/Rollback operations run as the runtime user.
 `scripts/setup_jetson_environment.sh` now installs Python, provisions the pinned
 toolchain, grants the runtime user membership in `video`, builds through the shared
 launcher, and verifies the build before installing/restarting the service. It still
-requires a flashed Jetson and an existing runtime user; complete hardware/JetPack
-compatibility detection and the Initialize Jetson interface are pending.
+requires a flashed Jetson and an existing runtime user. The app initializer adds
+compatibility checks and performs provisioning without an initial project copy on
+the device; it stages its uploaded snapshot and defers activation.
 
 The service name defaults to `vortex-vision.service` in bootstrap. Set
 `startup_service_name` to that name in the interface preferences if the service
@@ -276,7 +313,7 @@ Jetson validation.
 ## Remaining implementation order
 
 1. Add service-owned preview and a continuous frame-processing watchdog.
-2. Add fresh-device compatibility checks, guided initialization, offline provisioning,
+2. Add offline provisioning bundles, broader hardware/JetPack compatibility coverage,
    and release retention cleanup.
 
 Linux service installation, sudoers validation, real camera timing, GPU/TensorRT,
