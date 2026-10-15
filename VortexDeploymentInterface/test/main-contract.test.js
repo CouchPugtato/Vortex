@@ -9,10 +9,10 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { Writable } = require("node:stream");
 
-function harness(t, exitCode = () => 0) {
+function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-deployment-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const commands = [], writes = new Map(), handlers = new Map();
+  const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [];
   class FakeClient extends EventEmitter {
     connect() { queueMicrotask(() => this.emit("ready")); return this; }
     end() {}
@@ -49,12 +49,13 @@ function harness(t, exitCode = () => 0) {
       if (name === "electron") return electron;
       if (name === "ssh2") return { Client: FakeClient };
       if (name === "./launch-config") return require("../launch-config");
+      if (name === "./staging-deploy") return { stageProject: async (...args) => { stageCalls.push(args); return stage(...args); } };
       return require(name);
     } };
   const source = fs.readFileSync(path.join(appDir, "main.js"), "utf8");
   vm.runInNewContext(source+"\nmodule.exports = { APP_CONFIG_PATH, stopManagedStartupService, " +
-    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand };", sandbox);
-  return { ...sandbox.module.exports, commands, writes, handlers, directory, connection: new FakeClient() };
+    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging };", sandbox);
+  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, directory, connection: new FakeClient() };
 }
 
 const settings = { local_path: "C:/source/Vortex", remote_path: "/home/vortex/deployments",
@@ -101,19 +102,25 @@ test("startup sync propagates a failed remote write/activation command", async (
   await assert.rejects(h.syncRemoteStartupScript(h.connection, settings), /Remote command failed/);
 });
 
-test("build validates and uses the common launcher without fallback", async (t) => {
+test("legacy build API stages a snapshot instead of building the running tree", async (t) => {
   const h = harness(t);
   await h.buildMainProgram(settings);
-  const validate = h.commands.findIndex((command) => command.includes("--validate-config"));
-  const build = h.commands.findIndex((command) => command.includes("--build --with-debug-bridge"));
-  assert(validate >= 0 && build > validate);
-  assert(!h.commands.some((command) => /rm -f Cargo.lock|apt-get|--online/.test(command)));
+  assert.equal(h.stageCalls.length, 1);
+  assert.equal(h.stageCalls[0][1], "/home/vortex/deployments/Vortex");
+  assert.equal(h.commands.length, 0);
 });
 
-test("failed build is reported and never retried with other features", async (t) => {
-  const h = harness(t, (command) => command.includes("--build --with-debug-bridge") ? 1 : 0);
-  await assert.rejects(h.buildMainProgram(settings), /Verified build failed/);
-  assert.equal(h.commands.filter((command) => command.includes("--build --with-debug-bridge")).length, 1);
+test("staging does not stop/resume the service and rejects concurrent app requests", async (t) => {
+  let finish;
+  const h = harness(t, () => 0, () => new Promise((resolve) => { finish = resolve; }));
+  const cfg = { ...settings, startup_service_name: "vortex-vision.service" };
+  assert.equal(h.startStaging(cfg).ok, true);
+  assert.equal(h.startStaging(cfg).ok, false);
+  assert.equal(h.serviceGuard.activeCount, 0);
+  assert.equal(h.commands.length, 0);
+  finish({ state: "ready" });
+  await new Promise(setImmediate);
+  assert.equal(h.startStaging({ ...cfg, build_profile: "invalid" }).ok, false);
 });
 
 test("diagnostics cannot bypass the launcher via legacy command settings", async (t) => {

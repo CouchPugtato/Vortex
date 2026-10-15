@@ -5,6 +5,7 @@ const fsSync = require("fs");
 const { Client } = require("ssh2");
 const crypto = require("crypto");
 const { LAUNCHER, buildDeviceConfig } = require("./launch-config");
+const { stageProject } = require("./staging-deploy");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const LEGACY_REPO_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
@@ -21,6 +22,7 @@ const serviceGuard = {
   resumeInFlight: null
 };
 let quitCleanupInProgress = false;
+let stagingInFlight = false;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -701,108 +703,21 @@ function sftpWriteFile(sftp, remotePath, bytes) {
   });
 }
 
-async function walkFiles(rootDir) {
-  const out = [];
-  async function walk(current) {
-    const entries = await fs.readdir(current, { withFileTypes: true });
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.name === "target" || entry.name === "node_modules" || entry.name === ".git") continue;
-      if (entry.isDirectory()) await walk(full);
-      else out.push(full);
-    }
-  }
-  await walk(rootDir);
-  return out;
-}
-
 async function deployProject(settings) {
-  buildDeviceConfig(settings);
-  const cfg = withFixedSshConfig(settings);
-  const conn = await connectSsh(settings);
-  try {
-    emitLog(`Connected to ${cfg.host}:${cfg.port}`);
-    const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-    const normalizedTarget = String(remoteTarget).replace(/\/+$/, "");
-    if (!normalizedTarget || normalizedTarget === "/" || normalizedTarget.split("/").length < 3) {
-      throw new Error(`Refusing to delete unsafe remote path: ${remoteTarget}`);
-    }
-
-    emitLog(`Clearing remote folder (preserving target/): ${remoteTarget}`);
-    await execCommand(conn, `mkdir -p '${remoteTarget}'`);
-    await execCommand(
-      conn,
-      `bash -lc "find '${remoteTarget}' -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +"`
-    );
-    emitLog(`Remote folder: ${remoteTarget}`);
-
-    const sftp = await getSftp(conn);
-    const files = await walkFiles(settings.local_path);
-    const total = files.length || 1;
-    emitDeployProgress({ percent: 0, current: 0, total, status: "starting" });
-
-    const createdDirs = new Set([toPosix(remoteTarget)]);
-    let i = 0;
-    for (const file of files) {
-      const rel = path.relative(settings.local_path, file);
-      const relPosix = toPosix(rel);
-      const remoteFile = toPosix(path.posix.join(remoteTarget, relPosix));
-      const parent = path.posix.dirname(remoteFile);
-      if (!createdDirs.has(parent)) {
-        await execCommand(conn, `mkdir -p '${parent}'`);
-        createdDirs.add(parent);
-      }
-      emitLog(`Upload: ${relPosix}`);
-      await sftpFastPut(sftp, file, remoteFile);
-      i += 1;
-      emitDeployProgress({
-        percent: Math.round((i / total) * 100),
-        current: i,
-        total,
-        status: "uploading"
-      });
-    }
-
-    await syncRemoteStartupScript(conn, settings);
-
-    emitLog("Deployment finished successfully.");
-    emitDeployProgress({ percent: 100, current: total, total, status: "done" });
-  } finally {
-    conn.end();
-  }
+  return stageProject(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), {
+    appDir: __dirname,
+    connect: connectSsh,
+    execChecked,
+    getSftp,
+    upload: sftpFastPut,
+    log: emitLog,
+    progress: (event) => emitDeployProgress({ ...event, current: event.percent, total: 100 })
+  });
 }
 
+// Legacy IPC callers also stage a new snapshot; they cannot rebuild the active tree.
 async function buildMainProgram(settings) {
-  buildDeviceConfig(settings);
-  const conn = await connectSsh(settings);
-  try {
-    const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-    await syncRemoteStartupScript(conn, settings);
-    await execChecked(conn, `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --validate-config`);
-    emitMainBuildProgress({ status: "active", percent: 5, text: "Building pinned profile (offline)..." });
-    const command = `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --build --with-debug-bridge`;
-    const channel = await execCommand(conn, command, { stream: true });
-    await new Promise((resolve, reject) => {
-      let pending = "";
-      const onData = (bytes) => {
-        pending += bytes.toString("utf8");
-        const lines = pending.split(/\r?\n/);
-        pending = lines.pop() || "";
-        for (const line of lines) if (line.trim()) emitLog(stripAnsi(line));
-      };
-      channel.on("data", onData);
-      channel.stderr.on("data", onData);
-      channel.on("error", reject);
-      channel.on("close", (code) => {
-        if (pending.trim()) emitLog(stripAnsi(pending));
-        if (code === 0) resolve();
-        else reject(new Error(`Verified build failed (${code}). Initialize/cache dependencies first if offline packages are missing.`));
-      });
-    });
-    emitMainBuildProgress({ status: "done", percent: 100, text: "Verified production and debug builds complete" });
-  } finally {
-    conn.end();
-  }
+  return deployProject(settings);
 }
 
 async function resolveMonitorCommand(conn, settings) {
@@ -1224,47 +1139,22 @@ ipcMain.handle("set-jetson-power-limit", async (_evt, settings, watts) => {
   return setJetsonPowerLimit(settings, watts);
 });
 
-ipcMain.handle("deploy-start", async (_evt, settings) => {
+function startStaging(settings) {
+  if (stagingInFlight) return { ok: false, error: "A staging operation is already running in this app" };
   try {
     buildDeviceConfig(settings);
-    await beginManagedToolActivity(settings, "deploy");
-  } catch (err) {
-    const msg = err?.message || String(err);
-    emitLog(`Service pre-stop failed: ${msg}`);
-    return { ok: false, error: msg };
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
+  stagingInFlight = true;
   deployProject(settings)
-    .then(() => emitLog("Deploy complete."))
-    .catch((err) => {
-      emitLog(`Deploy failed: ${err.message}`);
-      emitDeployProgress({ percent: 0, current: 0, total: 0, status: "error" });
-    })
-    .finally(() => {
-      endManagedToolActivity();
-    });
+    .catch((error) => emitLog(`Release staging failed: ${error.message}`))
+    .finally(() => { stagingInFlight = false; });
   return { ok: true };
-});
+}
 
-ipcMain.handle("build-main-start", async (_evt, settings) => {
-  try {
-    buildDeviceConfig(settings);
-    await beginManagedToolActivity(settings, "main-build");
-  } catch (err) {
-    const msg = err?.message || String(err);
-    emitLog(`Service pre-stop failed: ${msg}`);
-    return { ok: false, error: msg };
-  }
-  buildMainProgram(settings)
-    .then(() => emitLog("Main build complete."))
-    .catch((err) => {
-      emitLog(`Main build failed: ${err.message}`);
-      emitMainBuildProgress({ status: "error", percent: 0, text: "✕ Main build failed" });
-    })
-    .finally(() => {
-      endManagedToolActivity();
-    });
-  return { ok: true };
-});
+ipcMain.handle("deploy-start", async (_evt, settings) => startStaging(settings));
+ipcMain.handle("build-main-start", async (_evt, settings) => startStaging(settings));
 
 ipcMain.handle("monitor-start", async (_evt, settings) => {
   emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });

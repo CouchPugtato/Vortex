@@ -187,7 +187,7 @@ def binary_path(root, binary):
     return root/"target"/"release"/(binary+(".exe" if os.name == "nt" else ""))
 
 
-def build(root, config, online=False, with_debug_bridge=False):
+def build(root, config, online=False, with_debug_bridge=False, cache_dir=None):
     rustup_cargo = Path.home()/".cargo"/"bin"/("cargo.exe" if os.name == "nt" else "cargo")
     cargo = str(rustup_cargo) if rustup_cargo.is_file() else shutil.which("cargo") or "cargo"
     pin = re.search(r'^\s*channel\s*=\s*"(\d+\.\d+\.\d+)"\s*$',
@@ -203,6 +203,9 @@ def build(root, config, online=False, with_debug_bridge=False):
     features = PROFILES[config["build_profile"]]
     if features:
         command += ["--features", ",".join(features)]
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir).resolve()
+        command += ["--target-dir", str(cache_dir)]
     # An explicit build may replace old artifacts, so invalidate the old stamp first.
     stamp = root/"target"/"release"/"vortex-build.json"
     before = source_digest(root)
@@ -214,6 +217,19 @@ def build(root, config, online=False, with_debug_bridge=False):
     build_env["RUSTUP_AUTO_INSTALL"] = "1" if online else "0"
     subprocess.run(command, cwd=root, env=build_env, check=True)
     require(source_digest(root) == before, "Source changed during build; rebuild before launching")
+    if cache_dir is not None and cache_dir != (root/"target").resolve():
+        # Each staged release owns its executable. Never run a mutable cache artifact.
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        for name in bins:
+            destination = binary_path(root, name)
+            fd, temporary = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
+            os.close(fd)
+            try:
+                shutil.copy2(cache_dir/"release"/destination.name, temporary)
+                os.replace(temporary, destination)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
     atomic_json(stamp, dict(schema_version=1, runtime="main", profile=config["build_profile"],
                            source_sha256=before, binaries={name: sha256(binary_path(root, name)) for name in bins}))
 
@@ -245,10 +261,11 @@ def main(argv=None):
     actions.add_argument("--debug-bridge", action="store_true", help="Legacy single-camera diagnostic mode; not production")
     parser.add_argument("--online", action="store_true", help="Allow dependency downloads for an explicit build")
     parser.add_argument("--with-debug-bridge", action="store_true", help="Also build the legacy diagnostic executable")
+    parser.add_argument("--build-cache", type=Path, help="Shared Cargo target directory; copy artifacts into this release")
     parser.add_argument("--camera", type=int, default=0, help="Camera for --debug-bridge only")
     args = parser.parse_args(argv)
-    if (args.online or args.with_debug_bridge) and not args.build:
-        parser.error("--online and --with-debug-bridge require --build")
+    if (args.online or args.with_debug_bridge or args.build_cache is not None) and not args.build:
+        parser.error("Build options require --build")
     try:
         root = ROOT
         config = validate_config(read_json(absolute(root, args.device_config)))
@@ -257,7 +274,7 @@ def main(argv=None):
             print(f"Device settings valid: main / {config['build_profile']} / cameras {config['cameras']}")
             return 0
         if args.build:
-            build(root, config, args.online, args.with_debug_bridge)
+            build(root, config, args.online, args.with_debug_bridge, args.build_cache)
             print(f"Verified build complete: {config['build_profile']}")
             return 0
         binary = BRIDGE if args.debug_bridge or args.check_debug_bridge else MAIN

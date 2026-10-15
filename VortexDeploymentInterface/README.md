@@ -29,7 +29,8 @@ Available packaging scripts:
 ## Features
 
 - Edit and save runtime `config/config.json`.
-- Deploy project folder to Jetson over SSH/SFTP.
+- Stage a checksummed source release over SSH/SFTP and build it without replacing
+  or restarting the running installation.
 - Start/stop monitor command and parse AprilTag/Object output by camera.
 - Live camera preview by running remote capture command and fetching image frames.
 - Monitor command presets for main pipeline launch patterns.
@@ -38,8 +39,11 @@ Available packaging scripts:
 
 - See [deployment architecture and migration](../docs/deployment.md) for the shared
   Python launcher, device settings, build profiles, and staged deployment upgrade.
-- After deploying source changes, **Build Profile** creates the verified binaries.
-  Startup refuses stale or unverified executables instead of compiling implicitly.
+- **Stage Release** packages required files, verifies checksums, acquires the
+  device deployment lock, and creates an isolated verified build. Ready releases
+  are not activated yet; activation and rollback are the next stage.
+- Python is needed on the desktop; the Jetson needs Python, the pinned Rust
+  toolchain, native libraries, and cached dependencies. Builds are offline.
 - **Start Diagnostics** currently replaces production capture with the legacy
   bridge. Service-attached monitoring is planned.
 

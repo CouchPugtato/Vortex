@@ -28,6 +28,7 @@
     "files": [
       "main.js",
       "launch-config.js",
+      "staging-deploy.js",
       "preload.js",
       "renderer/**/*",
       "package.json"

@@ -133,6 +133,7 @@ function pushPreviewFrame(dataUrl) {
 }
 
 function setDeployIndicator(stateKind, text, percent = null) {
+  el.deployBtn.disabled = stateKind === "active";
   if (deployFadeTimer) {
     clearTimeout(deployFadeTimer);
     deployFadeTimer = null;
@@ -333,6 +334,7 @@ function readAppConfigFromUI() {
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
+    runtime_config_path: el.runtimePath.value.trim(),
     tag_map_path: tagMapPath,
     onnx_model_path: onnxPath,
     jetson_max_watts: jetsonWatts,
@@ -1173,14 +1175,14 @@ async function init() {
       setDeployIndicator("active", "0%", 0);
       const result = await window.vortexApi.deployStart(cfg);
       if (!result?.ok) throw new Error(result?.error || "Deploy could not start");
-      appendLog("Deploy started.");
+      appendLog("Release staging started. The running installation will stay unchanged.");
     } catch (err) {
       setDeployIndicator("error", "Deploy start failed", 0);
       appendLog(`Deploy start failed: ${err.message}`);
     }
   });
 
-  el.buildMainBtn.addEventListener("click", async () => {
+  el.buildMainBtn?.addEventListener("click", async () => {
     try {
       const cfg = readAppConfigFromUI();
       setBuildIndicator("active", "Queued...", 0);
@@ -1374,13 +1376,11 @@ async function init() {
   window.vortexApi.onDeployProgress((p) => {
     const status = String(p?.status || "");
     const percent = Number(p?.percent || 0);
-    const cur = Number(p?.current || 0);
-    const total = Number(p?.total || 0);
-    const msg = total > 0 ? `${percent}% (${cur}/${total})` : `${percent}%`;
+    const msg = String(p?.text || `${percent}%`);
     if (status === "done") {
-      setDeployIndicator("done", "✓ Deployed", 100);
+      setDeployIndicator("done", msg, 100);
     } else if (status === "error") {
-      setDeployIndicator("error", "✕ Deploy failed", percent);
+      setDeployIndicator("error", msg, percent);
     } else {
       setDeployIndicator("active", msg, percent);
     }

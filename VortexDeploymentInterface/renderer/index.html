@@ -109,11 +109,11 @@
           <div class="row wrap status-row">
             <button id="togglePipeline" class="accent">Start Diagnostics</button>
             <button id="nextCamera">Next Camera</button>
-            <button id="deployBtn">Deploy</button>
-            <button id="buildMainBtn">Build Profile</button>
+            <button id="deployBtn">Stage Release</button>
           </div>
           <div class="hint">Diagnostics currently replaces production camera capture with the legacy
-            single-camera bridge. Build the selected profile after deploying source changes.</div>
+            single-camera bridge. Stage Release uploads and builds an isolated release;
+            it does not replace or restart the running installation.</div>
           <div class="row wrap progress-row">
             <div id="monitorProgressWrap" class="monitor-progress is-hidden">
               <progress id="monitorProgress" max="100" value="0"></progress>

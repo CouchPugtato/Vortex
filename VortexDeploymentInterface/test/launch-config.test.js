@@ -62,4 +62,5 @@ test("every generated profile and NT mode is accepted by the Python launcher", (
 test("packaged app includes the launch configuration module", () => {
   const pkg = require("../package.json");
   assert(pkg.build.files.includes("launch-config.js"));
+  assert(pkg.build.files.includes("staging-deploy.js"));
 });

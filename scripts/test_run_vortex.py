@@ -37,6 +37,8 @@ class LauncherTests(unittest.TestCase):
     def fake_build(self, command, **kwargs):
         for name in (runtime.MAIN, runtime.BRIDGE):
             binary = runtime.binary_path(self.root, name)
+            if "--target-dir" in command:
+                binary = Path(command[command.index("--target-dir")+1])/"release"/binary.name
             binary.parent.mkdir(parents=True, exist_ok=True)
             binary.write_bytes(b"executable")
             binary.chmod(0o755)
@@ -172,6 +174,15 @@ class LauncherTests(unittest.TestCase):
         self.build()
         self.config["cameras"] = [1, 3]
         self.config["udp"]["port"] = 9999
+        runtime.checked_binary(self.root, self.config)
+
+    def test_cache_build_copies_private_artifacts_into_release(self):
+        cache = self.root/"external-cache"
+        call = self.build(cache_dir=cache)
+        self.assertEqual(call.args[0][call.args[0].index("--target-dir")+1], str(cache.resolve()))
+        binary = runtime.checked_binary(self.root, self.config)
+        (cache/"release"/binary.name).write_bytes(b"next build")
+        self.assertEqual(binary.read_bytes(), b"executable")
         runtime.checked_binary(self.root, self.config)
 
     def test_changed_sources_during_build_are_not_stamped(self):
