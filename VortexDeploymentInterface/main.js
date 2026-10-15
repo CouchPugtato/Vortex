@@ -6,6 +6,7 @@ const { Client } = require("ssh2");
 const crypto = require("crypto");
 const { LAUNCHER, buildDeviceConfig } = require("./launch-config");
 const { stageProject } = require("./staging-deploy");
+const { operateRelease, releaseStatus } = require("./activation-deploy");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const LEGACY_REPO_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
@@ -110,6 +111,11 @@ function emitBridgeState(state) {
 function emitDeployProgress(progress) {
   const win = getWindow();
   if (win) win.webContents.send("deploy-progress", progress);
+}
+
+function emitReleaseState(state) {
+  const win = getWindow();
+  if (win) win.webContents.send("release-state", state);
 }
 
 function emitMonitorStartProgress(progress) {
@@ -704,7 +710,7 @@ function sftpWriteFile(sftp, remotePath, bytes) {
 }
 
 async function deployProject(settings) {
-  return stageProject(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), {
+  const result = await stageProject(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), {
     appDir: __dirname,
     connect: connectSsh,
     execChecked,
@@ -713,6 +719,12 @@ async function deployProject(settings) {
     log: emitLog,
     progress: (event) => emitDeployProgress({ ...event, current: event.percent, total: 100 })
   });
+  if (result.release_id) {
+    const persisted = await readPersistedAppConfig();
+    await writeJson(APP_CONFIG_PATH, { ...persisted, last_ready_release: result.release_id });
+    emitReleaseState({ ready: [result.release_id] });
+  }
+  return result;
 }
 
 // Legacy IPC callers also stage a new snapshot; they cannot rebuild the active tree.
@@ -1156,10 +1168,39 @@ function startStaging(settings) {
 ipcMain.handle("deploy-start", async (_evt, settings) => startStaging(settings));
 ipcMain.handle("build-main-start", async (_evt, settings) => startStaging(settings));
 
+function activationDependencies() {
+  return { connect: connectSsh, execChecked, log: emitLog, progress: emitDeployProgress, user: FIXED_SSH.user };
+}
+
+ipcMain.handle("release-status", async (_evt, settings) => {
+  const state = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
+  emitReleaseState(state);
+  return state;
+});
+
+ipcMain.handle("release-operate", async (_evt, settings, action, release) => {
+  if (stagingInFlight || monitorManager.conn || serviceGuard.activeCount) {
+    return { ok: false, error: "Wait for the current operation and stop diagnostics before switching releases" };
+  }
+  stagingInFlight = true;
+  operateRelease(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), action, release, activationDependencies())
+    .then(async () => {
+      const state = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
+      emitReleaseState(state);
+    })
+    .catch((error) => emitLog(`Release operation failed: ${error.message}`))
+    .finally(() => { stagingInFlight = false; });
+  return { ok: true };
+});
+
 ipcMain.handle("monitor-start", async (_evt, settings) => {
   emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });
   let activityStarted = false;
   try {
+    const overview = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
+    if (overview.active?.kind === "release" || overview.pending) {
+      throw new Error("A managed release is selected. Legacy diagnostics cannot replace it; service-attached preview is pending.");
+    }
     await beginManagedToolActivity(settings, "monitor");
     activityStarted = true;
     await monitorManager.start(settings);

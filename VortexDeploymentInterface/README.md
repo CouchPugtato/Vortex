@@ -40,12 +40,16 @@ Available packaging scripts:
 - See [deployment architecture and migration](../docs/deployment.md) for the shared
   Python launcher, device settings, build profiles, and staged deployment upgrade.
 - **Stage Release** packages required files, verifies checksums, acquires the
-  device deployment lock, and creates an isolated verified build. Ready releases
-  are not activated yet; activation and rollback are the next stage.
+  device deployment lock, and creates an isolated verified build.
+- **Activate** checks the executable, libraries, saved-image smoke test, and fresh
+  camera processing. A failed start restores the previous release/configuration.
+  **Rollback** switches back manually. First-time service setup needs sudo; the app
+  reports the setup command if noninteractive preparation is unavailable.
 - Python is needed on the desktop; the Jetson needs Python, the pinned Rust
   toolchain, native libraries, and cached dependencies. Builds are offline.
 - **Start Diagnostics** currently replaces production capture with the legacy
-  bridge. Service-attached monitoring is planned.
+  bridge and is blocked once a managed release is selected. Service-attached
+  monitoring is planned.
 
 - Connection errors like `ECONNREFUSED` / `10061` mean host/port are unreachable.
 - Preview command template supports:

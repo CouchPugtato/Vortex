@@ -8,6 +8,10 @@ mod detector;
 mod pose;
 #[path = "../../../src/tag_refine.rs"]
 mod tag_refine;
+#[path = "../../../src/runtime_health.rs"]
+mod runtime_health;
+#[path = "../../../src/deployment_smoke.rs"]
+mod deployment_smoke;
 
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Vector3};
@@ -47,6 +51,11 @@ fn rotation_rows(r: &Matrix3<f64>) -> [[f64; 3]; 3] {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--deployment-smoke") {
+        let path = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("Missing smoke image"))?;
+        println!("VORTEX_SMOKE {}", deployment_smoke::run(std::path::Path::new(&path))?);
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("--stream") {
         return stream();
     }

@@ -169,6 +169,9 @@ echo "==> Validating production launcher"
 sudo -u "${RUN_USER}" -H python3 "${APP_DIR}/scripts/run_vortex.py" --check
 
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+MANAGED_ROOT="${APP_DIR}.deployment"
+
+if [[ ! -f "${MANAGED_ROOT}/managed-service.json" ]]; then
 echo "==> Installing ${SERVICE_NAME}"
 cat > "${SERVICE_PATH}" <<EOF
 [Unit]
@@ -193,6 +196,21 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
+fi
+
+echo "==> Preparing managed activation and service control"
+sudo -u "${RUN_USER}" -H python3 -c '
+from pathlib import Path
+import sys
+Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)
+lock = Path.home()/".local/state/vortex/deployment.lock"
+lock.parent.mkdir(parents=True, exist_ok=True)
+lock.touch(exist_ok=True)
+' "${MANAGED_ROOT}"
+python3 "${APP_DIR}/scripts/activate_release.py" install-service \
+  --root "${MANAGED_ROOT}" --legacy-root "${APP_DIR}" \
+  --service "${SERVICE_NAME}" --user "${RUN_USER}"
 systemctl restart "${SERVICE_NAME}"
 
 echo "==> Done"

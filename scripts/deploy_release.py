@@ -20,7 +20,8 @@ MAX_FILES = 10000
 MAX_BYTES = 2 * 1024**3
 MAX_MANIFEST = 2 * 1024**2
 ROOT_FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", "run_vortex.sh"}
-SCRIPT_FILES = {"scripts/run_vortex.py", "scripts/deploy_release.py"}
+SCRIPT_FILES = {"scripts/run_vortex.py", "scripts/deploy_release.py", "scripts/activate_release.py",
+                "simulation_tests/reference/dim_noisy_tag.png"}
 RESOURCE_FILES = {"config/device.json", "config/config.json", "config/apriltag_map.json",
                   "config/2026-rebuilt-welded.json", "models/rockpaperscizzors.engine"}
 PROFILES = {"cpu": [], "gpu": ["gpu"], "tensorrt": ["tensorrt"], "gpu-tensorrt": ["gpu", "tensorrt"]}
@@ -45,9 +46,19 @@ def atomic_json(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def sync_directory(path):
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def sha256(path):

@@ -9,10 +9,11 @@ const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { Writable } = require("node:stream");
 
-function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })) {
+function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" }), operation = async () => ({ state: "active" })) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-deployment-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [];
+  const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [], activationCalls = [];
+  const overview = { ready: ["new"], active: { kind: "none" }, previous: { kind: "none" } };
   class FakeClient extends EventEmitter {
     connect() { queueMicrotask(() => this.emit("ready")); return this; }
     end() {}
@@ -49,13 +50,17 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
       if (name === "electron") return electron;
       if (name === "ssh2") return { Client: FakeClient };
       if (name === "./launch-config") return require("../launch-config");
+      if (name === "./activation-deploy") return {
+        operateRelease: async (...args) => { activationCalls.push(args); return operation(...args); },
+        releaseStatus: async () => overview
+      };
       if (name === "./staging-deploy") return { stageProject: async (...args) => { stageCalls.push(args); return stage(...args); } };
       return require(name);
     } };
   const source = fs.readFileSync(path.join(appDir, "main.js"), "utf8");
   vm.runInNewContext(source+"\nmodule.exports = { APP_CONFIG_PATH, stopManagedStartupService, " +
     "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging };", sandbox);
-  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, directory, connection: new FakeClient() };
+  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, overview, directory, connection: new FakeClient() };
 }
 
 const settings = { local_path: "C:/source/Vortex", remote_path: "/home/vortex/deployments",
@@ -129,4 +134,20 @@ test("diagnostics cannot bypass the launcher via legacy command settings", async
     { ...settings, monitor_start_cmd: "unverified-program", preview_camera_index: 2 });
   assert(command.endsWith("python3 scripts/run_vortex.py --debug-bridge --camera 2"));
   assert(!command.includes("unverified-program"));
+});
+
+test("activation IPC shares the staging guard and blocks legacy diagnostics on managed releases", async (t) => {
+  let finish;
+  const h = harness(t, () => 0, undefined, () => new Promise((resolve) => { finish = resolve; }));
+  const operate = h.handlers.get("release-operate");
+  assert.equal((await operate(null, settings, "activate", "new")).ok, true);
+  assert.equal((await operate(null, settings, "rollback", "new")).ok, false);
+  assert.equal(h.activationCalls.length, 1);
+  finish({ state: "active" });
+  await new Promise(setImmediate);
+  h.overview.active = { kind: "release", release_id: "new" };
+  const result = await h.handlers.get("monitor-start")(null, { ...settings, last_ready_release: "new" });
+  assert.equal(result.ok, false);
+  assert(result.error.includes("managed release"));
+  assert.equal(h.commands.length, 0);
 });

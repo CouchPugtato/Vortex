@@ -110,10 +110,16 @@
             <button id="togglePipeline" class="accent">Start Diagnostics</button>
             <button id="nextCamera">Next Camera</button>
             <button id="deployBtn">Stage Release</button>
+            <select id="readyRelease" aria-label="Prepared release"><option value="">Stage a release first</option></select>
+            <button id="activateRelease">Activate</button>
+            <button id="rollbackRelease">Rollback</button>
+            <button id="refreshReleases">Refresh Releases</button>
           </div>
+          <div id="releaseState" class="hint">No release selected.</div>
           <div class="hint">Diagnostics currently replaces production camera capture with the legacy
             single-camera bridge. Stage Release uploads and builds an isolated release;
-            it does not replace or restart the running installation.</div>
+            it does not restart the running installation. Activate and Rollback restart the
+            service and verify every configured camera.</div>
           <div class="row wrap progress-row">
             <div id="monitorProgressWrap" class="monitor-progress is-hidden">
               <progress id="monitorProgress" max="100" value="0"></progress>

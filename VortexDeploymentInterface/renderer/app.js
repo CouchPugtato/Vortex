@@ -45,6 +45,11 @@ const el = {
   runtimeForm: document.querySelector("#runtimeForm"),
   deployBtn: document.querySelector("#deployBtn"),
   buildMainBtn: document.querySelector("#buildMainBtn"),
+  readyRelease: document.querySelector("#readyRelease"),
+  activateRelease: document.querySelector("#activateRelease"),
+  rollbackRelease: document.querySelector("#rollbackRelease"),
+  refreshReleases: document.querySelector("#refreshReleases"),
+  releaseState: document.querySelector("#releaseState"),
   buildProfile: document.querySelector("#buildProfile"),
   deployProgressWrap: document.querySelector("#deployProgressWrap"),
   deployProgress: document.querySelector("#deployProgress"),
@@ -134,6 +139,8 @@ function pushPreviewFrame(dataUrl) {
 
 function setDeployIndicator(stateKind, text, percent = null) {
   el.deployBtn.disabled = stateKind === "active";
+  el.activateRelease.disabled = stateKind === "active";
+  el.rollbackRelease.disabled = stateKind === "active";
   if (deployFadeTimer) {
     clearTimeout(deployFadeTimer);
     deployFadeTimer = null;
@@ -243,6 +250,10 @@ function setBuildIndicator(stateKind, text, percent = null) {
 
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
+  if (cfg.last_ready_release && ![...el.readyRelease.options].some((option) => option.value === cfg.last_ready_release)) {
+    el.readyRelease.add(new Option(cfg.last_ready_release, cfg.last_ready_release));
+    el.readyRelease.value = cfg.last_ready_release;
+  }
   state.tagMapPath = String(cfg?.tag_map_path || state.tagMapPath || "");
   state.onnxPath = String(cfg?.onnx_model_path || state.onnxPath || "");
   if (el.tagMapPath) el.tagMapPath.value = state.tagMapPath;
@@ -1180,6 +1191,39 @@ async function init() {
       setDeployIndicator("error", "Deploy start failed", 0);
       appendLog(`Deploy start failed: ${err.message}`);
     }
+  });
+
+  for (const [button, action] of [[el.activateRelease, "activate"], [el.rollbackRelease, "rollback"]]) {
+    button.addEventListener("click", async () => {
+      try {
+        const cfg = { ...readAppConfigFromUI(), last_ready_release: el.readyRelease.value };
+        if (!cfg.last_ready_release) throw new Error("Stage/select a release first");
+        setDeployIndicator("active", `Starting ${action}...`, 0);
+        const response = await window.vortexApi.releaseOperate(cfg, action, cfg.last_ready_release);
+        if (!response?.ok) throw new Error(response?.error || "Release operation could not start");
+      } catch (error) {
+        setDeployIndicator("error", error.message, 0);
+        appendLog(error.message);
+      }
+    });
+  }
+  el.refreshReleases.addEventListener("click", async () => {
+    try {
+      await window.vortexApi.releaseStatus({ ...readAppConfigFromUI(), last_ready_release: el.readyRelease.value });
+    } catch (error) { appendLog(`Release status failed: ${error.message}`); }
+  });
+  window.vortexApi.onReleaseState((overview) => {
+    if (overview.ready?.length) {
+      const existing = el.readyRelease.value;
+      el.readyRelease.replaceChildren(...overview.ready.map((id) => new Option(id, id)));
+      el.readyRelease.value = overview.ready.includes(existing) ? existing : overview.ready[0];
+      state.appConfig.last_ready_release = el.readyRelease.value;
+    }
+    const describe = (selection) => selection?.kind === "release" ? selection.release_id : selection?.kind || "none";
+    if (overview.active) el.togglePipeline.disabled = overview.active.kind === "release" || Boolean(overview.pending);
+    el.releaseState.textContent = overview.active ?
+      `Selected: ${describe(overview.active)} | Previous: ${describe(overview.previous)}${overview.pending ? " | switch pending" : ""}` :
+      "Release ready; Activate switches it after validation.";
   });
 
   el.buildMainBtn?.addEventListener("click", async () => {

@@ -2,8 +2,9 @@
 
 **Stage Release** now packages, uploads, verifies, and builds a versioned release
 without replacing files in the running installation or stopping its service.
-Activation, camera/runtime health checks, rollback, and service-attached monitoring
-are still pending. A ready release is explicitly **not activated**.
+**Activate** performs preflight checks, switches the systemd service, and verifies
+camera health. **Rollback** restores the previous release/configuration. A ready
+release remains **not activated** until Activate is selected.
 
 ## Stage a release
 
@@ -14,8 +15,9 @@ default `python` (Windows) or `python3` command is unavailable.
 
 The app creates one compressed snapshot containing Rust sources, Cargo manifests,
 the toolchain pin, launch scripts, and selected configuration/field resources.
-Desktop credentials, virtual environments, captures, tests, documentation media,
-and existing build outputs are excluded. When TensorRT object detection is enabled,
+Desktop credentials, virtual environments, captures, test suites, documentation
+media, and existing build outputs are excluded. One fixed saved-image smoke
+fixture is included as a runtime validation resource. When TensorRT object detection is enabled,
 the currently supported canonical `models/rockpaperscizzors.engine` is required and
 included. Engine compatibility still needs hardware validation.
 
@@ -68,6 +70,62 @@ To inspect a saved job on the Jetson:
 python3 /home/vortex/deployments/Vortex.deployment/incoming/RELEASE_ID/controller.py status --root /home/vortex/deployments/Vortex.deployment --release-id RELEASE_ID
 ```
 
+## Activate and roll back
+
+After Stage Release completes, select its ID and click **Activate**. **Refresh
+Releases** lists prepared releases and the committed selected/previous versions.
+The desktop remembers its last prepared release across restarts.
+
+Under the same device lock, activation:
+
+1. Rechecks payload/build hashes and checks the ELF machine against the device.
+2. Checks shared libraries with `ldd` and runs the production executable's
+   `--deployment-smoke` mode on the fixed noisy tag-1 image. The CPU detector/pose
+   solver must recover its known position within 20 cm; no camera is opened.
+3. Flushes release files and records a durable activation journal before stopping
+   the service.
+4. Atomically replaces `current`, selects the release's own configuration snapshot,
+   and starts the service through its stable management entry point.
+5. Requires three seconds of advancing health reports within a 30-second startup
+   deadline. Every configured camera must process fresh frames with successful
+   required detector backends. A GPU profile falling back to CPU fails this check.
+6. Commits the new/previous selections only after health verification.
+
+Health is written atomically to `Vortex.deployment/health.json` and includes release
+ID, an activation-specific launch token, service PID, monotonic uptime, and per-camera
+frame counts/age/backend status. Verification checks the actual systemd MainPID,
+requires report/frame counters to advance, and rejects stale data. AprilTags and
+robot-network connectivity are not required for camera health. This is startup
+verification, not continuous pose-accuracy monitoring or a runtime watchdog.
+
+On startup failure, the controller stops the failed version, restores the previous
+release and configuration, restarts it, and checks its health. **Rollback** manually
+switches to the saved previous selection through the same transaction. A legacy
+installation restored during the first migration can only be checked for a running
+process; its old binary does not expose the new camera-health protocol. The result
+explicitly says `legacy_process_only`. A failed first installation with no previous
+selection remains stopped. If restoration also fails, the result is
+`rollback_failed` and its journal/logs remain available; it never reports success.
+
+Activation/rollback are detached jobs, so closing the desktop does not abandon the
+transaction. If power fails before confirmation, the systemd entry point restores
+the previous selection before starting a runtime. A durable confirmed switch is
+kept. The journal uses boot ID plus process start identity to distinguish an active
+worker from an interrupted one. Recovery records whether camera health was actually
+checked; recovery before service startup does not claim it was.
+
+State files are `selection.json`, `active.json`, `previous.json`, `activation.json`
+(only while pending), and `recovery.json`. Operation logs/status live in `jobs/`.
+Manual recovery, using the deployed controller on the Jetson:
+
+```text
+python3 /home/vortex/deployments/Vortex.deployment/activate_release.py recover --root /home/vortex/deployments/Vortex.deployment
+```
+
+A failed confirmation or interrupted switch never edits either release's camera
+calibration/mount configuration. Editing settings for the next deployment creates
+another snapshot; it does not alter an already prepared release.
+
 ## Runtime and configuration
 
 Production runs `dumapril-taglocalization` through `scripts/run_vortex.py`.
@@ -84,8 +142,8 @@ launcher. Startup never downloads dependencies or builds an executable.
 The launcher removes inherited values for the settings it manages and applies this
 file, so an old shell environment cannot override the selected network destination.
 It validates device settings, camera calibration structure, and field-map geometry
-before executing a verified binary. Camera availability and runtime library checks
-are not yet implemented.
+before executing a verified binary. Activation additionally checks ELF architecture,
+runtime libraries, a saved-image CPU smoke test, and actual camera processing.
 
 The interface snapshots camera/network/profile settings into the package's
 `config/device.json`; its selected field map uses `config/apriltag_map.json`.
@@ -142,10 +200,20 @@ install a service. A new device still needs the bootstrap script after JetPack i
 installed and an initial project copy is available. Missing offline dependencies
 need explicit online provisioning using the command above.
 
-Existing source deployments continue running at their existing paths. Stage Release
-does not migrate their systemd unit or select a newly prepared release. For now,
-keep using the existing installation for production; activation and migration of
-its service to a ready release are the next implementation stage.
+Existing source deployments continue running until Activate. First-time service
+preparation requires root privileges; Activate attempts noninteractive sudo and
+reports a concrete setup command if permission is unavailable. Run that command
+once in an SSH terminal using sudo, then retry Activate. The updated bootstrap also
+performs this preparation. Existing packages from before this feature must be
+restaged because they lack the health/smoke modules.
+
+The installer supports migration of the existing `run_vortex.sh` systemd unit.
+It rejects unexpected launch commands and service drop-ins rather than discarding
+custom behavior. Managed service/root paths must not contain spaces or systemd
+specifier characters. It backs up the old unit, installs stable management scripts,
+and grants only start/stop/reset-failed permission for that specific unit through
+a validated sudoers entry. Installing/upgrading the controller itself still needs
+root; ordinary Activate/Rollback operations run as the runtime user.
 
 `scripts/setup_jetson_environment.sh` now installs Python, provisions the pinned
 toolchain, grants the runtime user membership in `video`, builds through the shared
@@ -160,13 +228,14 @@ The service-control commands use noninteractive sudo and require suitable permis
 
 ## Legacy diagnostics
 
-**Start Diagnostics** still temporarily replaces production capture with
+Before managed activation, **Start Diagnostics** can temporarily replace production capture with
 `orin_bridge`, which provides the existing single-camera preview and diagnostics
 but not the production telemetry. It now uses the same Python launcher and runtime
 configuration, verifies its build before launching, and never installs packages,
 deletes lockfiles, or silently chooses another build profile.
 
-Service-attached preview will replace this interruption in a later stage.
+Legacy diagnostics is blocked when a managed release is selected so it cannot
+kill/reconfigure production capture. Service-attached preview remains a later stage.
 
 ## Local checks
 
@@ -187,9 +256,13 @@ Jetson validation.
 
 ## Remaining implementation order
 
-1. Add native/runtime library and smoke-test validation, release activation,
-   application health, rollback, and interrupted-activation recovery.
-2. Manage jobs through systemd, add UI reattachment/status/rollback, and replace
-   legacy diagnostics with service-owned preview.
-3. Add fresh-device compatibility checks, guided initialization, offline provisioning,
+1. Manage jobs through systemd, add automatic UI job reattachment and service-owned
+   preview, and add a continuous frame-processing watchdog.
+2. Add fresh-device compatibility checks, guided initialization, offline provisioning,
    and release retention cleanup.
+
+Linux service installation, sudoers validation, real camera timing, GPU/TensorRT,
+and boot recovery still require Jetson testing. Local transaction tests inject
+service failures and power interruption; Windows cannot exercise the real Linux
+systemd/symlink operations. The Rust smoke/health modules are compiled and tested
+through the native CPU replay harness.

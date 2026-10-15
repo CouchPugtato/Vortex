@@ -7,6 +7,8 @@ mod undistort;
 mod preprocess;
 mod pose;
 mod yolo_detector;
+mod runtime_health;
+mod deployment_smoke;
 
 use nalgebra as _;
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
@@ -79,6 +81,8 @@ struct PipelineStats {
     detections: ProcessedDetections,
     joint_robot_pose: Option<(f64, f64, usize, f64)>,
     timestamp: Instant,
+    backends: Vec<String>,
+    pipeline_ok: bool,
 }
 
 struct NtCameraTopics {
@@ -469,6 +473,11 @@ fn main() -> anyhow::Result<()> {
     install_filtered_panic_hook();
 
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--deployment-smoke") {
+        anyhow::ensure!(args.len() == 3, "Usage: --deployment-smoke IMAGE");
+        println!("VORTEX_SMOKE {}", deployment_smoke::run(Path::new(&args[2]))?);
+        return Ok(());
+    }
     
     // parse camera indices from args
     // examples: "0", "0,1", "0 2", "0, 2"
@@ -497,6 +506,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if camera_indices.is_empty() { camera_indices.push(0); }
+    let mut health = runtime_health::Reporter::from_env(&camera_indices)?;
 
     println!("Starting Multi-Camera AprilTag Detector");
     println!("Cameras: {:?}", camera_indices);
@@ -626,7 +636,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        if let Ok(stat) = rx_stats.recv() {
+        if let Some(reporter) = health.as_mut() {
+            if let Err(error) = reporter.flush() { eprintln!("Health report failed: {error}"); }
+        }
+        if let Ok(stat) = rx_stats.recv_timeout(Duration::from_millis(100)) {
+            if let Some(reporter) = health.as_mut() {
+                reporter.record(stat.camera_index, stat.timestamp, stat.backends.clone(), stat.pipeline_ok);
+            }
             cam_detections.insert(stat.camera_index, stat.detections.0);
             cam_joint_pose.insert(stat.camera_index, stat.joint_robot_pose);
 
@@ -1073,6 +1089,10 @@ fn spawn_camera_pipeline(
                 }
 
                 let mut processed_detections = Vec::new();
+                let backends: Vec<String> = detectors.iter().map(|d| d.name().to_string()).collect();
+                let mut pipeline_ok = backends.iter().any(|name| name.starts_with("apriltag-")) &&
+                    (!cfg!(feature = "tensorrt") || !object_detection_config.use_nn ||
+                     backends.iter().any(|name| name == "yolo-tensorrt"));
                 let mut joint_object_points: Vec<Vector3<f64>> = Vec::new();
                 let mut joint_image_points: Vec<(f64, f64)> = Vec::new();
                 let mut joint_initial_poses: Vec<pose::Pose> = Vec::new();
@@ -1082,6 +1102,7 @@ fn spawn_camera_pipeline(
                         Ok(d) => d,
                         Err(e) => {
                             eprintln!("Detector {} failed on cam {}: {}", detector.name(), camera_index, e);
+                            pipeline_ok = false;
                             continue;
                         }
                     };
@@ -1272,6 +1293,8 @@ fn spawn_camera_pipeline(
                     detections: ProcessedDetections(processed_detections),
                     joint_robot_pose,
                     timestamp: Instant::now(),
+                    backends,
+                    pipeline_ok,
                 };
 
                 if tx_stats.send(stat).is_err() {

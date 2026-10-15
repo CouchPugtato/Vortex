@@ -138,6 +138,7 @@ def environment(root, config, inherited=None):
         env.pop(name, None)
     nt, udp = config["networktables"], config["udp"]
     env.update(VORTEX_RUNTIME_CONFIG=str(absolute(root, config["runtime_config"])),
+               VORTEX_MAIN_GPU="1" if "gpu" in PROFILES[config["build_profile"]] else "0",
                VORTEX_TAG_MAP=str(absolute(root, config["tag_map"])),
                VORTEX_NT_ENABLE=str(int(nt["enabled"])), VORTEX_NT_TABLE=nt["table"],
                VORTEX_UDP_ENABLE=str(int(udp["enabled"])),
