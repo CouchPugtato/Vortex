@@ -3,11 +3,13 @@ const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
 const { Client } = require("ssh2");
+const crypto = require("crypto");
+const { LAUNCHER, buildDeviceConfig } = require("./launch-config");
 
-const APP_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
+const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
+const LEGACY_REPO_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
 const LEGACY_APP_CONFIG_PATH = path.join(__dirname, "vortex_config.json");
 const LEGACY_USERDATA_CONFIG_PATH = path.join(app.getPath("userData"), "vortex_config.json");
-const DEFAULT_RUNTIME_CONFIG_PATH = path.resolve(__dirname, "..", "config", "config.json");
 const FIXED_SSH = Object.freeze({
   port: "22",
   user: "vortex",
@@ -148,6 +150,7 @@ function defaultAppConfig() {
     preview_capture_cmd: "",
     jetson_max_watts: 15,
     startup_camera_indices: "0,1",
+    build_profile: "cpu",
     vortex_nt_enable: false,
     vortex_nt_mode: "team",
     vortex_nt_team: "509",
@@ -169,7 +172,11 @@ function withFixedSshConfig(cfg) {
 }
 
 function normalizeServiceName(name) {
-  return String(name || "").trim();
+  const value = String(name || "").trim();
+  if (value && !/^[a-zA-Z0-9][a-zA-Z0-9_.@:-]*\.service$/.test(value)) {
+    throw new Error("Startup service must be a valid .service unit name");
+  }
+  return value;
 }
 
 function hasManagedService(settings) {
@@ -182,9 +189,9 @@ async function stopManagedStartupService(settings, reason = "operation") {
   const serviceName = normalizeServiceName(cfg.startup_service_name);
   const conn = await connectSsh(cfg);
   try {
-    const stopSvc = await execCommand(conn, `sudo systemctl stop ${serviceName}`);
+    const stopSvc = await execCommand(conn, `sudo -n systemctl stop ${shSingle(serviceName)}`);
     if (stopSvc.code !== 0) {
-      emitLog(`Service stop failed (${reason}): ${stopSvc.stderr || stopSvc.stdout}`);
+      throw new Error(`Service stop failed (${reason}): ${stopSvc.stderr || stopSvc.stdout}`);
     } else {
       emitLog(`Service stopped (${reason}): ${serviceName}`);
     }
@@ -199,9 +206,9 @@ async function startManagedStartupService(settings, reason = "exit") {
   const serviceName = normalizeServiceName(cfg.startup_service_name);
   const conn = await connectSsh(cfg);
   try {
-    const startSvc = await execCommand(conn, `sudo systemctl start ${serviceName}`);
+    const startSvc = await execCommand(conn, `sudo -n systemctl start ${shSingle(serviceName)}`);
     if (startSvc.code !== 0) {
-      emitLog(`Service start failed (${reason}): ${startSvc.stderr || startSvc.stdout}`);
+      throw new Error(`Service start failed (${reason}): ${startSvc.stderr || startSvc.stdout}`);
     } else {
       emitLog(`Service started (${reason}): ${serviceName}`);
     }
@@ -214,10 +221,10 @@ async function beginManagedToolActivity(settings, label) {
   if (!hasManagedService(settings)) return;
   serviceGuard.lastSettings = withFixedSshConfig(settings);
   const wasIdle = serviceGuard.activeCount === 0;
-  serviceGuard.activeCount += 1;
   if (wasIdle) {
     await stopManagedStartupService(serviceGuard.lastSettings, label);
   }
+  serviceGuard.activeCount += 1;
 }
 
 function endManagedToolActivity() {
@@ -266,6 +273,11 @@ function portablePathFromAppDir(candidatePath) {
 async function readPersistedAppConfig() {
   const userCfg = await readJson(APP_CONFIG_PATH, null);
   if (userCfg) return userCfg;
+  const repoCfg = await readJson(LEGACY_REPO_CONFIG_PATH, null);
+  if (repoCfg) {
+    await writeJson(APP_CONFIG_PATH, repoCfg);
+    return repoCfg;
+  }
   const legacyUserCfg = await readJson(LEGACY_USERDATA_CONFIG_PATH, null);
   if (legacyUserCfg) {
     await writeJson(APP_CONFIG_PATH, legacyUserCfg);
@@ -290,7 +302,13 @@ async function readJson(filePath, fallback) {
 
 async function writeJson(filePath, obj) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(obj, null, 2), "utf8");
+  const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify(obj, null, 2), "utf8");
+    await fs.rename(temporary, filePath);
+  } finally {
+    await fs.unlink(temporary).catch(() => {});
+  }
 }
 
 function toPosix(p) {
@@ -307,80 +325,13 @@ function inferRemoteDeployFolder(remoteBase, localPath) {
   return `${(remoteBase || "").replace(/\/+$/, "")}/${basenameOrDefault(localPath, "Vortex")}`;
 }
 
-function stripOuterQuotes(s) {
-  const t = String(s || "").trim();
-  if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))) {
-    return t.slice(1, -1);
-  }
-  return t;
-}
-
 function shSingle(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-function normalizeCameraIndicesArg(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return "0,1";
-  const parts = text
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => Number(p))
-    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 63)
-    .map((n) => String(Math.trunc(n)));
-  if (parts.length === 0) return "0,1";
-  return [...new Set(parts)].join(",");
-}
-
-function normalizeNtMode(raw) {
-  const mode = String(raw || "").trim().toLowerCase();
-  if (mode === "local" || mode === "custom" || mode === "team") return mode;
-  return "team";
-}
-
-function normalizeUdpPort(raw, fallback = 5809) {
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  const i = Math.trunc(n);
-  if (i < 1 || i > 65535) return fallback;
-  return i;
-}
-
 function buildRunVortexScript(settings) {
-  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-  const cameraArg = normalizeCameraIndicesArg(settings.startup_camera_indices);
-  const ntTable = String(settings.vortex_nt_table || "/Vortex/Vision").trim() || "/Vortex/Vision";
-
-  const lines = [
-    "#!/usr/bin/env bash",
-    "set -euo pipefail",
-    "",
-    `APP_DIR=${shSingle(remoteTarget)}`,
-    "BIN=\"$APP_DIR/target/release/dumapril-taglocalization\"",
-    "CAMERAS=" + shSingle(cameraArg),
-    "",
-    "cd \"$APP_DIR\"",
-    "",
-    "if [[ ! -x \"$BIN\" ]]; then",
-    "  echo \"[vortex] release binary missing, building...\"",
-    "  cargo build --release --bin dumapril-taglocalization",
-    "fi",
-    "",
-    "export VORTEX_RUNTIME_CONFIG=\"${VORTEX_RUNTIME_CONFIG:-config/config.json}\"",
-    "export VORTEX_NT_ENABLE=0",
-    `export VORTEX_NT_TABLE=${shSingle(ntTable)}`,
-    "unset VORTEX_NT_TEAM",
-    "unset VORTEX_NT_SERVER",
-    "export VORTEX_UDP_ENABLE=1",
-    "export VORTEX_UDP_TARGET=10.5.9.2",
-    "export VORTEX_UDP_PORT=5091"
-  ];
-
-  lines.push("");
-  lines.push("exec \"$BIN\" \"$CAMERAS\"");
-  lines.push("");
-  return lines.join("\n");
+  buildDeviceConfig(settings);
+  return LAUNCHER;
 }
 
 async function syncRemoteStartupScript(conn, settings) {
@@ -388,12 +339,14 @@ async function syncRemoteStartupScript(conn, settings) {
   const runScriptPath = `${remoteTarget}/run_vortex.sh`;
   const content = Buffer.from(buildRunVortexScript(settings), "utf8");
   const sftp = await getSftp(conn);
-  await sftpWriteFile(sftp, runScriptPath, content);
-  await execCommand(
-    conn,
-    `bash -lc "sed -i 's/\\r$//' '${runScriptPath}'; chmod +x '${runScriptPath}'"`
-  );
-  emitLog("Remote startup script updated from Deployment Interface networking settings.");
+  await syncTagMapRemote(conn, settings);
+  const devicePath = `${remoteTarget}/config/device.json`;
+  await execChecked(conn, `mkdir -p -- ${shSingle(path.posix.dirname(devicePath))}`);
+  await sftpAtomicWrite(conn, sftp, devicePath,
+    Buffer.from(JSON.stringify(buildDeviceConfig(settings), null, 2)+"\n"));
+  await sftpAtomicWrite(conn, sftp, runScriptPath, content);
+  await execChecked(conn, `chmod +x -- ${shSingle(runScriptPath)}`);
+  emitLog("Production launcher and device settings synced (camera, build profile, NT, UDP).");
 }
 
 function tailForLog(text, limit = 6000) {
@@ -693,18 +646,30 @@ function execCommand(conn, command, { stream = false } = {}) {
   });
 }
 
+async function execChecked(conn, command) {
+  const result = await execCommand(conn, command);
+  if (result.code !== 0) {
+    throw new Error(`Remote command failed (${result.code}): ${tailForLog(result.stderr || result.stdout)}`);
+  }
+  return result;
+}
+
+async function sftpAtomicWrite(conn, sftp, destination, bytes) {
+  const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
+  try {
+    await sftpWriteFile(sftp, temporary, bytes);
+    await execChecked(conn, `mv -f -- ${shSingle(temporary)} ${shSingle(destination)}`);
+  } finally {
+    await execCommand(conn, `rm -f -- ${shSingle(temporary)}`).catch(() => {});
+  }
+}
+
 function getSftp(conn) {
   return new Promise((resolve, reject) => {
     conn.sftp((err, sftp) => {
       if (err) reject(err);
       else resolve(sftp);
     });
-  });
-}
-
-function sftpMkdir(sftp, remotePath) {
-  return new Promise((resolve) => {
-    sftp.mkdir(remotePath, { mode: 0o755 }, () => resolve());
   });
 }
 
@@ -752,6 +717,7 @@ async function walkFiles(rootDir) {
 }
 
 async function deployProject(settings) {
+  buildDeviceConfig(settings);
   const cfg = withFixedSshConfig(settings);
   const conn = await connectSsh(settings);
   try {
@@ -807,459 +773,48 @@ async function deployProject(settings) {
 }
 
 async function buildMainProgram(settings) {
+  buildDeviceConfig(settings);
   const conn = await connectSsh(settings);
   try {
-    emitMainBuildProgress({ status: "starting", percent: 0, text: "Connecting..." });
     const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-    const hasCargo = await execCommand(conn, `test -f '${remoteTarget}/Cargo.toml' && echo OK || echo NO`);
-    if (!String(hasCargo.stdout || "").includes("OK")) {
-      throw new Error(`No Cargo.toml found in ${remoteTarget}. Deploy first.`);
-    }
-
-    let total = 2;
-    try {
-      const meta = await execCommand(
-        conn,
-        `bash -lc "cd '${remoteTarget}' && cargo metadata --format-version 1 --locked 2>/dev/null"`
-      );
-      if (meta.code === 0) {
-        const parsed = JSON.parse(String(meta.stdout || "{}"));
-        const count = Array.isArray(parsed?.resolve?.nodes) ? parsed.resolve.nodes.length : 1;
-        total = Math.max(1, Number(count) || 1);
-      }
-    } catch (_err) {}
-    emitLog(`[0/${total}] Starting remote build`);
-    emitMainBuildProgress({ status: "active", percent: 0, text: `[0/${total}] Starting` });
-
-    const buildBins = [
-      { bin: "dumapril-taglocalization", label: "main" },
-      { bin: "orin_bridge", label: "bridge" }
-    ];
-
-    for (let buildIndex = 0; buildIndex < buildBins.length; buildIndex += 1) {
-      const { bin, label } = buildBins[buildIndex];
-      emitLog(`[${buildIndex}/${total}] Building ${label}: ${bin}`);
-      emitMainBuildProgress({
-        status: "active",
-        percent: Math.round((buildIndex * 100) / total),
-        text: `[${buildIndex}/${total}] Building ${label}`
-      });
-
-      const cmd = `bash -lc "cd '${remoteTarget}' && cargo build -vv --release --bin ${bin} 2>&1"`;
-      const channel = await execCommand(conn, cmd, { stream: true });
-      await new Promise((resolve, reject) => {
-        let pending = "";
-        const seen = new Set();
-        const onLine = (raw) => {
-          const line = stripAnsi(raw).trim();
-          if (!line) return;
-          const step = line.match(/^(Compiling|Fresh)\s+([^\s]+)\s+/);
-          if (step) {
-            const action = String(step[1]);
-            const crate = String(step[2]);
-            if (crate) seen.add(crate);
-            const synthetic = `[${buildIndex + 1}/${total}] ${label}: ${action} ${crate}`;
-            emitLog(synthetic);
-            const stageBase = (buildIndex * 100) / total;
-            const stageSpan = 100 / total;
-            const pct = Math.max(
-              0,
-              Math.min(99, Math.round(stageBase + (Math.min(seen.size, 50) / 50) * stageSpan))
-            );
-            emitMainBuildProgress({ status: "active", percent: pct, text: synthetic });
-            return;
-          }
-          if (/^Finished\b/i.test(line)) {
-            const msg = `[${buildIndex + 1}/${total}] ${label}: ${line}`;
-            emitLog(msg);
-            emitMainBuildProgress({
-              status: "active",
-              percent: Math.max(1, Math.round(((buildIndex + 1) * 100) / total) - 1),
-              text: msg
-            });
-          }
-        };
-
-        const onData = (buf) => {
-          pending += buf.toString("utf8");
-          const lines = pending.split(/\r?\n/);
-          pending = lines.pop() || "";
-          for (const ln of lines) onLine(ln);
-        };
-        channel.on("data", onData);
-        channel.stderr.on("data", onData);
-        channel.on("error", reject);
-        channel.on("close", (code) => {
-          if (pending.trim()) onLine(pending.trim());
-          if (code === 0) {
-            resolve();
-          } else {
-            emitMainBuildProgress({ status: "error", percent: 0, text: `✕ ${label} build failed` });
-            reject(new Error(`Remote ${label} build failed with exit code ${code}`));
-          }
-        });
-      });
-    }
-
-    emitMainBuildProgress({ status: "done", percent: 100, text: "✓ Main and bridge build complete" });
-
     await syncRemoteStartupScript(conn, settings);
-    emitLog("Post-build startup script sync complete.");
+    await execChecked(conn, `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --validate-config`);
+    emitMainBuildProgress({ status: "active", percent: 5, text: "Building pinned profile (offline)..." });
+    const command = `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --build --with-debug-bridge`;
+    const channel = await execCommand(conn, command, { stream: true });
+    await new Promise((resolve, reject) => {
+      let pending = "";
+      const onData = (bytes) => {
+        pending += bytes.toString("utf8");
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || "";
+        for (const line of lines) if (line.trim()) emitLog(stripAnsi(line));
+      };
+      channel.on("data", onData);
+      channel.stderr.on("data", onData);
+      channel.on("error", reject);
+      channel.on("close", (code) => {
+        if (pending.trim()) emitLog(stripAnsi(pending));
+        if (code === 0) resolve();
+        else reject(new Error(`Verified build failed (${code}). Initialize/cache dependencies first if offline packages are missing.`));
+      });
+    });
+    emitMainBuildProgress({ status: "done", percent: 100, text: "Verified production and debug builds complete" });
   } finally {
     conn.end();
   }
 }
 
-async function commandExistsInDir(conn, dir, binaryPath) {
-  const probe = await execCommand(
-    conn,
-    `test -x '${dir}/${binaryPath}' && echo OK || echo NO`
-  );
-  return String(probe.stdout || "").includes("OK");
-}
-
-function splitMonitorCommand(monitorStartCmd) {
-  const cmd = String(monitorStartCmd || "").trim();
-  const m = cmd.match(/^cd\s+(['"])(.*?)\1\s*&&\s*(.+)$/);
-  if (!m) return { cwd: null, tail: cmd };
-  return { cwd: m[2], tail: m[3] };
-}
-
-function withBridgeEnv(cmdTail, binary) {
-  const tail = String(cmdTail || "").trim();
-  if (binary !== "orin_bridge") return tail;
-  const envParts = [];
-  if (!/\bYOLO_ENGINE=/.test(tail)) envParts.push(`YOLO_ENGINE='models/rockpaperscizzors.engine'`);
-  if (envParts.length === 0) return tail;
-  return `${envParts.join(" ")} ${tail}`;
-}
-
 async function resolveMonitorCommand(conn, settings) {
-  const cfg = withFixedSshConfig(settings);
-  const raw = String(settings.monitor_start_cmd || "").trim();
-  const { cwd, tail } = splitMonitorCommand(raw);
-  const invoked = String(tail || raw);
-  const binaryMatch = invoked.match(/\.\/([^\s]+)/);
-  const binaryRelPath = binaryMatch ? binaryMatch[1] : "dumapril-taglocalization";
-  const binary = path.posix.basename(binaryRelPath);
-  const likelyTail = withBridgeEnv(tail || raw, binary);
-  const hasBinaryRef = likelyTail.includes(binary);
-
-  if (!hasBinaryRef) return raw;
-
-  async function ensureYoloEngineInDir(dir) {
-    if (binary !== "orin_bridge") return;
-    try {
-      const hasEngine = await execCommand(
-        conn,
-        `test -f '${dir}/models/rockpaperscizzors.engine' && echo OK || echo NO`
-      );
-      if (String(hasEngine.stdout || "").includes("OK")) return;
-
-      const hasOnnx = await execCommand(
-        conn,
-        `test -f '${dir}/models/rockpaperscizzors.onnx' && echo OK || echo NO`
-      );
-      if (!String(hasOnnx.stdout || "").includes("OK")) {
-        emitLog("YOLO engine missing and ONNX source not found; object detection disabled.");
-        return;
-      }
-
-      const hasTrtExec = await execCommand(conn, "bash -lc \"command -v trtexec >/dev/null 2>&1 && echo OK || echo NO\"");
-      if (!String(hasTrtExec.stdout || "").includes("OK")) {
-        emitLog("YOLO engine missing and trtexec not found on remote; object detection disabled.");
-        return;
-      }
-
-      const trtLog = `/tmp/vortex_trtexec_${Date.now()}.log`;
-      emitLog("Building TensorRT engine from models/rockpaperscizzors.onnx...");
-      const build = await execCommand(
-        conn,
-        `bash -lc "cd '${dir}' && trtexec --onnx=models/rockpaperscizzors.onnx --saveEngine=models/rockpaperscizzors.engine --fp16 --workspace=2048 > '${trtLog}' 2>&1; code=\\$?; tail -n 120 '${trtLog}'; exit \\$code"`
-      );
-      const out = String((build.stdout || "") + "\n" + (build.stderr || "")).trim();
-      if (out) emitLog(tailForLog(out));
-      if (build.code === 0) emitLog("TensorRT engine created: models/rockpaperscizzors.engine");
-      else emitLog("TensorRT engine build failed; object detection may remain disabled.");
-    } catch (_err) {
-      emitLog("Failed to prepare TensorRT engine automatically.");
-    }
-  }
-
-  const derived = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-  const candidates = [
-    cwd,
-    derived,
-    settings.remote_path,
-    `/home/${cfg.user}`,
-    `/home/${cfg.user}/deployments`,
-    `/home/${cfg.user}/deployments/Vortex`
-  ]
-    .map((v) => stripOuterQuotes(v))
-    .filter(Boolean)
-    .filter((v, i, arr) => arr.indexOf(v) === i);
-
-  for (const dir of candidates) {
-    try {
-      if (await commandExistsInDir(conn, dir, binaryRelPath)) {
-        await ensureYoloEngineInDir(dir);
-        const resolved = `cd '${dir}' && ${likelyTail}`;
-        emitLog(`Resolved monitor dir: ${dir}`);
-        return resolved;
-      }
-    } catch (_err) {
-      // try next candidate
-    }
-  }
-
-  async function buildBridgeInDir(dir, cargoCmd = "cargo") {
-    const logPath = `/tmp/vortex_orin_bridge_build_${Date.now()}.log`;
-    const variants = [
-      { label: "GPU+TensorRT", features: "gpu,tensorrt" },
-      { label: "TensorRT", features: "tensorrt" },
-      { label: "GPU", features: "gpu" },
-      { label: "CPU", features: "" }
-    ];
-
-    const runBuild = async (features, pre = "") => {
-      const featureArgs = features ? ` --features ${features}` : "";
-      return execCommand(
-        conn,
-        `bash -lc "cd '${dir}' && ${pre}${cargoCmd} build --release --bin orin_bridge${featureArgs} > '${logPath}' 2>&1; code=\\$?; tail -n 180 '${logPath}'; exit \\$code"`
-      );
-    };
-
-    const isLockErr = (text) =>
-      text.includes("lock file version 4") ||
-      text.includes("failed to parse lock file") ||
-      text.includes("feature `edition2024` is required");
-
-    let sawLockErr = false;
-    let last = null;
-
-    for (const v of variants) {
-      emitLog(`Trying orin_bridge build variant: ${v.label}${v.features ? ` (${v.features})` : ""}`);
-      const out = await runBuild(v.features);
-      last = out;
-      if (out.code === 0) {
-        emitLog(`Built orin_bridge variant: ${v.label}`);
-        return { ok: true, output: out };
-      }
-      const text = String((out.stdout || "") + "\n" + (out.stderr || "")).trim();
-      sawLockErr = sawLockErr || isLockErr(text);
-      if (text) emitLog(tailForLog(text));
-    }
-
-    if (!sawLockErr) return { ok: false, output: last };
-
-    emitLog(`Lockfile incompatible on remote in ${dir}; retrying build variants without Cargo.lock...`);
-    for (const v of variants) {
-      emitLog(`Retrying orin_bridge build variant: ${v.label}${v.features ? ` (${v.features})` : ""}`);
-      const out = await runBuild(v.features, "rm -f Cargo.lock && ");
-      last = out;
-      if (out.code === 0) {
-        emitLog(`Built orin_bridge variant after lock reset: ${v.label}`);
-        return { ok: true, output: out };
-      }
-      const text = String((out.stdout || "") + "\n" + (out.stderr || "")).trim();
-      if (text) emitLog(tailForLog(text));
-    }
-    return { ok: false, output: last };
-  }
-
-  async function ensureBridgeBuildDeps() {
-    const pw = shSingle(cfg.pass || "");
-    emitLog("Ensuring remote build dependencies for orin_bridge...");
-    const depInstall = await execCommand(
-      conn,
-      `bash -lc "echo ${pw} | sudo -S -p '' apt-get update && echo ${pw} | sudo -S -p '' apt-get install -y build-essential pkg-config clang cmake libssl-dev libclang-dev libturbojpeg0-dev libjpeg-dev zlib1g-dev v4l-utils libv4l-dev"`
-    );
-    if (depInstall.code !== 0) {
-      const out = String((depInstall.stdout || "") + "\n" + (depInstall.stderr || "")).trim();
-      if (out) emitLog(tailForLog(out));
-      throw new Error("failed to install remote build dependencies");
-    }
-  }
-
-  let sawMissingCargo = false;
-  let sawOldCargo = false;
-  for (const dir of candidates) {
-    try {
-      const hasCargo = await execCommand(conn, `test -f '${dir}/Cargo.toml' && echo OK || echo NO`);
-      if (!String(hasCargo.stdout || "").includes("OK")) continue;
-      emitLog(`Building orin bridge on remote: ${dir}`);
-      const build = await buildBridgeInDir(dir);
-      if (!build.ok) {
-        emitLog(`Remote build failed in ${dir}`);
-        const out = String((build.output.stdout || "") + "\n" + (build.output.stderr || "")).trim();
-        if (out) {
-          const clipped = tailForLog(out);
-          emitLog(clipped);
-          emitLog(`Remote build exit code: ${build.output.code}`);
-          if (clipped.includes("cargo: command not found")) {
-            sawMissingCargo = true;
-          }
-          if (
-            clipped.includes("feature `edition2024` is required") ||
-            clipped.includes("lock file version 4") ||
-            clipped.includes("-Znext-lockfile-bump")
-          ) {
-            sawOldCargo = true;
-          }
-        }
-        continue;
-      }
-      if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
-        await ensureYoloEngineInDir(dir);
-        const suffix = likelyTail.includes(binary)
-          ? likelyTail.split(binary).slice(1).join(binary)
-          : "";
-        const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
-        const resolved = `cd '${dir}' && ${cmdTail}`;
-        emitLog(`Resolved monitor dir after build: ${dir}`);
-        return resolved;
-      }
-    } catch (_err) {
-      // continue
-    }
-  }
-
-  try {
-    const scan = await execCommand(
-      conn,
-      `find '/home/${cfg.user}' -maxdepth 6 -type f -name '${binary}' 2>/dev/null | head -n 1`
-    );
-    const found = String(scan.stdout || "").trim();
-    if (found) {
-      const dir = path.posix.dirname(found);
-      const suffix = likelyTail.includes(binary)
-        ? likelyTail.split(binary).slice(1).join(binary)
-        : "";
-      const normalized = dir.replace(/\/+$/, "");
-      let runDir = normalized;
-      let runCmd = `./${binary}${suffix}`;
-
-      if (normalized.endsWith("/target/release")) {
-        runDir = normalized.replace(/\/target\/release$/, "");
-        runCmd = `./target/release/${binary}${suffix}`;
-      }
-
-      await ensureYoloEngineInDir(runDir);
-      const resolved = `cd '${runDir}' && ${withBridgeEnv(runCmd, binary)}`;
-      emitLog(`Resolved monitor dir by scan: ${runDir}`);
-      return resolved;
-    }
-  } catch (_err) {
-    // fall through
-  }
-
-  if (sawMissingCargo) {
-    emitLog("Cargo not found. Attempting remote install via apt...");
-    try {
-      const pw = shSingle(cfg.pass || "");
-      const install = await execCommand(
-        conn,
-        `bash -lc "echo ${pw} | sudo -S -p '' apt-get update && echo ${pw} | sudo -S -p '' apt-get install -y cargo"`
-      );
-      if (install.code !== 0) {
-        const out = String((install.stdout || "") + "\n" + (install.stderr || "")).trim();
-        if (out) emitLog(tailForLog(out));
-        throw new Error("automatic cargo install failed");
-      }
-      emitLog("Cargo install succeeded. Retrying bridge build...");
-      await ensureBridgeBuildDeps();
-
-      for (const dir of candidates) {
-        try {
-          const hasCargo = await execCommand(conn, `test -f '${dir}/Cargo.toml' && echo OK || echo NO`);
-          if (!String(hasCargo.stdout || "").includes("OK")) continue;
-          const build = await buildBridgeInDir(dir);
-          if (!build.ok) {
-            const out = String((build.output.stdout || "") + "\n" + (build.output.stderr || "")).trim();
-            if (out) emitLog(tailForLog(out));
-            emitLog(`Remote build exit code: ${build.output.code}`);
-            continue;
-          }
-          if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
-            await ensureYoloEngineInDir(dir);
-            const suffix = likelyTail.includes(binary)
-              ? likelyTail.split(binary).slice(1).join(binary)
-              : "";
-            const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
-            const resolved = `cd '${dir}' && ${cmdTail}`;
-            emitLog(`Resolved monitor dir after auto-install: ${dir}`);
-            return resolved;
-          }
-        } catch (_err) {
-          // continue
-        }
-      }
-    } catch (_err) {
-      throw new Error(
-        "Cargo is not installed on remote host and auto-install failed. Install Rust/Cargo on Orin or deploy a prebuilt ./target/release/orin_bridge."
-      );
-    }
-
-    throw new Error(
-      "Cargo was installed, but orin_bridge build still failed. Check remote build logs."
-    );
-  }
-
-  if (sawOldCargo) {
-    emitLog("Remote Cargo is too old. Attempting rustup stable install...");
-    try {
-      const pw = shSingle(cfg.pass || "");
-      // Ensure curl exists for rustup bootstrap
-      await execCommand(
-        conn,
-        `bash -lc "command -v curl >/dev/null 2>&1 || (echo ${pw} | sudo -S -p '' apt-get update && echo ${pw} | sudo -S -p '' apt-get install -y curl)"`
-      );
-      const rustup = await execCommand(
-        conn,
-        `bash -lc "curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable"`
-      );
-      if (rustup.code !== 0) {
-        const out = String((rustup.stdout || "") + "\n" + (rustup.stderr || "")).trim();
-        if (out) emitLog(tailForLog(out));
-        throw new Error("rustup install failed");
-      }
-
-      const cargoCmd = "$HOME/.cargo/bin/cargo";
-      await ensureBridgeBuildDeps();
-      for (const dir of candidates) {
-        try {
-          const hasCargo = await execCommand(conn, `test -f '${dir}/Cargo.toml' && echo OK || echo NO`);
-          if (!String(hasCargo.stdout || "").includes("OK")) continue;
-          const build = await buildBridgeInDir(dir, cargoCmd);
-          if (!build.ok) {
-            const out = String((build.output.stdout || "") + "\n" + (build.output.stderr || "")).trim();
-            if (out) emitLog(tailForLog(out));
-            emitLog(`Remote build exit code: ${build.output.code}`);
-            continue;
-          }
-          if (await commandExistsInDir(conn, dir, `target/release/${binary}`)) {
-            await ensureYoloEngineInDir(dir);
-            const suffix = likelyTail.includes(binary)
-              ? likelyTail.split(binary).slice(1).join(binary)
-              : "";
-            const cmdTail = withBridgeEnv(`./target/release/${binary}${suffix}`, binary);
-            const resolved = `cd '${dir}' && ${cmdTail}`;
-            emitLog(`Resolved monitor dir after rustup upgrade: ${dir}`);
-            return resolved;
-          }
-        } catch (_err) {
-          // continue
-        }
-      }
-    } catch (_err) {
-      throw new Error(
-        "Remote Cargo is too old and rustup auto-upgrade failed. Install a newer Rust toolchain on Orin or deploy a prebuilt ./target/release/orin_bridge."
-      );
-    }
-
-    throw new Error("Rust toolchain upgraded, but orin_bridge build still failed.");
-  }
-  throw new Error("No monitor binary found on remote host. Deploy/build first.");
+  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+  const camera = Number(settings.preview_camera_index ?? 0);
+  if (!Number.isInteger(camera) || camera < 0 || camera > 5) throw new Error("Invalid debug camera (0-5)");
+  // Legacy diagnostics remain explicit until service-attached preview is implemented.
+  // No hidden builds, feature fallback, dependency installation, or lockfile changes.
+  await syncRemoteStartupScript(conn, settings);
+  await execChecked(conn, `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --check-debug-bridge`);
+  emitLog("Starting legacy bridge diagnostics; this replaces production camera ownership while monitoring.");
+  return `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --debug-bridge --camera ${camera}`;
 }
 
 const monitorManager = {
@@ -1280,7 +835,6 @@ const monitorManager = {
     try {
       emitMonitorStartProgress({ status: "starting", percent: 10, text: "Connecting..." });
       this.conn = await connectSsh(settings);
-      await syncTagMapRemote(this.conn, settings);
 
       emitMonitorStartProgress({ status: "starting", percent: 55, text: "Resolving monitor..." });
       const resolvedStart = await resolveMonitorCommand(this.conn, settings);
@@ -1380,35 +934,16 @@ const monitorManager = {
 };
 
 async function syncTagMapRemote(conn, settings) {
-  try {
-    const localPath = path.resolve(String(settings.tag_map_path || ""));
-    if (!localPath || !fsSync.existsSync(localPath)) {
-      emitLog("Tag map not found locally; using remote/default map path if present.");
-      return { ok: false, reason: "missing-local-map" };
-    }
-    const sftp = await getSftp(conn);
-    const targets = [
-      inferRemoteDeployFolder(settings.remote_path, settings.local_path),
-      settings.remote_path,
-      `/home/${withFixedSshConfig(settings).user}/deployments/Vortex`
-    ]
-      .map((p) => String(p || "").replace(/\/+$/, ""))
-      .filter(Boolean)
-      .filter((v, i, arr) => arr.indexOf(v) === i);
-    let wrote = 0;
-    for (const t of targets) {
-      const remotePath = `${t}/config/apriltag_map.json`;
-      const remoteParent = path.posix.dirname(remotePath);
-      await execCommand(conn, `mkdir -p '${remoteParent}'`);
-      await sftpFastPut(sftp, localPath, remotePath);
-      emitLog(`Tag map synced to remote: ${remotePath}`);
-      wrote += 1;
-    }
-    return { ok: wrote > 0, remotePath: `${targets[0]}/config/apriltag_map.json` };
-  } catch (err) {
-    emitLog(`Tag map sync failed: ${err?.message || String(err)}`);
-    return { ok: false, error: err?.message || String(err) };
-  }
+  if (!String(settings.tag_map_path || "").trim()) return;
+  const localPath = path.resolve(__dirname, settings.tag_map_path);
+  const map = await readJson(localPath, null);
+  if (!Array.isArray(map?.tags) || map.tags.length === 0) throw new Error("Selected tag map is missing or invalid");
+  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
+  const destination = `${remoteTarget}/config/apriltag_map.json`;
+  await execChecked(conn, `mkdir -p -- ${shSingle(path.posix.dirname(destination))}`);
+  await sftpAtomicWrite(conn, await getSftp(conn), destination,
+    Buffer.from(JSON.stringify(map)+"\n"));
+  emitLog(`Tag map synced: ${destination}`);
 }
 
 const previewManager = {
@@ -1503,7 +1038,8 @@ ipcMain.handle("bootstrap", async () => {
   if (appCfg.onnx_model_path) {
     appCfg.onnx_model_path = resolvePathFromAppDir(appCfg.onnx_model_path, "");
   }
-  const runtimeConfigPath = path.resolve(__dirname, appCfg.runtime_config_path || DEFAULT_RUNTIME_CONFIG_PATH);
+  const runtimeConfigPath = path.resolve(__dirname, appCfg.runtime_config_path ||
+    path.join(appCfg.local_path, "config", "config.json"));
   const runtimeConfig = await readJson(runtimeConfigPath, {});
   return { appConfig: appCfg, runtimeConfigPath, runtimeConfig };
 });
@@ -1638,6 +1174,7 @@ ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath)
 });
 
 ipcMain.handle("save-app-config", async (_evt, appConfig) => {
+  buildDeviceConfig(appConfig || {});
   const sanitized = withFixedSshConfig({ ...(appConfig || {}) });
   delete sanitized.preview_camera_index;
   sanitized.local_path = portablePathFromAppDir(sanitized.local_path);
@@ -1667,10 +1204,11 @@ ipcMain.handle("sync-runtime-config-remote", async (_evt, settings, config) => {
     const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
     const remoteConfigPath = `${remoteTarget}/config/config.json`;
     const remoteParent = path.posix.dirname(remoteConfigPath);
-    await execCommand(conn, `mkdir -p '${remoteParent}'`);
+    buildDeviceConfig(settings);
+    await execChecked(conn, `mkdir -p -- ${shSingle(remoteParent)}`);
     const sftp = await getSftp(conn);
     const payload = Buffer.from(`${JSON.stringify(config, null, 2)}\n`, "utf8");
-    await sftpWriteFile(sftp, remoteConfigPath, payload);
+    await sftpAtomicWrite(conn, sftp, remoteConfigPath, payload);
     emitLog(`Runtime config synced to remote: ${remoteConfigPath}`);
     return { ok: true, remoteConfigPath };
   } catch (err) {
@@ -1688,6 +1226,7 @@ ipcMain.handle("set-jetson-power-limit", async (_evt, settings, watts) => {
 
 ipcMain.handle("deploy-start", async (_evt, settings) => {
   try {
+    buildDeviceConfig(settings);
     await beginManagedToolActivity(settings, "deploy");
   } catch (err) {
     const msg = err?.message || String(err);
@@ -1708,6 +1247,7 @@ ipcMain.handle("deploy-start", async (_evt, settings) => {
 
 ipcMain.handle("build-main-start", async (_evt, settings) => {
   try {
+    buildDeviceConfig(settings);
     await beginManagedToolActivity(settings, "main-build");
   } catch (err) {
     const msg = err?.message || String(err);
@@ -1808,18 +1348,12 @@ ipcMain.handle("list-remote-cameras", async (_evt, settings) => {
 });
 
 ipcMain.handle("apply-monitor-preset", async (_evt, appConfig, preset) => {
-  const remoteFolder = inferRemoteDeployFolder(appConfig.remote_path, appConfig.local_path);
-  const out = { ...appConfig };
-  const cam = Number(appConfig.preview_camera_index || 0);
-  if (preset === "main_cam_0") {
-    out.monitor_start_cmd = `cd '${remoteFolder}' && VORTEX_BRIDGE_CAMERA=${cam} VORTEX_BRIDGE_FRAME='/tmp/vortex_bridge_frame.jpg' VORTEX_BRIDGE_STATE='/tmp/vortex_bridge_state.json' ./target/release/orin_bridge 2>&1`;
-  } else if (preset === "main_cam_0_2") {
-    out.monitor_start_cmd = `cd '${remoteFolder}' && VORTEX_BRIDGE_CAMERA=${cam} VORTEX_BRIDGE_FRAME='/tmp/vortex_bridge_frame.jpg' VORTEX_BRIDGE_STATE='/tmp/vortex_bridge_state.json' ./target/release/orin_bridge 2>&1`;
-  } else if (preset === "main_defaults") {
-    out.monitor_start_cmd = `cd '${remoteFolder}' && VORTEX_BRIDGE_CAMERA=${cam} VORTEX_BRIDGE_FRAME='/tmp/vortex_bridge_frame.jpg' VORTEX_BRIDGE_STATE='/tmp/vortex_bridge_state.json' ./target/release/orin_bridge 2>&1`;
-  }
-  out.monitor_stop_cmd = "pkill -f orin_bridge || true";
-  out.preview_remote_path = "/tmp/vortex_bridge_frame.jpg";
-  out.preview_state_path = "/tmp/vortex_bridge_state.json";
-  return out;
+  if (!["main_cam_0", "main_cam_0_2", "main_defaults"].includes(preset)) throw new Error("Unknown monitor preset");
+  return {
+    ...appConfig,
+    monitor_start_cmd: "python3 scripts/run_vortex.py --debug-bridge",
+    monitor_stop_cmd: "pkill -f orin_bridge || true",
+    preview_remote_path: "/tmp/vortex_bridge_frame.jpg",
+    preview_state_path: "/tmp/vortex_bridge_state.json"
+  };
 });

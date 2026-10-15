@@ -130,7 +130,8 @@ if [[ "${SKIP_APT}" != "1" ]]; then
     libudev-dev \
     libturbojpeg0-dev \
     libv4l-dev \
-    v4l-utils
+    v4l-utils \
+    python3
 fi
 
 if [[ "${SKIP_RUST}" != "1" ]]; then
@@ -141,11 +142,13 @@ if [[ "${SKIP_RUST}" != "1" ]]; then
       curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
     fi
     source "$HOME/.cargo/env"
-    rustup toolchain install stable --profile minimal
-    rustup default stable
-    rustup component add rustfmt || true
   '
+  TOOLCHAIN_VERSION="$(python3 -c 'import re,sys; print(re.search(r"channel\s*=\s*\"([^\"]+)\"", open(sys.argv[1]).read()).group(1))' "${APP_DIR}/rust-toolchain.toml")"
+  sudo -u "${RUN_USER}" -H bash -lc 'source "$HOME/.cargo/env"; rustup toolchain install "$1" --profile minimal' _ "${TOOLCHAIN_VERSION}"
 fi
+
+echo "==> Configuring camera access"
+usermod -aG video "${RUN_USER}"
 
 echo "==> Normalizing startup script"
 sed -i 's/\r$//' "${APP_DIR}/run_vortex.sh"
@@ -158,10 +161,12 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
     set -euo pipefail
     source \"\$HOME/.cargo/env\"
     cd \"${APP_DIR}\"
-    cargo build --release --bin dumapril-taglocalization
-    cargo build --release --bin orin_bridge || true
+    python3 scripts/run_vortex.py --build --online --with-debug-bridge
   "
 fi
+
+echo "==> Validating production launcher"
+sudo -u "${RUN_USER}" -H python3 "${APP_DIR}/scripts/run_vortex.py" --check
 
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 echo "==> Installing ${SERVICE_NAME}"

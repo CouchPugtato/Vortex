@@ -36,6 +36,13 @@ Available packaging scripts:
 
 ## Notes
 
+- See [deployment architecture and migration](../docs/deployment.md) for the shared
+  Python launcher, device settings, build profiles, and staged deployment upgrade.
+- After deploying source changes, **Build Profile** creates the verified binaries.
+  Startup refuses stale or unverified executables instead of compiling implicitly.
+- **Start Diagnostics** currently replaces production capture with the legacy
+  bridge. Service-attached monitoring is planned.
+
 - Connection errors like `ECONNREFUSED` / `10061` mean host/port are unreachable.
 - Preview command template supports:
   - `{cam}` for camera index

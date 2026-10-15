@@ -45,6 +45,7 @@ const el = {
   runtimeForm: document.querySelector("#runtimeForm"),
   deployBtn: document.querySelector("#deployBtn"),
   buildMainBtn: document.querySelector("#buildMainBtn"),
+  buildProfile: document.querySelector("#buildProfile"),
   deployProgressWrap: document.querySelector("#deployProgressWrap"),
   deployProgress: document.querySelector("#deployProgress"),
   deployProgressText: document.querySelector("#deployProgressText"),
@@ -257,6 +258,7 @@ function hydrateAppConfig(cfg) {
   if (el.startupCameras) {
     el.startupCameras.value = normalizeCameraIndices(cfg?.startup_camera_indices || "0,1");
   }
+  if (el.buildProfile) el.buildProfile.value = cfg?.build_profile || "cpu";
   if (el.ntEnable) el.ntEnable.checked = Boolean(cfg?.vortex_nt_enable);
   if (el.ntMode) el.ntMode.value = normalizeNtMode(cfg?.vortex_nt_mode || "team");
   if (el.ntTeam) el.ntTeam.value = String(cfg?.vortex_nt_team || "509");
@@ -317,17 +319,17 @@ function readAppConfigFromUI() {
   const jetsonWatts = Number.isFinite(wattsRaw) && allowed.has(Math.round(wattsRaw))
     ? Math.round(wattsRaw)
     : 15;
-  const startupCameraIndices = normalizeCameraIndices(
-    el.startupCameras?.value || state.appConfig?.startup_camera_indices || "0,1"
+  const startupCameraIndices = String(
+    el.startupCameras?.value ?? state.appConfig?.startup_camera_indices ?? "0,1"
   );
   const ntEnable = Boolean(el.ntEnable?.checked ?? state.appConfig?.vortex_nt_enable);
   const ntMode = normalizeNtMode(el.ntMode?.value || state.appConfig?.vortex_nt_mode || "team");
-  const ntTeam = String(el.ntTeam?.value || state.appConfig?.vortex_nt_team || "509").trim() || "509";
-  const ntServer = String(el.ntServer?.value || state.appConfig?.vortex_nt_server || "").trim();
-  const ntTable = String(el.ntTable?.value || state.appConfig?.vortex_nt_table || "/Vortex/Vision").trim() || "/Vortex/Vision";
+  const ntTeam = String(el.ntTeam?.value ?? state.appConfig?.vortex_nt_team ?? "509").trim();
+  const ntServer = String(el.ntServer?.value ?? state.appConfig?.vortex_nt_server ?? "").trim();
+  const ntTable = String(el.ntTable?.value ?? state.appConfig?.vortex_nt_table ?? "/Vortex/Vision").trim();
   const udpEnable = Boolean(el.udpEnable?.checked ?? state.appConfig?.vortex_udp_enable ?? true);
-  const udpTarget = String(el.udpTarget?.value || state.appConfig?.vortex_udp_target || "192.168.1.24").trim();
-  const udpPort = normalizePort(el.udpPort?.value || state.appConfig?.vortex_udp_port || 5809, 5809);
+  const udpTarget = String(el.udpTarget?.value ?? state.appConfig?.vortex_udp_target ?? "192.168.1.24").trim();
+  const udpPort = el.udpPort?.value ?? state.appConfig?.vortex_udp_port ?? 5809;
   return {
     ...state.appConfig,
     preview_camera_index: normalizedCam,
@@ -335,6 +337,7 @@ function readAppConfigFromUI() {
     onnx_model_path: onnxPath,
     jetson_max_watts: jetsonWatts,
     startup_camera_indices: startupCameraIndices,
+    build_profile: el.buildProfile.value,
     vortex_nt_enable: ntEnable,
     vortex_nt_mode: ntMode,
     vortex_nt_team: ntTeam,
@@ -1065,19 +1068,19 @@ async function init() {
   });
 
   const saveNetworkConfig = async () => {
-    if (el.startupCameras) {
-      el.startupCameras.value = normalizeCameraIndices(el.startupCameras.value);
-    }
-    if (el.udpPort) {
-      el.udpPort.value = String(normalizePort(el.udpPort.value, 5809));
-    }
     syncNetworkFieldState();
-    state.appConfig = readAppConfigFromUI();
-    await window.vortexApi.saveAppConfig(state.appConfig).catch(() => {});
+    const config = readAppConfigFromUI();
+    try {
+      await window.vortexApi.saveAppConfig(config);
+      state.appConfig = config;
+    } catch (err) {
+      appendLog(`Launch settings not saved: ${err.message}`);
+    }
   };
 
   [
     el.startupCameras,
+    el.buildProfile,
     el.ntEnable,
     el.ntMode,
     el.ntTeam,
@@ -1162,24 +1165,31 @@ async function init() {
   });
 
   el.deployBtn.addEventListener("click", async () => {
-    const cfg = readAppConfigFromUI();
-    state.runtimeConfig = readRuntimeConfigFromForm();
-    await window.vortexApi.saveRuntimeConfig(el.runtimePath.value.trim(), state.runtimeConfig);
-    await window.vortexApi.saveAppConfig(cfg);
-    setDeployIndicator("active", "0%", 0);
-    await window.vortexApi.deployStart(cfg);
-    appendLog("Deploy started.");
+    try {
+      const cfg = readAppConfigFromUI();
+      await window.vortexApi.saveAppConfig(cfg);
+      state.runtimeConfig = readRuntimeConfigFromForm();
+      await window.vortexApi.saveRuntimeConfig(el.runtimePath.value.trim(), state.runtimeConfig);
+      setDeployIndicator("active", "0%", 0);
+      const result = await window.vortexApi.deployStart(cfg);
+      if (!result?.ok) throw new Error(result?.error || "Deploy could not start");
+      appendLog("Deploy started.");
+    } catch (err) {
+      setDeployIndicator("error", "Deploy start failed", 0);
+      appendLog(`Deploy start failed: ${err.message}`);
+    }
   });
 
   el.buildMainBtn.addEventListener("click", async () => {
-    const cfg = readAppConfigFromUI();
-    setBuildIndicator("active", "[0/0] Queued...", 0);
-    const res = await window.vortexApi.buildMainStart(cfg);
-    if (!res?.ok) {
+    try {
+      const cfg = readAppConfigFromUI();
+      setBuildIndicator("active", "Queued...", 0);
+      const result = await window.vortexApi.buildMainStart(cfg);
+      if (!result?.ok) throw new Error(result?.error || "Build could not start");
+      appendLog("Profile build started.");
+    } catch (err) {
       setBuildIndicator("error", "✕ Build start failed", 0);
-      appendLog(`Build start failed: ${res?.error || "unknown error"}`);
-    } else {
-      appendLog("Main build started.");
+      appendLog(`Build start failed: ${err.message}`);
     }
   });
 
@@ -1197,7 +1207,7 @@ async function init() {
         const p = await window.vortexApi.previewStart(cfg);
         if (!p?.ok) throw new Error(p?.error || "preview start failed");
         state.pipelineRunning = true;
-        el.togglePipeline.textContent = "Stop Monitor";
+        el.togglePipeline.textContent = "Stop Diagnostics";
         refreshCameraControls();
       } catch (err) {
         const msg = String(err?.message || err);
@@ -1217,7 +1227,7 @@ async function init() {
         appendLog(`Stop error: ${err.message}`);
       }
       state.pipelineRunning = false;
-      el.togglePipeline.textContent = "Start Monitor";
+      el.togglePipeline.textContent = "Start Diagnostics";
       refreshCameraControls();
     }
   });
@@ -1250,7 +1260,7 @@ async function init() {
           const p = await window.vortexApi.previewStart(cfg);
           if (!p?.ok) appendLog(`Preview restart failed: ${p?.error || "unknown error"}`);
           state.pipelineRunning = true;
-          el.togglePipeline.textContent = "Stop Monitor";
+          el.togglePipeline.textContent = "Stop Diagnostics";
         }
       } catch (err) {
         appendLog(`Camera switch error: ${err.message}`);
@@ -1275,11 +1285,11 @@ async function init() {
     el.monitorStatus.textContent = `Monitor: ${running ? "Running" : "Stopped"}`;
     if (running) {
       state.pipelineRunning = true;
-      el.togglePipeline.textContent = "Stop Monitor";
+      el.togglePipeline.textContent = "Stop Diagnostics";
     }
     if (!running) {
       state.pipelineRunning = false;
-      el.togglePipeline.textContent = "Start Monitor";
+      el.togglePipeline.textContent = "Start Diagnostics";
       window.vortexApi.previewStop().catch(() => {});
     }
     refreshCameraControls();

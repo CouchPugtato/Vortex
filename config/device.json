@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "runtime": "main",
+  "build_profile": "cpu",
+  "cameras": [0, 2],
+  "runtime_config": "config/config.json",
+  "tag_map": "config/2026-rebuilt-welded.json",
+  "networktables": {
+    "enabled": false,
+    "mode": "team",
+    "team": 509,
+    "server": "",
+    "table": "/Vortex/Jetson1"
+  },
+  "udp": {
+    "enabled": true,
+    "target": "192.168.1.24",
+    "port": 5091
+  }
+}
