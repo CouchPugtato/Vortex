@@ -50,14 +50,14 @@ function fake(states = [ready]) {
     get connects() { return connects; }, get directory() { return localDirectory; } };
 }
 
-test("archive upload and detached build never delete or restart the current installation", async () => {
+test("archive upload and managed build never delete or restart the current installation", async () => {
   const h = fake([{ ...ready, state: "building" }, { ...ready, state: "checking" }, ready]);
   assert.equal((await stageProject(settings, target, h.deps)).state, "ready");
   assert.equal(h.uploads.length, 2);
   assert(h.uploads.every((file) => file.startsWith(`${root}/incoming/`)));
-  assert(h.commands.some((command) => command.startsWith("nohup ") && command.endsWith("< /dev/null &")));
+  assert(h.commands.some((command) => command.includes(" start-job ") && command.includes("--kind stage")));
   assert(!h.commands.some((command) => /systemctl|pkill|rm -rf|find |syncRemoteStartupScript/.test(command)));
-  assert(h.commands.findIndex((command) => command.includes("hashlib")) < h.commands.findIndex((command) => command.startsWith("nohup ")));
+  assert(h.commands.findIndex((command) => command.includes("hashlib")) < h.commands.findIndex((command) => command.includes(" start-job ")));
   assert.equal(h.events.at(-1).text, "Release ready — not activated");
   await assert.rejects(fs.access(h.directory));
 });
@@ -66,7 +66,7 @@ test("a disconnected SSH client reconnects to the same job without launching it 
   const h = fake([new Error("connection reset"), ready]);
   await stageProject(settings, target, h.deps);
   assert.equal(h.connects, 2);
-  assert.equal(h.commands.filter((command) => command.startsWith("nohup ")).length, 1);
+  assert.equal(h.commands.filter((command) => command.includes(" start-job ")).length, 1);
 });
 
 test("failed builds report saved logs and never activate anything", async () => {
@@ -91,14 +91,14 @@ test("checksum verification failure prevents launching the controller", async ()
     return execute(conn, command);
   };
   await assert.rejects(stageProject(settings, target, h.deps), /checksum mismatch/);
-  assert(!h.commands.some((command) => command.startsWith("nohup ")));
+  assert(!h.commands.some((command) => command.includes(" start-job ")));
 });
 
 test("failed uploads do not start a remote build", async () => {
   const h = fake();
   h.deps.upload = async () => { throw new Error("transfer failed"); };
   await assert.rejects(stageProject(settings, target, h.deps), /transfer failed/);
-  assert(!h.commands.some((command) => command.startsWith("nohup ")));
+  assert(!h.commands.some((command) => command.includes(" start-job ")));
 });
 
 test("local packaging failure contacts no Jetson", async () => {
@@ -108,7 +108,7 @@ test("local packaging failure contacts no Jetson", async () => {
   assert.equal(h.connects, 0);
 });
 
-test("timeout leaves detached job running and reports where to inspect it", async () => {
+test("timeout leaves managed job running and reports where to inspect it", async () => {
   const h = fake();
   h.deps.timeoutMs = 0;
   await assert.rejects(stageProject(settings, target, h.deps), /Stopped waiting/);
@@ -146,4 +146,46 @@ test("real local packager snapshots the repository and selected configuration", 
   assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), result.archive_sha256);
   assert.equal(bytes.length, result.archive_bytes);
   assert.equal(result.build_profile, "cpu");
+});
+
+
+test("reopening restores a stage job and compiler logs without packaging, uploading or submitting", async () => {
+  const h = fake([{ ...ready, state: "building", log_tail: "Compiling vortex\n" }, ready]);
+  h.deps.resume = { kind: "stage", ...metadata };
+  h.deps.package = async () => { throw new Error("must not package on reconnect"); };
+  let finished = 0;
+  h.deps.finished = async () => finished++;
+  await stageProject(settings, target, h.deps);
+  assert.equal(h.uploads.length, 0);
+  assert.equal(h.commands.filter((command) => command.includes(" start-job ")).length, 0);
+  assert(h.commands.every((command) => command.includes(" status ")));
+  assert(h.logs.some((line) => line.includes("Compiling vortex")));
+  assert.equal(finished, 1);
+});
+
+test("save precedes submission and a lost submission reply keeps the job resumable", async () => {
+  const h = fake();
+  let saved, finished = false;
+  h.deps.remember = async (job) => { saved = job; };
+  h.deps.finished = async () => { finished = true; };
+  const execute = h.deps.execChecked;
+  h.deps.execChecked = async (conn, command) => {
+    if (command.includes(" start-job ")) {
+      assert.equal(saved.release_id, metadata.release_id);
+      throw new Error("SSH lost reply");
+    }
+    return execute(conn, command);
+  };
+  await assert.rejects(stageProject(settings, target, h.deps), /SSH lost reply/);
+  assert.equal(saved.kind, "stage");
+  assert.equal(finished, false);
+});
+
+test("interrupted stages restore saved logs, clear the pending record and report failure", async () => {
+  const h = fake([{ ...ready, state: "interrupted", error: "Worker killed", log_tail: "last compiler output" }]);
+  let finished = false;
+  h.deps.finished = async () => { finished = true; };
+  await assert.rejects(stageProject(settings, target, h.deps), /Worker killed/);
+  assert(finished);
+  assert(h.logs.includes("last compiler output"));
 });

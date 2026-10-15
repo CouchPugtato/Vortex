@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld("vortexApi", {
   deployStart: (settings) => ipcRenderer.invoke("deploy-start", settings),
   buildMainStart: (settings) => ipcRenderer.invoke("build-main-start", settings),
   releaseStatus: (settings) => ipcRenderer.invoke("release-status", settings),
+  resumeDeployment: (settings) => ipcRenderer.invoke("deployment-resume", settings),
   releaseOperate: (settings, action, release) => ipcRenderer.invoke("release-operate", settings, action, release),
   onReleaseState: makeSubscriber("release-state"),
   monitorStart: (settings) => ipcRenderer.invoke("monitor-start", settings),

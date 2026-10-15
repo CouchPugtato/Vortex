@@ -461,6 +461,7 @@ WantedBy=multi-user.target
                 sudoers_temp.unlink(missing_ok=True)
             execute(["systemctl", "daemon-reload"], check=True, timeout=20)
             execute(["systemctl", "enable", name], check=True, timeout=20)
+            execute(["loginctl", "enable-linger", user], check=True, timeout=20)
         except Exception:
             if original is None:
                 unit_path.unlink(missing_ok=True)
@@ -495,7 +496,8 @@ def status(root, operation_id=None):
     return dict(ready=ready, active=optional_json(root/"active.json", {"kind": "none"}),
                 previous=optional_json(root/"previous.json", {"kind": "none"}),
                 pending=optional_json(root/"activation.json"), service_configured=bool(optional_json(root/"managed-service.json", {}).get("installed")),
-                controller_current=installed.is_file() and deployment.sha256(installed) == deployment.sha256(Path(__file__)))
+                controller_current=installed.is_file() and deployment.sha256(installed) == deployment.sha256(Path(__file__)) and
+                (root/"deploy_release.py").is_file() and deployment.sha256(root/"deploy_release.py") == deployment.sha256(Path(deployment.__file__)))
 
 
 def main(argv=None):
@@ -521,6 +523,8 @@ def main(argv=None):
                 result = recover_locked(root, Systemd(root))
         elif args.action == "status":
             result = status(root, args.operation_id)
+            if args.operation_id:
+                result = deployment.supervised_status(root, args.operation_id, result)
         else:
             result = activate(root, args.release_id, args.action == "rollback", args.operation_id)
         print(json.dumps(result, allow_nan=False))

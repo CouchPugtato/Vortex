@@ -5,6 +5,7 @@ const path = require("path");
 const os = require("os");
 const { spawn } = require("child_process");
 const { buildDeviceConfig } = require("./launch-config");
+const { logFollower } = require("./job-progress");
 
 function quote(value) { return `'${String(value).replace(/'/g, `'\\''`)}'`; }
 
@@ -40,20 +41,21 @@ async function packageLocally(settings, directory, appDir) {
 }
 
 async function stageProject(settings, remoteTarget, deps) {
-  const device = buildDeviceConfig(settings);
+  const device = deps.resume ? { build_profile: deps.resume.build_profile } : buildDeviceConfig(settings);
   const root = managedRoot(remoteTarget);
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "vortex-release-"));
   let conn = null;
   let metadata = null;
   let launched = false;
+  const followLog = logFollower(deps.log);
   const emit = (percent, text, status = "active") => deps.progress({ percent, text, status });
   const checked = async (command) => {
     if (!conn) conn = await deps.connect(settings);
     return deps.execChecked(conn, command);
   };
   try {
-    emit(2, "Packaging release snapshot...");
-    metadata = await (deps.package || packageLocally)(settings, directory, deps.appDir);
+    emit(2, deps.resume ? "Reconnecting to saved staging job..." : "Packaging release snapshot...");
+    metadata = deps.resume || await (deps.package || packageLocally)(settings, directory, deps.appDir);
     if (metadata.schema_version !== 1 || metadata.build_profile !== device.build_profile ||
         !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(metadata.release_id) ||
         !/^[a-f0-9]{64}$/.test(metadata.archive_sha256) || !/^[a-f0-9]{64}$/.test(metadata.controller_sha256)) {
@@ -63,24 +65,28 @@ async function stageProject(settings, remoteTarget, deps) {
     const controller = `${incoming}/controller.py`;
     const archive = `${incoming}/release.tar.gz`;
     deps.log(`Release ${metadata.release_id}: staging at ${root}; production will keep running.`);
-    await checked(`mkdir -p -- ${quote(incoming)}`);
-    const sftp = await deps.getSftp(conn);
-    emit(10, "Uploading release archive...");
-    await deps.upload(sftp, path.join(directory, "release.tar.gz"), archive, {
-      step: (sent, chunk, total) => emit(10+Math.round(25*sent/Math.max(total, 1)), "Uploading release archive...")
-    });
-    await deps.upload(sftp, path.join(directory, "controller.py"), controller);
-    // Verify the small bootstrap controller before executing it. The controller
-    // separately checks the entire archive and every extracted payload file.
-    const verify = "import hashlib,sys; p=sys.argv[1]; expected=sys.argv[2]; " +
-      "actual=hashlib.sha256(open(p,'rb').read()).hexdigest(); " +
-      "sys.exit(0 if actual==expected else 1)";
-    await checked(`python3 -c ${quote(verify)} ${quote(controller)} ${quote(metadata.controller_sha256)}`);
-    emit(38, "Starting isolated build...");
-    const command = `python3 ${quote(controller)} stage --root ${quote(root)} --archive ${quote(archive)} ` +
-      `--sha256 ${quote(metadata.archive_sha256)} --release-id ${quote(metadata.release_id)} --with-debug-bridge`;
-    // A detached job owns the lock and log independently of the GUI/SSH stream.
-    await checked(`nohup ${command} > ${quote(incoming+"/controller.log")} 2>&1 < /dev/null &`);
+    if (!deps.resume) {
+      await checked(`mkdir -p -- ${quote(incoming)}`);
+      const sftp = await deps.getSftp(conn);
+      emit(10, "Uploading release archive...");
+      await deps.upload(sftp, path.join(directory, "release.tar.gz"), archive, {
+        step: (sent, chunk, total) => emit(10+Math.round(25*sent/Math.max(total, 1)), "Uploading release archive...")
+      });
+      await deps.upload(sftp, path.join(directory, "controller.py"), controller);
+      // Verify the small bootstrap controller before executing it. The controller
+      // separately checks the entire archive and every extracted payload file.
+      const verify = "import hashlib,sys; p=sys.argv[1]; expected=sys.argv[2]; " +
+        "actual=hashlib.sha256(open(p,'rb').read()).hexdigest(); " +
+        "sys.exit(0 if actual==expected else 1)";
+      await checked(`python3 -c ${quote(verify)} ${quote(controller)} ${quote(metadata.controller_sha256)}`);
+      emit(38, "Starting isolated build...");
+      const command = `python3 ${quote(controller)} start-job --root ${quote(root)} --kind stage ` +
+        `--job-id ${quote(metadata.release_id)} --sha256 ${quote(metadata.archive_sha256)} --release-id ${quote(metadata.release_id)}`;
+      // Save before submission so a lost SSH reply cannot cause a second launch.
+      await deps.remember?.({ kind: "stage", ...metadata });
+      launched = true;
+      await checked(command);
+    }
     launched = true;
     const poll = `python3 ${quote(controller)} status --root ${quote(root)} --release-id ${quote(metadata.release_id)}`;
     const start = Date.now();
@@ -101,6 +107,7 @@ async function stageProject(settings, remoteTarget, deps) {
         continue;
       }
       const job = JSON.parse(response.stdout);
+      followLog(job);
       if (job.release_id !== metadata.release_id || job.activated !== false) throw new Error("Unexpected deployment job identity/state");
       if (job.state === "ready") {
         if (job.profile !== metadata.build_profile || job.release_path !== `${root}/releases/${metadata.release_id}`) {
@@ -108,13 +115,16 @@ async function stageProject(settings, remoteTarget, deps) {
         }
         emit(100, "Release ready — not activated", "done");
         deps.log(`Release ready: ${job.release_path}. Running installation unchanged.`);
+        await deps.finished?.();
         return job;
       }
-      if (job.state === "failed" || (job.state === "starting" && ++starting > 30)) {
-        if (job.state === "failed") launched = false;
+      if (["failed", "interrupted"].includes(job.state) ||
+          (job.state === "starting" && ++starting > 30 && !["active", "activating"].includes(job.unit_state))) {
+        launched = false;
         const tail = await checked(`tail -n 60 -- ${quote(root+"/jobs/"+metadata.release_id+".log")} ` +
-          `${quote(incoming+"/controller.log")} 2>/dev/null || true`);
+          `${quote(root+"/jobs/"+metadata.release_id+".controller.log")} 2>/dev/null || true`);
         if (tail.stdout.trim()) deps.log(tail.stdout.trim());
+        await deps.finished?.();
         throw new Error(job.error || "Remote staging job did not start; inspect controller.log");
       }
       if (!["starting", "queued", "verifying", "extracting", "validating", "building", "checking"].includes(job.state)) {
@@ -128,7 +138,8 @@ async function stageProject(settings, remoteTarget, deps) {
     }
     throw new Error("Stopped waiting for the remote build; inspect its saved job status before retrying");
   } catch (error) {
-    emit(0, "Staging failed — running installation unchanged", "error");
+    emit(0, launched ? "Staging status unavailable — reconnect with Refresh Releases" :
+      "Staging failed — running installation unchanged", "error");
     if (launched) deps.log(`Job may still be running. Status: ${root}/jobs/${metadata.release_id}.json`);
     throw error;
   } finally {

@@ -41,6 +41,9 @@ Available packaging scripts:
   Python launcher, device settings, build profiles, and staged deployment upgrade.
 - **Stage Release** packages required files, verifies checksums, acquires the
   device deployment lock, and creates an isolated verified build.
+- Deployment jobs run under systemd and survive closing the app. Reopening restores
+  progress, logs, and results; **Refresh Releases** retries reconnection after an outage.
+  Existing Jetsons need `sudo loginctl enable-linger vortex` before staging.
 - **Activate** checks the executable, libraries, saved-image smoke test, and fresh
   camera processing. A failed start restores the previous release/configuration.
   **Rollback** switches back manually. First-time service setup needs sudo; the app

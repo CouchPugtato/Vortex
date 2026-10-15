@@ -39,7 +39,7 @@ On the Jetson the archive goes to a **sibling** of the existing deployment:
   build-cache/PROFILE/                      reusable Cargo artifacts
 ```
 
-The bootstrap controller is checksummed before execution. Its detached job verifies
+The bootstrap controller is checksummed before execution. Its systemd job verifies
 the complete archive, rejects unsafe paths/links/duplicates and unexpected files,
 checks free extraction space, and verifies each extracted file. A nonblocking OS
 lock at `~/.local/state/vortex/deployment.lock` serializes verification and builds
@@ -53,12 +53,31 @@ cannot replace its binaries through the shared cache. Builds use two Cargo jobs
 and a lower process priority, but compilation still competes with live vision for
 CPU and memory. Build duration and camera performance need Jetson measurement.
 
-Closing the app or disconnecting SSH does not stop the detached build. The current
-app reconnects to the same job after temporary connection loss. After reopening,
-status and logs can be inspected over SSH; automatic job reattachment in the UI is
-pending. Reboot/power loss can leave an incomplete staging directory and saved
-in-progress status; it cannot activate that directory. Failed packages, staging
-trees, and logs are retained for diagnosis. Automatic retention cleanup is pending.
+Staging and activation run as transient user-level systemd services, independent
+of SSH and the desktop. Closing the app does not stop them. The interface saves the
+job identity and device location before submitting, automatically reconnects on
+reopening, and restores progress, the latest log output, and the result. It never
+resubmits the saved operation. **Refresh Releases** retries attachment after a
+longer outage; pending jobs block new deployment operations in that desktop.
+Connection settings must still match the saved device and deployment folder.
+
+The Jetson needs `dbus-user-session` and a persistent user manager. Bootstrap and
+managed-service setup enable [user lingering](https://www.freedesktop.org/software/systemd/man/252/loginctl.html).
+For an existing installation, run this once before staging:
+
+```text
+sudo loginctl enable-linger vortex
+```
+
+Jobs retain `jobs/ID.unit.json` supervisor metadata, `ID.controller.log`, and the
+existing status/build logs. Staging has a two-hour limit; activation has a five-minute
+limit. Workers do not restart automatically. Status reconciles unfinished jobs
+against systemd and reports crashes, timeouts, or units lost during reboot as
+**interrupted**, preserving activation recovery metadata. A temporary manager
+connection failure remains an inspection error, rather than a claimed interruption.
+Incomplete staging trees cannot be activated. Failed packages, trees, and logs are
+retained; automatic retention cleanup is pending. Reattachment covers submitted
+jobs; packaging and partial uploads must be retried after closing the app.
 
 No build failure, checksum failure, or lock rejection switches the running release.
 The old independent **Build Profile** button is removed; its compatibility IPC
@@ -107,7 +126,7 @@ explicitly says `legacy_process_only`. A failed first installation with no previ
 selection remains stopped. If restoration also fails, the result is
 `rollback_failed` and its journal/logs remain available; it never reports success.
 
-Activation/rollback are detached jobs, so closing the desktop does not abandon the
+Activation/rollback are systemd jobs, so closing the desktop does not abandon the
 transaction. If power fails before confirmation, the systemd entry point restores
 the previous selection before starting a runtime. A durable confirmed switch is
 kept. The journal uses boot ID plus process start identity to distinguish an active
@@ -256,8 +275,7 @@ Jetson validation.
 
 ## Remaining implementation order
 
-1. Manage jobs through systemd, add automatic UI job reattachment and service-owned
-   preview, and add a continuous frame-processing watchdog.
+1. Add service-owned preview and a continuous frame-processing watchdog.
 2. Add fresh-device compatibility checks, guided initialization, offline provisioning,
    and release retention cleanup.
 

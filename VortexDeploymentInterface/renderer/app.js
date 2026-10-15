@@ -1476,6 +1476,10 @@ async function init() {
   setMonitorIndicator("hidden", "");
   setOnnxIndicator("hidden", "");
   setBuildIndicator("hidden", "");
+  try {
+    const resumed = await window.vortexApi.resumeDeployment(readAppConfigFromUI());
+    if (!resumed.ok) appendLog(resumed.error);
+  } catch (error) { appendLog(`Job reconnection failed: ${error.message}`); }
   await refreshRemoteCameras();
   refreshCameraControls();
   renderRobotPose();

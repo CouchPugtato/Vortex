@@ -9,6 +9,7 @@ const { stageProject } = require("./staging-deploy");
 const { operateRelease, releaseStatus } = require("./activation-deploy");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
+const JOB_PATH = path.join(app.getPath("userData"), "pending_deployment_job.json");
 const LEGACY_REPO_CONFIG_PATH = path.resolve(__dirname, "..", "config", "deployment_tool_config.json");
 const LEGACY_APP_CONFIG_PATH = path.join(__dirname, "vortex_config.json");
 const LEGACY_USERDATA_CONFIG_PATH = path.join(app.getPath("userData"), "vortex_config.json");
@@ -712,6 +713,7 @@ function sftpWriteFile(sftp, remotePath, bytes) {
 async function deployProject(settings) {
   const result = await stageProject(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), {
     appDir: __dirname,
+    ...jobPersistence(settings),
     connect: connectSsh,
     execChecked,
     getSftp,
@@ -1153,6 +1155,7 @@ ipcMain.handle("set-jetson-power-limit", async (_evt, settings, watts) => {
 
 function startStaging(settings) {
   if (stagingInFlight) return { ok: false, error: "A staging operation is already running in this app" };
+  if (fsSync.existsSync(JOB_PATH)) return { ok: false, error: "A saved deployment job needs reconnection. Use Refresh Releases first." };
   try {
     buildDeviceConfig(settings);
   } catch (error) {
@@ -1168,22 +1171,77 @@ function startStaging(settings) {
 ipcMain.handle("deploy-start", async (_evt, settings) => startStaging(settings));
 ipcMain.handle("build-main-start", async (_evt, settings) => startStaging(settings));
 
-function activationDependencies() {
-  return { connect: connectSsh, execChecked, log: emitLog, progress: emitDeployProgress, user: FIXED_SSH.user };
+function jobEndpoint(settings) {
+  return { host: settings.host, user: FIXED_SSH.user, port: FIXED_SSH.port,
+    target: inferRemoteDeployFolder(settings.remote_path, settings.local_path) };
 }
 
+function jobPersistence(settings) {
+  return {
+    remember: async (job) => writeJson(JOB_PATH, { schema_version: 1, endpoint: jobEndpoint(settings), job }),
+    finished: async () => fs.rm(JOB_PATH, { force: true })
+  };
+}
+
+function activationDependencies(settings) {
+  return { connect: connectSsh, execChecked, log: emitLog, progress: emitDeployProgress,
+    user: FIXED_SSH.user, ...(settings ? jobPersistence(settings) : {}) };
+}
+
+async function resumeDeployment(settings) {
+  if (stagingInFlight) return { ok: true, attached: true };
+  if (!fsSync.existsSync(JOB_PATH)) return { ok: true, attached: false };
+  // Claim attachment before the first await, including concurrent Refresh/startup requests.
+  stagingInFlight = true;
+  let saved;
+  try {
+    saved = JSON.parse(await fs.readFile(JOB_PATH, "utf8"));
+    if (saved.schema_version !== 1 || JSON.stringify(saved.endpoint) !== JSON.stringify(jobEndpoint(settings))) {
+      stagingInFlight = false;
+      return { ok: false, error: "Saved job belongs to another device or deployment folder. Restore those connection settings to reconnect." };
+    }
+    if (!["stage", "activate", "rollback"].includes(saved.job?.kind)) throw new Error("Invalid saved deployment job");
+  } catch (error) {
+    stagingInFlight = false;
+    throw error;
+  }
+  emitLog(`Reconnecting to saved ${saved.job.kind} job. No new job will be launched.`);
+  emitDeployProgress({ status: "active", percent: 2, text: "Reconnecting to saved job..." });
+  const target = saved.endpoint.target;
+  const deps = { ...activationDependencies(settings), resume: saved.job };
+  const work = saved.job.kind === "stage" ?
+    stageProject({ ...settings, build_profile: saved.job.build_profile }, target, { ...deps, appDir: __dirname }) :
+    operateRelease(settings, target, saved.job.kind, saved.job.release_id, deps);
+  work.then(async (result) => {
+    if (saved.job.kind === "stage") {
+      const config = await readPersistedAppConfig();
+      await writeJson(APP_CONFIG_PATH, { ...config, last_ready_release: result.release_id });
+      emitReleaseState({ ready: [result.release_id] });
+    } else {
+      emitReleaseState(await releaseStatus(settings, target, activationDependencies()));
+    }
+  }).catch((error) => emitLog(`Saved deployment job: ${error.message}`))
+    .finally(() => { stagingInFlight = false; });
+  return { ok: true, attached: true };
+}
+
+ipcMain.handle("deployment-resume", async (_evt, settings) => resumeDeployment(settings));
+
 ipcMain.handle("release-status", async (_evt, settings) => {
+  const resumed = await resumeDeployment(settings);
+  if (!resumed.ok) throw new Error(resumed.error);
+  if (resumed.attached) return { job_attached: true };
   const state = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
   emitReleaseState(state);
   return state;
 });
 
 ipcMain.handle("release-operate", async (_evt, settings, action, release) => {
-  if (stagingInFlight || monitorManager.conn || serviceGuard.activeCount) {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || monitorManager.conn || serviceGuard.activeCount) {
     return { ok: false, error: "Wait for the current operation and stop diagnostics before switching releases" };
   }
   stagingInFlight = true;
-  operateRelease(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), action, release, activationDependencies())
+  operateRelease(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), action, release, activationDependencies(settings))
     .then(async () => {
       const state = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
       emitReleaseState(state);
@@ -1197,6 +1255,7 @@ ipcMain.handle("monitor-start", async (_evt, settings) => {
   emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });
   let activityStarted = false;
   try {
+    if (stagingInFlight || fsSync.existsSync(JOB_PATH)) throw new Error("Reconnect to the saved deployment job and wait for it to finish before starting diagnostics");
     const overview = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
     if (overview.active?.kind === "release" || overview.pending) {
       throw new Error("A managed release is selected. Legacy diagnostics cannot replace it; service-attached preview is pending.");

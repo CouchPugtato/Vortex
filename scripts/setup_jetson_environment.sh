@@ -131,7 +131,8 @@ if [[ "${SKIP_APT}" != "1" ]]; then
     libturbojpeg0-dev \
     libv4l-dev \
     v4l-utils \
-    python3
+    python3 \
+    dbus-user-session
 fi
 
 if [[ "${SKIP_RUST}" != "1" ]]; then
@@ -200,6 +201,7 @@ systemctl restart "${SERVICE_NAME}"
 fi
 
 echo "==> Preparing managed activation and service control"
+loginctl enable-linger "${RUN_USER}"
 sudo -u "${RUN_USER}" -H python3 -c '
 from pathlib import Path
 import sys

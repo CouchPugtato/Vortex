@@ -30,6 +30,7 @@
       "launch-config.js",
       "staging-deploy.js",
       "activation-deploy.js",
+      "job-progress.js",
       "preload.js",
       "renderer/**/*",
       "package.json"

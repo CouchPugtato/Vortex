@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 
 
@@ -344,6 +345,95 @@ def stage_release(root, archive, archive_sha256, identity, with_debug_bridge=Fal
         raise
 
 
+TERMINAL_STATES = {"ready", "active", "failed", "rolled_back", "rollback_failed", "recovered", "interrupted"}
+
+
+def user_systemd_env():
+    require(sys.platform == "linux", "Managed deployment jobs require Linux systemd")
+    runtime = f"/run/user/{os.getuid()}"
+    return dict(os.environ, XDG_RUNTIME_DIR=runtime,
+                DBUS_SESSION_BUS_ADDRESS=f"unix:path={runtime}/bus")
+
+
+def start_job(root, identity, kind, release=None, checksum=None, execute=subprocess.run):
+    """Submit once to the persistent user manager; never restart an interrupted job."""
+    root = Path(root).resolve()
+    identity = release_id(identity)
+    require(kind in ("stage", "activate", "rollback"), "Invalid managed job kind")
+    require(re.fullmatch(r"[A-Za-z0-9_./:\\-]+", str(root)), "Managed job directory must use simple absolute Linux paths")
+    env = user_systemd_env()
+    linger = execute(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"],
+                     env=env, capture_output=True, text=True, check=True, timeout=15)
+    require(linger.stdout.strip() == "yes", "Persistent deployment jobs need user lingering. Run once: sudo loginctl enable-linger " + str(os.getuid()))
+    execute(["systemctl", "--user", "show-environment"], env=env, capture_output=True,
+            text=True, check=True, timeout=15)
+    jobs = child(root, "jobs")
+    jobs.mkdir(parents=True, exist_ok=True)
+    unit = "vortex-job-"+hashlib.sha256((str(root)+"/"+identity).encode()).hexdigest()[:32]+".service"
+    controller = Path(__file__).resolve()
+    if kind == "stage":
+        require(release == identity, "Stage identity mismatch")
+        require(isinstance(checksum, str) and re.fullmatch("[a-f0-9]{64}", checksum), "Invalid archive checksum")
+        incoming = child(root, "incoming", identity)
+        require(controller == incoming/"controller.py", "Stage must use its verified uploaded controller")
+        command = [sys.executable, str(controller), "stage", "--root", str(root), "--archive",
+                   str(incoming/"release.tar.gz"), "--sha256", checksum, "--release-id", identity, "--with-debug-bridge"]
+    else:
+        command = [sys.executable, str(root/"activate_release.py"), kind, "--root", str(root), "--operation-id", identity]
+        if kind == "activate":
+            command += ["--release-id", release_id(release)]
+    descriptor = jobs/(identity+".unit.json")
+    # An exclusive dispatch claim also covers a lost SSH reply during submission.
+    with (jobs/(identity+".dispatch")).open("x") as stream:
+        stream.write(unit)
+    data = dict(schema_version=1, job_id=identity, kind=kind, unit=unit, submitted_at=time.time(), dispatch="submitting")
+    atomic_json(descriptor, data)
+    try:
+        execute(["systemd-run", "--user", "--unit="+unit, "--description=Vortex "+kind,
+                 "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
+                 "--property=TimeoutStopSec=15", "--property=RuntimeMaxSec="+("7200" if kind == "stage" else "300"),
+                 "--property=Nice=10", "--property=WorkingDirectory="+str(root),
+                 "--property=StandardOutput=append:"+str(jobs/(identity+".controller.log")),
+                 "--property=StandardError=inherit", "--", *command],
+                env=env, capture_output=True, text=True, check=True, timeout=30)
+        data["dispatch"] = "submitted"
+        atomic_json(descriptor, data)
+    except Exception:
+        # Submission may have succeeded before SSH/systemd-run lost its reply.
+        # Preserve the descriptor; status reconciles with the manager.
+        raise
+    return data
+
+
+def supervised_status(root, identity, job, execute=subprocess.run):
+    root = Path(root).resolve()
+    descriptor = child(root, "jobs", release_id(identity)+".unit.json")
+    if descriptor.exists():
+        data = read_json(descriptor)
+        expected = "vortex-job-"+hashlib.sha256((str(root)+"/"+identity).encode()).hexdigest()[:32]+".service"
+        require(data["unit"] == expected and data["job_id"] == identity, "Invalid managed job descriptor")
+        response = execute(["systemctl", "--user", "show", expected, "-p", "ActiveState", "-p", "Result",
+                            "-p", "ExecMainStatus", "-p", "LoadState"], env=user_systemd_env(), capture_output=True, text=True, timeout=15)
+        values = dict(line.split("=", 1) for line in response.stdout.splitlines() if "=" in line)
+        require(response.returncode == 0 or values.get("LoadState") == "not-found",
+                "Cannot inspect deployment job manager; reconnect before retrying")
+        job["unit"] = expected
+        job["unit_state"] = values.get("ActiveState")
+        if job["state"] not in TERMINAL_STATES and values.get("ActiveState") not in ("active", "activating", "reloading", "deactivating"):
+            if data["dispatch"] == "submitted" or time.time()-data["submitted_at"] > 30:
+                job = dict(job, state="interrupted", error="Deployment worker stopped before completing; inspect logs and recovery state",
+                           unit_result=values.get("Result"), exit_status=values.get("ExecMainStatus"))
+    # The compiler writes a private log; otherwise show the controller's output.
+    for suffix in (".log", ".controller.log"):
+        log = child(root, "jobs", identity+suffix)
+        if log.is_file():
+            with log.open("rb") as stream:
+                stream.seek(max(0, log.stat().st_size-16384))
+                job["log_tail"] = stream.read(16384).decode("utf-8", errors="replace")
+            break
+    return job
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -362,6 +452,12 @@ def main(argv=None):
     status = actions.add_parser("status")
     status.add_argument("--root", type=Path, required=True)
     status.add_argument("--release-id", required=True)
+    start = actions.add_parser("start-job")
+    start.add_argument("--root", type=Path, required=True)
+    start.add_argument("--job-id", required=True)
+    start.add_argument("--kind", choices=("stage", "activate", "rollback"), required=True)
+    start.add_argument("--release-id")
+    start.add_argument("--sha256")
     args = parser.parse_args(argv)
     try:
         if args.action == "pack":
@@ -370,13 +466,16 @@ def main(argv=None):
             if hasattr(os, "nice"):
                 os.nice(10)
             result = stage_release(args.root, args.archive, args.sha256, args.release_id, args.with_debug_bridge)
+        elif args.action == "start-job":
+            result = start_job(args.root, args.job_id, args.kind, args.release_id, args.sha256)
         else:
             identity = release_id(args.release_id)
             job_path = child(args.root.resolve(), "jobs", identity+".json")
             result = read_json(job_path) if job_path.exists() else dict(release_id=identity, state="starting", activated=False)
+            result = supervised_status(args.root, identity, result)
         print(json.dumps(result, allow_nan=False))
         return 0
-    except (OSError, ValueError, TypeError, RuntimeError, EOFError, subprocess.CalledProcessError, tarfile.TarError) as error:
+    except (OSError, ValueError, TypeError, RuntimeError, EOFError, subprocess.SubprocessError, tarfile.TarError) as error:
         print(f"Vortex release operation failed: {error}", file=sys.stderr)
         return 1
 

@@ -14,7 +14,7 @@ function harness(states = ["active"], overview = { service_configured: true, con
     connect: async () => { connects++; return { end() {} }; },
     execChecked: async (conn, command) => {
       commands.push(command);
-      if (command.startsWith("nohup ")) operation = command.match(/--operation-id '([^']+)'/)[1];
+      if (command.includes(" start-job ")) operation = command.match(/--job-id '([^']+)'/)[1];
       if (command.includes(" status ") && !command.includes("--operation-id")) return { stdout: JSON.stringify(overview) };
       if (command.includes(" status ")) {
         const next = states.shift() || "active";
@@ -30,11 +30,11 @@ function harness(states = ["active"], overview = { service_configured: true, con
   return { deps, commands, progress, logs, get connects() { return connects; } };
 }
 
-test("activation uses a detached saved operation and waits for verified camera health", async () => {
+test("activation uses a systemd saved operation and waits for verified camera health", async () => {
   const h = harness(["validating", "stopping", "switching", "verifying", "active"]);
   const result = await operateRelease(settings, remote, "activate", "new", h.deps);
   assert.equal(result.state, "active");
-  assert(h.commands.some((command) => command.startsWith("nohup ") && command.includes(" activate ")));
+  assert(h.commands.some((command) => command.includes(" start-job ") && command.includes("--kind 'activate'")));
   assert.equal(h.progress.at(-1).text, "Release active — camera health verified");
 });
 
@@ -49,7 +49,7 @@ test("first activation prepares the managed service without hiding sudo errors",
     return checked(conn, command);
   };
   await assert.rejects(operateRelease(settings, remote, "activate", "new", failed.deps), /Run this once on the Jetson with sudo/);
-  assert(!failed.commands.some((command) => command.startsWith("nohup ")));
+  assert(!failed.commands.some((command) => command.includes(" start-job ")));
 });
 
 test("automatic rollback is reported as a failed activation with restored installation", async () => {
@@ -75,14 +75,14 @@ test("temporary disconnection reconnects without starting another activation", a
   const h = harness([new Error("disconnected"), "active"]);
   await operateRelease(settings, remote, "activate", "new", h.deps);
   assert.equal(h.connects, 2);
-  assert.equal(h.commands.filter((command) => command.startsWith("nohup ")).length, 1);
+  assert.equal(h.commands.filter((command) => command.includes(" start-job ")).length, 1);
 });
 
 test("manual rollback can restore a legacy process without claiming camera verification", async () => {
   const h = harness([{ state: "active", action: "rollback", selection: { kind: "legacy" }, verification: "legacy_process_only" }]);
   await operateRelease(settings, remote, "rollback", "new", h.deps);
   assert.equal(h.progress.at(-1).text, "Rollback verified");
-  assert(h.commands.some((command) => command.startsWith("nohup ") && command.includes(" rollback ")));
+  assert(h.commands.some((command) => command.includes(" start-job ") && command.includes("--kind 'rollback'")));
 });
 
 test("invalid action/release is rejected before any remote command", async () => {
@@ -106,4 +106,45 @@ test("a fresh desktop can inspect the installed controller without a saved relea
   assert.equal(overview.active.release_id, "new");
   assert(h.commands[0].startsWith("if [ -f "));
   assert(!h.commands[0].includes("sudo"));
+});
+
+
+test("reopening activation watches its original ID without service preparation or another submission", async () => {
+  const h = harness([{ operation_id: "activation-saved", state: "verifying", log_tail: "verifying cameras" },
+    { operation_id: "activation-saved", state: "active" }]);
+  h.deps.resume = { kind: "activate", operation_id: "activation-saved", release_id: "new" };
+  let finished = 0;
+  h.deps.finished = async () => finished++;
+  await operateRelease(settings, remote, "activate", "new", h.deps);
+  assert(h.commands.every((command) => command.includes(" status ") && command.includes("activation-saved")));
+  assert(h.logs.includes("verifying cameras"));
+  assert.equal(finished, 1);
+});
+
+test("an interrupted activation never claims verified health or restarts automatically", async () => {
+  const h = harness([{ state: "interrupted", error: "Worker stopped" }]);
+  let finished = false;
+  h.deps.finished = async () => { finished = true; };
+  await assert.rejects(operateRelease(settings, remote, "activate", "new", h.deps), /Worker stopped/);
+  assert(finished);
+  assert.equal(h.commands.filter((command) => command.includes(" start-job ")).length, 1);
+  assert.equal(h.progress.at(-1).status, "error");
+});
+
+test("activation identity is saved before submission and retained on lost replies", async () => {
+  const h = harness();
+  let saved, finished = false;
+  h.deps.remember = async (job) => { saved = job; };
+  h.deps.finished = async () => { finished = true; };
+  const execute = h.deps.execChecked;
+  h.deps.execChecked = async (conn, command) => {
+    if (command.includes(" start-job ")) {
+      assert(command.includes(saved.operation_id));
+      throw new Error("SSH reply lost");
+    }
+    return execute(conn, command);
+  };
+  await assert.rejects(operateRelease(settings, remote, "activate", "new", h.deps), /SSH reply lost/);
+  assert.equal(saved.kind, "activate");
+  assert.equal(finished, false);
 });

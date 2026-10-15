@@ -59,7 +59,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
     } };
   const source = fs.readFileSync(path.join(appDir, "main.js"), "utf8");
   vm.runInNewContext(source+"\nmodule.exports = { APP_CONFIG_PATH, stopManagedStartupService, " +
-    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging };", sandbox);
+    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging, JOB_PATH, resumeDeployment };", sandbox);
   return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, overview, directory, connection: new FakeClient() };
 }
 
@@ -150,4 +150,65 @@ test("activation IPC shares the staging guard and blocks legacy diagnostics on m
   assert.equal(result.ok, false);
   assert(result.error.includes("managed release"));
   assert.equal(h.commands.length, 0);
+});
+
+
+function savedJob(h, job, overrides = {}) {
+  fs.writeFileSync(h.JOB_PATH, JSON.stringify({ schema_version: 1,
+    endpoint: { host: settings.host, user: "vortex", port: "22", target: "/home/vortex/deployments/Vortex", ...overrides }, job }));
+}
+
+test("saved jobs reattach through IPC on the original device and block duplicate app operations", async (t) => {
+  let finish;
+  const h = harness(t, () => 0, () => new Promise((resolve) => { finish = resolve; }));
+  savedJob(h, { kind: "stage", release_id: "old-job", build_profile: "cpu" });
+  const [result] = await Promise.all([
+    h.handlers.get("deployment-resume")(null, settings), h.resumeDeployment(settings)
+  ]);
+  assert.equal(result.attached, true);
+  assert.equal(h.stageCalls.length, 1);
+  assert.equal(h.stageCalls[0][0].build_profile, "cpu");
+  assert.equal(h.stageCalls[0][2].resume.release_id, "old-job");
+  assert.equal(h.startStaging(settings).ok, false);
+  assert.equal((await h.handlers.get("release-operate")(null, settings, "activate", "new")).ok, false);
+  assert.equal((await h.resumeDeployment(settings)).attached, true);
+  assert.equal(h.stageCalls.length, 1);
+  await h.stageCalls[0][2].finished();
+  finish({ state: "ready", release_id: "old-job" });
+  // Allow the persistent last-ready update to complete before temporary cleanup.
+  for (let i = 0; i < 30 && !fs.existsSync(h.APP_CONFIG_PATH); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(JSON.parse(fs.readFileSync(h.APP_CONFIG_PATH)).last_ready_release, "old-job");
+});
+
+test("pending activation reconnects using its saved operation ID without preparing another release", async (t) => {
+  const h = harness(t);
+  savedJob(h, { kind: "rollback", operation_id: "activation-original", release_id: "new" });
+  assert.equal((await h.resumeDeployment(settings)).attached, true);
+  assert.equal(h.activationCalls[0][2], "rollback");
+  assert.equal(h.activationCalls[0][4].resume.operation_id, "activation-original");
+  await new Promise(setImmediate);
+});
+
+test("saved job from another device is never polled or overwritten", async (t) => {
+  const h = harness(t);
+  savedJob(h, { kind: "activate", operation_id: "original", release_id: "new" }, { host: "other-device" });
+  assert.equal((await h.resumeDeployment(settings)).ok, false);
+  assert.equal(h.stageCalls.length, 0);
+  assert.equal(h.activationCalls.length, 0);
+  assert.equal(h.startStaging(settings).ok, false);
+  assert.equal(h.commands.length, 0);
+});
+
+test("saved job persistence contains only job identity and device location", async (t) => {
+  const h = harness(t);
+  await h.buildMainProgram(settings);
+  const callbacks = h.stageCalls[0][2];
+  await callbacks.remember({ kind: "stage", release_id: "original" });
+  const saved = JSON.parse(fs.readFileSync(h.JOB_PATH));
+  assert.deepEqual(Object.keys(saved).sort(), ["endpoint", "job", "schema_version"]);
+  assert.equal(saved.endpoint.host, settings.host);
+  assert(!fs.readFileSync(h.JOB_PATH, "utf8").includes("redstorm"));
+  await callbacks.finished();
+  assert.equal(fs.existsSync(h.JOB_PATH), false);
 });
