@@ -32,6 +32,7 @@
       "activation-deploy.js",
       "job-progress.js",
       "initialize-deploy.js",
+      "service-diagnostics.js",
       "preload.js",
       "renderer/**/*",
       "package.json"

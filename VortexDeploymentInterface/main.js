@@ -8,6 +8,7 @@ const { LAUNCHER, buildDeviceConfig } = require("./launch-config");
 const { stageProject } = require("./staging-deploy");
 const { operateRelease, releaseStatus } = require("./activation-deploy");
 const { initializeJetson } = require("./initialize-deploy");
+const { ServiceDiagnostics } = require("./service-diagnostics");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const JOB_PATH = path.join(app.getPath("userData"), "pending_deployment_job.json");
@@ -25,6 +26,14 @@ const serviceGuard = {
 };
 let quitCleanupInProgress = false;
 let stagingInFlight = false;
+const serviceDiagnostics = new ServiceDiagnostics({
+  connect: connectSsh, execChecked, log: emitLog, monitorState: emitMonitorState,
+  frame: (packet) => { const win = getWindow(); if (win) win.webContents.send("service-frame", packet); },
+  status: (status) => {
+    emitPreviewState(Boolean(status.ready));
+    const win = getWindow(); if (win) win.webContents.send("service-status", status);
+  }
+});
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -53,6 +62,7 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
+  serviceDiagnostics.stop();
   monitorManager.stop();
   previewManager.stop();
   if (process.platform !== "darwin") app.quit();
@@ -64,6 +74,7 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   (async () => {
     try {
+      await serviceDiagnostics.stop();
       await monitorManager.stop();
       previewManager.stop();
       await restartManagedStartupServiceOnExit();
@@ -1287,58 +1298,30 @@ ipcMain.handle("release-operate", async (_evt, settings, action, release) => {
 });
 
 ipcMain.handle("monitor-start", async (_evt, settings) => {
-  emitMonitorStartProgress({ status: "starting", percent: 5, text: "Starting..." });
-  let activityStarted = false;
   try {
-    if (stagingInFlight || fsSync.existsSync(JOB_PATH)) throw new Error("Reconnect to the saved deployment job and wait for it to finish before starting diagnostics");
-    const overview = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
-    if (overview.active?.kind === "release" || overview.pending) {
-      throw new Error("A managed release is selected. Legacy diagnostics cannot replace it; service-attached preview is pending.");
-    }
-    await beginManagedToolActivity(settings, "monitor");
-    activityStarted = true;
-    await monitorManager.start(settings);
-    monitorManager.activityHeld = true;
+    if (stagingInFlight || fsSync.existsSync(JOB_PATH)) throw new Error("Reconnect to the saved deployment job before attaching diagnostics");
+    emitMonitorStartProgress({ status: "starting", percent: 10, text: "Attaching to production service..." });
+    await serviceDiagnostics.start(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path));
+    emitMonitorStartProgress({ status: "done", percent: 100, text: "Production diagnostics attached" });
     return { ok: true };
-  } catch (err) {
-    if (activityStarted && monitorManager.activityHeld) {
-      endManagedToolActivity();
-      monitorManager.activityHeld = false;
-    } else if (activityStarted) {
-      endManagedToolActivity();
-    }
-    const msg = err?.message || String(err);
-    emitLog(`Monitor start failed: ${msg}`);
-    if (msg.includes("All configured authentication methods failed")) {
-      emitLog("Authentication failed. Check the Jetson address, account and SSH password in Jetson Setup.");
-    }
-    emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
-    return { ok: false, error: msg };
+  } catch (error) {
+    emitMonitorStartProgress({ status: "error", percent: 0, text: error.message });
+    return { ok: false, error: error.message };
   }
 });
 
 ipcMain.handle("monitor-stop", async () => {
-  await monitorManager.stop();
+  await serviceDiagnostics.stop();
   return { ok: true };
 });
 
-ipcMain.handle("preview-start", async (_evt, settings) => {
-  try {
-    previewManager.start(settings);
-    return { ok: true };
-  } catch (err) {
-    const msg = err?.message || String(err);
-    emitLog(`Preview start failed: ${msg}`);
-    return { ok: false, error: msg };
-  }
-});
-
-ipcMain.handle("preview-stop", async () => {
-  previewManager.stop();
-  return { ok: true };
-});
+ipcMain.handle("preview-start", async () => serviceDiagnostics.running ? { ok: true } :
+  { ok: false, error: "Attach production diagnostics first. Activate an updated release if necessary." });
+ipcMain.handle("preview-stop", async () => ({ ok: true }));
 
 ipcMain.handle("list-remote-cameras", async (_evt, settings) => {
+  const overview = await releaseStatus(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), activationDependencies());
+  if (overview.active?.kind === "release") return { ok: true, cameras: overview.configured_cameras || [] };
   const conn = await connectSsh(settings);
   try {
     const grouped = await execCommand(

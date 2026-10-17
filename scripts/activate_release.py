@@ -1,5 +1,6 @@
 """Transactional release activation, systemd entry point, and interrupted-switch recovery."""
 import argparse
+import base64
 from datetime import datetime, timezone
 import json
 import os
@@ -112,10 +113,13 @@ class Systemd:
         return subprocess.run(prefix+["systemctl", *args, self.name], capture_output=True, text=True, check=True, timeout=30)
 
     def info(self):
-        result = subprocess.run(["systemctl", "show", self.name, "-p", "ActiveState", "-p", "MainPID"],
+        result = subprocess.run(["systemctl", "show", self.name, "-p", "ActiveState", "-p", "MainPID",
+                                 "-p", "NRestarts", "-p", "Result", "-p", "StatusText"],
                                 capture_output=True, text=True, check=True, timeout=10)
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-        return dict(active=values.get("ActiveState") == "active", pid=int(values.get("MainPID", "0")))
+        return dict(active=values.get("ActiveState") == "active", pid=int(values.get("MainPID", "0")),
+                    state=values.get("ActiveState"), restarts=int(values.get("NRestarts", "0")),
+                    result=values.get("Result"), status=values.get("StatusText"))
 
     def stop(self):
         self.command("stop")
@@ -365,7 +369,14 @@ def service_run(root):
         directory, _ = ready_release(root, selection["release_id"])
         verify_current_pointer(root, directory)
         env = dict(os.environ, VORTEX_HEALTH_PATH=str(root/"health.json"),
+                   VORTEX_DIAGNOSTICS_DIR=str(root/"diagnostics"), VORTEX_SERVICE_WATCHDOG="1",
                    VORTEX_RELEASE_ID=selection["release_id"], VORTEX_LAUNCH_TOKEN=selection["launch_token"])
+        device = read_json(directory/"config/device.json")
+        runtime = read_json(directory/device["runtime_config"])
+        required = ["apriltag-gpu" if "gpu" in deployment.PROFILES[device["build_profile"]] else "apriltag-cpu"]
+        if "tensorrt" in deployment.PROFILES[device["build_profile"]] and runtime.get("object_detection", {}).get("use_nn", True):
+            required.append("yolo-tensorrt")
+        env["VORTEX_REQUIRED_BACKENDS"] = ",".join(required)
         os.execve(sys.executable, [sys.executable, str(directory/"scripts/run_vortex.py")], env)
     else:
         script = Path(selection["path"])/"run_vortex.sh"
@@ -429,6 +440,10 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+NotifyAccess=main
+WatchdogSec=0
+WatchdogSignal=SIGTERM
+TimeoutAbortSec=5
 User={user}
 Group={account.pw_gid}
 ExecStart=/usr/bin/python3 {root}/activate_release.py service-run --root {root}
@@ -475,6 +490,65 @@ WantedBy=multi-user.target
         return config
 
 
+def diagnostics(root, camera, client, stop=False, manager=None, clock=time.time):
+    """Read-only runtime attachment; the only write is a short preview lease."""
+    require(type(camera) is int and 0 <= camera <= 63, "Invalid diagnostics camera")
+    require(isinstance(client, str) and re.fullmatch(r"[A-Za-z0-9-]{1,96}", client), "Invalid diagnostics client")
+    directory = child(root, "diagnostics")
+    request = directory/"request.json"
+    if stop:
+        lease = optional_json(request, {})
+        if lease.get("client_id") == client:
+            request.unlink(missing_ok=True)
+        return dict(schema_version=1, detached=True)
+    info = (manager or Systemd(root)).info()
+    result = dict(schema_version=1, ready=False, camera_index=camera, service=info, reason="Service is not running")
+    if not info["active"] or info["pid"] <= 0:
+        return result
+    selection = selected(root)
+    if selection["kind"] != "release":
+        return dict(result, reason="Activate a managed release to use service diagnostics")
+    report = optional_json(root/"health.json", {})
+    now = int(clock()*1000)
+    if (report.get("schema_version") != 1 or report.get("release_id") != selection["release_id"] or report.get("launch_token") != selection["launch_token"] or
+            report.get("pid") != info["pid"] or report.get("diagnostics_version") != 1 or
+            not 0 <= now-report.get("timestamp_ms", 0) <= 1500):
+        return dict(result, reason="Waiting for current runtime health; older releases need rebuilding with service diagnostics")
+    camera_health = next((value for value in report.get("cameras", []) if value.get("index") == camera), None)
+    require(camera_health is not None, "Selected camera is not configured in the active release")
+    result.update(health=report, camera_health=camera_health, reason="Waiting for a processed preview")
+    directory.mkdir(exist_ok=True)
+    previous = optional_json(request, {})
+    if (previous.get("client_id") != client and previous.get("pid") == info["pid"] and
+            previous.get("launch_token") == selection["launch_token"] and now < previous.get("expires_ms", 0) <= now+5000):
+        return dict(result, reason="Another diagnostics client has the preview lease")
+    atomic_json(request, dict(schema_version=1, release_id=selection["release_id"], launch_token=selection["launch_token"],
+                              pid=info["pid"], camera_index=camera, client_id=client, expires_ms=now+3000))
+    state = optional_json(directory/"preview.json", {})
+    if (state.get("schema_version") != 1 or state.get("pid") != info["pid"] or state.get("release_id") != selection["release_id"] or
+            state.get("launch_token") != selection["launch_token"] or state.get("camera_index") != camera or state.get("client_id") != client or
+            not 0 <= now-state.get("timestamp_ms", 0) <= 1500 or
+            not 0 <= state.get("latency_ms", 999999)+now-state.get("timestamp_ms", 0) <= 1500):
+        return result
+    name = state.get("frame_id")
+    require(isinstance(name, str) and re.fullmatch(r"frame-[0-9]+-[0-9]+\.jpg", name), "Invalid preview frame path")
+    image = child(directory, name)
+    try:
+        require(0 < image.stat().st_size <= 512*1024, "Preview image exceeds limits")
+        jpeg = image.read_bytes()
+    except FileNotFoundError:
+        return result  # The bounded producer rotated this frame; next poll gets a newer one.
+    require(jpeg.startswith(b"\xff\xd8"), "Invalid preview JPEG")
+    # A restart/switch while reading must never pair an old image with a new runtime.
+    if selected(root) != selection or (manager or Systemd(root)).info()["pid"] != info["pid"]:
+        return dict(result, reason="Runtime changed while reading preview")
+    state["fps"] = camera_health.get("fps", 0)
+    state["frame_age_ms"] = state["latency_ms"]+now-state["timestamp_ms"]
+    state["watchdog"] = report.get("watchdog", "unknown")
+    return dict(result, ready=True, reason="Production service attached", state=state,
+                jpeg_base64=base64.b64encode(jpeg).decode("ascii"))
+
+
 def status(root, operation_id=None):
     if operation_id:
         path = child(root, "jobs", deployment.release_id(operation_id)+".json")
@@ -493,7 +567,12 @@ def status(root, operation_id=None):
         except (OSError, ValueError, KeyError):
             continue
     installed = root/"activate_release.py"
+    current = selected(root)
+    cameras = []
+    if current["kind"] == "release":
+        cameras = read_json(child(root, "releases", deployment.release_id(current["release_id"]), "config/device.json"))["cameras"]
     return dict(ready=ready, active=optional_json(root/"active.json", {"kind": "none"}),
+                configured_cameras=cameras,
                 previous=optional_json(root/"previous.json", {"kind": "none"}),
                 pending=optional_json(root/"activation.json"), service_configured=bool(optional_json(root/"managed-service.json", {}).get("installed")),
                 controller_current=installed.is_file() and deployment.sha256(installed) == deployment.sha256(Path(__file__)) and
@@ -502,13 +581,15 @@ def status(root, operation_id=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("activate", "rollback", "recover", "service-run", "install-service", "status", "preflight"))
+    parser.add_argument("action", choices=("activate", "rollback", "recover", "service-run", "install-service", "status", "preflight", "diagnostics", "diagnostics-stop"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--release-id")
     parser.add_argument("--operation-id")
     parser.add_argument("--legacy-root", type=Path)
     parser.add_argument("--service", default="vortex-vision.service")
     parser.add_argument("--user", default="vortex")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--client-id")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -528,6 +609,8 @@ def main(argv=None):
         elif args.action == "preflight":
             require(args.release_id is not None, "--release-id is required")
             result = native_preflight(root, args.release_id)
+        elif args.action in ("diagnostics", "diagnostics-stop"):
+            result = diagnostics(root, args.camera, args.client_id, args.action == "diagnostics-stop")
         else:
             result = activate(root, args.release_id, args.action == "rollback", args.operation_id)
         print(json.dumps(result, allow_nan=False))

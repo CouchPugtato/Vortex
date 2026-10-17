@@ -14,6 +14,46 @@ const state = {
   viewMode: "apriltag",
   pipelineRunning: false
 };
+let pendingServiceFrame = null;
+let loadingServiceFrame = null;
+let serviceImageLoading = false;
+let serviceSourceDims = null;
+
+function showServiceFrame(packet) {
+  if (!packet?.state || !packet.dataUrl) {
+    pendingServiceFrame = null;
+    loadingServiceFrame = null;
+    serviceImageLoading = false;
+    serviceSourceDims = null;
+    el.previewImage.removeAttribute("src");
+    const row = state.cameras.get(Number(state.selectedCamera));
+    if (row) { row.apriltags = []; row.objects = []; row.lastTagById?.clear(); }
+    state.robotPose = null;
+    renderDetectionTable();
+    renderRobotPose();
+    scheduleOverlayDraw();
+    return;
+  }
+  pendingServiceFrame = packet;
+  if (serviceImageLoading) return;
+  loadingServiceFrame = pendingServiceFrame;
+  pendingServiceFrame = null;
+  serviceImageLoading = true;
+  el.previewImage.src = loadingServiceFrame.dataUrl;
+}
+function finishServiceFrame() {
+  if (!serviceImageLoading || !loadingServiceFrame) return false;
+  const packet = loadingServiceFrame;
+  loadingServiceFrame = null;
+  serviceImageLoading = false;
+  serviceSourceDims = { w: packet.state.source_width, h: packet.state.source_height };
+  state.cameras.get(Number(packet.state.camera_index))?.lastTagById?.clear();
+  applyBridgeState(packet.state);
+  scheduleOverlayDraw();
+  if (pendingServiceFrame) showServiceFrame(pendingServiceFrame);
+  return true;
+}
+
 const CAMERA_ACTIVE_MS = 4000;
 const TAG_OVERLAY_STICKY_MS = 450;
 
@@ -116,7 +156,7 @@ let deployFadeTimer = null;
 let monitorFadeTimer = null;
 let onnxFadeTimer = null;
 let buildFadeTimer = null;
-let runtimeSyncTimer = null;
+let runtimeSaveTimer = null;
 let overlayRaf = 0;
 let fieldRaf = 0;
 let pendingPreviewDataUrl = null;
@@ -342,7 +382,7 @@ function syncNetworkFieldState() {
 
 function readAppConfigFromUI() {
   const cam = Number(state.selectedCamera || 0);
-  const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  const normalizedCam = Number.isFinite(cam) && cam >= 0 && cam <= 63 ? cam : 0;
   const tagMapPath = String(el.tagMapPath?.value || state.tagMapPath || "").trim();
   const onnxPath = String(el.onnxPath?.value || state.onnxPath || "").trim();
   const wattsRaw = Number(el.jetsonWatts?.value ?? state.appConfig?.jetson_max_watts ?? 15);
@@ -436,7 +476,7 @@ function renderRuntimeForm(config) {
         input.className = "toggle-input";
         input.checked = value == null ? Boolean(spec.defaultValue) : Boolean(value);
         input.addEventListener("change", () => {
-          scheduleLiveRuntimeSync();
+          scheduleRuntimeSave();
         });
       } else if (spec?.type === "range") {
         input.type = "range";
@@ -450,7 +490,7 @@ function renderRuntimeForm(config) {
         valueEl.textContent = input.value;
         input.addEventListener("input", () => {
           valueEl.textContent = input.value;
-          scheduleLiveRuntimeSync();
+          scheduleRuntimeSave();
         });
         wrap.appendChild(input);
         wrap.appendChild(valueEl);
@@ -459,7 +499,7 @@ function renderRuntimeForm(config) {
       } else {
         input.type = "text";
         input.value = value ?? "";
-        input.addEventListener("change", () => scheduleLiveRuntimeSync());
+        input.addEventListener("change", () => scheduleRuntimeSave());
       }
       wrap.appendChild(input);
       grid.appendChild(wrap);
@@ -494,7 +534,7 @@ function renderObjectDetectionForm(config) {
       input.type = "checkbox";
       input.className = "toggle-input";
       input.checked = value == null ? Boolean(spec.defaultValue) : Boolean(value);
-      input.addEventListener("change", () => scheduleLiveRuntimeSync());
+      input.addEventListener("change", () => scheduleRuntimeSave());
     } else if (spec?.type === "range") {
       input.type = "range";
       input.className = "slider-input";
@@ -507,7 +547,7 @@ function renderObjectDetectionForm(config) {
       valueEl.textContent = input.value;
       input.addEventListener("input", () => {
         valueEl.textContent = input.value;
-        scheduleLiveRuntimeSync();
+        scheduleRuntimeSave();
       });
       wrap.appendChild(input);
       wrap.appendChild(valueEl);
@@ -516,7 +556,7 @@ function renderObjectDetectionForm(config) {
     } else {
       input.type = "text";
       input.value = value ?? "";
-      input.addEventListener("change", () => scheduleLiveRuntimeSync());
+      input.addEventListener("change", () => scheduleRuntimeSave());
     }
     wrap.appendChild(input);
     grid.appendChild(wrap);
@@ -554,7 +594,7 @@ function readRuntimeConfigFromForm() {
     merged.camera_profiles = {};
   }
   const cam = Number(state.selectedCamera);
-  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 63 ? cam : 0;
   merged.camera_profiles[String(profileId)] = formResult.camera;
   if (!merged.camera || typeof merged.camera !== "object" || profileId === 0) {
     merged.camera = formResult.camera;
@@ -564,16 +604,11 @@ function readRuntimeConfigFromForm() {
   return merged;
 }
 
-function scheduleLiveRuntimeSync() {
-  if (runtimeSyncTimer) clearTimeout(runtimeSyncTimer);
-  runtimeSyncTimer = setTimeout(async () => {
+function scheduleRuntimeSave() {
+  if (runtimeSaveTimer) clearTimeout(runtimeSaveTimer);
+  runtimeSaveTimer = setTimeout(async () => {
     state.runtimeConfig = readRuntimeConfigFromForm();
     await window.vortexApi.saveRuntimeConfig(el.runtimePath.value.trim(), state.runtimeConfig).catch(() => {});
-    if (state.pipelineRunning) {
-      await window.vortexApi
-        .syncRuntimeConfigRemote(readAppConfigFromUI(), state.runtimeConfig)
-        .catch(() => {});
-    }
   }, 180);
 }
 
@@ -625,10 +660,10 @@ function ensureCameraProfilesForIds(ids) {
 }
 
 function renderRuntimeFormForCurrentCamera() {
-  const ids = [0, 1, 2, 3, 4, 5];
+  const ids = [...new Set([0, 1, 2, 3, 4, 5, ...(state.remoteCameras || []), Number(state.selectedCamera)])].filter((id) => Number.isInteger(id) && id >= 0 && id <= 63);
   ensureCameraProfilesForIds(ids);
   const cam = Number(state.selectedCamera);
-  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 5 ? cam : 0;
+  const profileId = Number.isFinite(cam) && cam >= 0 && cam <= 63 ? cam : 0;
   const cfg = JSON.parse(JSON.stringify(state.runtimeConfig || {}));
   const profile = cfg?.camera_profiles?.[String(profileId)];
   if (profile && typeof profile === "object") {
@@ -645,7 +680,7 @@ async function refreshRemoteCameras() {
     if (r?.ok && Array.isArray(r.cameras)) {
       state.remoteCameras = r.cameras
         .map((n) => Number(n))
-        .filter((n) => Number.isFinite(n) && n >= 0 && n <= 5)
+        .filter((n) => Number.isFinite(n) && n >= 0 && n <= 63)
         .sort((a, b) => a - b);
       return state.remoteCameras;
     }
@@ -656,6 +691,7 @@ async function refreshRemoteCameras() {
 }
 
 function previewSourceDims() {
+  if (serviceSourceDims) return serviceSourceDims;
   if (el.previewImage?.naturalWidth > 0 && el.previewImage?.naturalHeight > 0) {
     return { w: el.previewImage.naturalWidth, h: el.previewImage.naturalHeight };
   }
@@ -1013,7 +1049,7 @@ function drawOverlay() {
     const now = Date.now();
     const drawList = [];
     for (const t of tags) drawList.push({ corners: t.corners });
-    if (drawList.length === 0 && data.lastTagById instanceof Map) {
+    if (drawList.length === 0 && !serviceSourceDims && data.lastTagById instanceof Map) {
       for (const entry of data.lastTagById.values()) {
         if (!entry || !Array.isArray(entry.corners)) continue;
         if (now - Number(entry.lastSeenTs || 0) <= TAG_OVERLAY_STICKY_MS) {
@@ -1052,6 +1088,78 @@ function drawOverlay() {
       ctx.fillText(`${o.className} ${o.conf.toFixed(2)}`, x + 4, Math.max(12, y - 4));
     }
   }
+}
+
+function applyBridgeState(bridge) {
+    const cam = Number(bridge?.camera_index);
+    if (!Number.isFinite(cam)) return;
+    if (!state.cameras.has(cam)) {
+      state.cameras.set(cam, {
+        fps: null,
+        apriltags: [],
+        objects: [],
+        lastSeen: 0,
+        tagFrameHistory: [],
+        lastTagById: new Map()
+      });
+    }
+    const row = state.cameras.get(cam);
+    row.lastSeen = Date.now();
+    if (Number.isFinite(Number(bridge?.fps))) row.fps = Number(bridge.fps);
+    if (Array.isArray(bridge?.apriltags)) {
+      row.apriltags = bridge.apriltags.map((t) => ({
+        id: Number(t?.id),
+        dist: Number(t?.floor_z_error ?? t?.z ?? 0),
+        x: Number(t?.x ?? 0),
+        y: Number(t?.y ?? 0),
+        corners: Array.isArray(t?.corners) ? t.corners : []
+      }));
+      const idsThisFrame = row.apriltags.map((t) => t.id).filter((id) => Number.isFinite(id));
+      row.tagFrameHistory = row.tagFrameHistory || [];
+      row.tagFrameHistory.push(idsThisFrame);
+      if (row.tagFrameHistory.length > 300) row.tagFrameHistory.splice(0, row.tagFrameHistory.length - 300);
+      row.lastTagById = row.lastTagById || new Map();
+      for (const t of row.apriltags) {
+        row.lastTagById.set(t.id, {
+          dist: t.dist,
+          x: t.x,
+          y: t.y,
+          corners: t.corners,
+          lastSeenTs: Date.now()
+        });
+      }
+    }
+    if (Array.isArray(bridge?.objects)) {
+      row.objects = bridge.objects.map((o) => ({
+        className: String(o?.class_name ?? ""),
+        conf: Number(o?.confidence ?? 0),
+        dist: Number(o?.z ?? 0),
+        x: Number(Array.isArray(o?.bbox) ? o.bbox[0] : 0),
+        y: Number(Array.isArray(o?.bbox) ? o.bbox[1] : 0),
+        bbox: `BBox: [${Array.isArray(o?.bbox) ? o.bbox.join(",") : ""}]`,
+        bboxWidth: Number(Array.isArray(o?.bbox) ? o.bbox[2] : 0),
+        bboxHeight: Number(Array.isArray(o?.bbox) ? o.bbox[3] : 0)
+      }));
+    }
+    if (bridge?.robot_pose && Number.isFinite(Number(bridge.robot_pose.x)) && Number.isFinite(Number(bridge.robot_pose.y))) {
+      state.robotPose = {
+        x: Number(bridge.robot_pose.x),
+        y: Number(bridge.robot_pose.y),
+        tags_used: Number(bridge.robot_pose.tags_used || 0),
+        floor_z_error_avg: Number(bridge.robot_pose.floor_z_error_avg || 0)
+      };
+    } else {
+      state.robotPose = null;
+    }
+    if (!state.tagMap && Number.isFinite(Number(bridge?.field?.length)) && Number.isFinite(Number(bridge?.field?.width))) {
+      state.tagMap = { tags: [], field: { length: Number(bridge.field.length), width: Number(bridge.field.width) } };
+    }
+    if (state.selectedCamera == null) {
+      state.selectedCamera = cam;
+      renderRuntimeFormForCurrentCamera();
+    }
+    renderDetectionTable();
+    scheduleOverlayDraw();
 }
 
 async function init() {
@@ -1111,12 +1219,7 @@ async function init() {
     state.runtimePath = el.runtimePath.value.trim();
     state.runtimeConfig = readRuntimeConfigFromForm();
     await window.vortexApi.saveRuntimeConfig(state.runtimePath, state.runtimeConfig);
-    if (state.pipelineRunning) {
-      const sync = await window.vortexApi.syncRuntimeConfigRemote(readAppConfigFromUI(), state.runtimeConfig);
-      if (!sync?.ok) {
-        appendLog(`Remote config sync failed: ${sync?.error || "unknown error"}`);
-      }
-    }
+    appendLog("Stage and Activate a release to apply these settings to production.");
     appendLog(`Saved runtime config: ${state.runtimePath}`);
   });
 
@@ -1268,7 +1371,7 @@ async function init() {
       state.appConfig.last_ready_release = el.readyRelease.value;
     }
     const describe = (selection) => selection?.kind === "release" ? selection.release_id : selection?.kind || "none";
-    if (overview.active) el.togglePipeline.disabled = overview.active.kind === "release" || Boolean(overview.pending);
+    el.togglePipeline.disabled = false;
     el.releaseState.textContent = overview.active ?
       `Selected: ${describe(overview.active)} | Previous: ${describe(overview.previous)}${overview.pending ? " | switch pending" : ""}` :
       "Release ready; Activate switches it after validation.";
@@ -1292,22 +1395,27 @@ async function init() {
     if (!state.pipelineRunning) {
       try {
         setMonitorIndicator("active", "Starting...", 5);
-        cfg = await window.vortexApi.applyMonitorPreset(cfg, "main_cam_0");
         state.appConfig = cfg;
         await window.vortexApi.saveAppConfig(cfg);
         await refreshRemoteCameras();
+        const configured = getCameraCandidates();
+        if (configured.length && !configured.includes(Number(state.selectedCamera))) {
+          state.selectedCamera = configured[0];
+          renderRuntimeFormForCurrentCamera();
+        }
+        cfg = readAppConfigFromUI();
         const m = await window.vortexApi.monitorStart(cfg);
         if (!m?.ok) throw new Error(m?.error || "monitor start failed");
         const p = await window.vortexApi.previewStart(cfg);
         if (!p?.ok) throw new Error(p?.error || "preview start failed");
         state.pipelineRunning = true;
-        el.togglePipeline.textContent = "Stop Diagnostics";
+        el.togglePipeline.textContent = "Detach Diagnostics";
         refreshCameraControls();
       } catch (err) {
         const msg = String(err?.message || err);
         setMonitorIndicator("error", "✕ Start failed", 0);
         if (msg.includes("authentication methods failed")) {
-          appendLog(`Start failed: ${msg}. SSH credentials are fixed to vortex/redstorm on port 22.`);
+          appendLog(`Start failed: ${msg}. Check credentials in Jetson Setup.`);
         } else {
           appendLog(`Start failed: ${msg}`);
         }
@@ -1321,7 +1429,7 @@ async function init() {
         appendLog(`Stop error: ${err.message}`);
       }
       state.pipelineRunning = false;
-      el.togglePipeline.textContent = "Start Diagnostics";
+      el.togglePipeline.textContent = "Attach Diagnostics";
       refreshCameraControls();
     }
   });
@@ -1342,7 +1450,6 @@ async function init() {
     if (state.pipelineRunning) {
       try {
         let cfg = readAppConfigFromUI();
-        cfg = await window.vortexApi.applyMonitorPreset(cfg, "main_cam_0");
         state.appConfig = cfg;
         await window.vortexApi.saveAppConfig(cfg).catch(() => {});
         await window.vortexApi.previewStop();
@@ -1354,7 +1461,7 @@ async function init() {
           const p = await window.vortexApi.previewStart(cfg);
           if (!p?.ok) appendLog(`Preview restart failed: ${p?.error || "unknown error"}`);
           state.pipelineRunning = true;
-          el.togglePipeline.textContent = "Stop Diagnostics";
+          el.togglePipeline.textContent = "Detach Diagnostics";
         }
       } catch (err) {
         appendLog(`Camera switch error: ${err.message}`);
@@ -1379,11 +1486,11 @@ async function init() {
     el.monitorStatus.textContent = `Monitor: ${running ? "Running" : "Stopped"}`;
     if (running) {
       state.pipelineRunning = true;
-      el.togglePipeline.textContent = "Stop Diagnostics";
+      el.togglePipeline.textContent = "Detach Diagnostics";
     }
     if (!running) {
       state.pipelineRunning = false;
-      el.togglePipeline.textContent = "Start Diagnostics";
+      el.togglePipeline.textContent = "Attach Diagnostics";
       window.vortexApi.previewStop().catch(() => {});
     }
     refreshCameraControls();
@@ -1394,76 +1501,21 @@ async function init() {
   window.vortexApi.onPreviewFrame((dataUrl) => {
     pushPreviewFrame(dataUrl);
   });
-  window.vortexApi.onBridgeState((bridge) => {
-    const cam = Number(bridge?.camera_index);
-    if (!Number.isFinite(cam)) return;
-    if (!state.cameras.has(cam)) {
-      state.cameras.set(cam, {
-        fps: null,
-        apriltags: [],
-        objects: [],
-        lastSeen: 0,
-        tagFrameHistory: [],
-        lastTagById: new Map()
-      });
+  window.vortexApi.onBridgeState(applyBridgeState);
+  window.vortexApi.onServiceFrame(showServiceFrame);
+  window.vortexApi.onServiceStatus((status) => {
+    const service = status.service || {};
+    const camera = status.camera_health || {};
+    const ms = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(1)+"ms" : "-";
+    document.querySelector("#serviceStatus").textContent =
+      `${status.reason || "Production diagnostics"} | Service: ${service.state || "unknown"} (${service.result || "-"})`+
+      ` | Watchdog: ${status.health?.watchdog || "unknown"} | Restarts: ${service.restarts ?? "-"}`+
+      ` | Backends: ${(camera.backends || []).join(", ") || "-"}`+
+      ` | Processing: ${ms(camera.processing_ms)} | Pipeline: ${ms(camera.latency_ms)} | Read: ${ms(status.request_ms)}`;
+    if (Array.isArray(status.health?.cameras)) {
+      state.remoteCameras = status.health.cameras.map((entry) => Number(entry.index));
+      refreshCameraControls();
     }
-    const row = state.cameras.get(cam);
-    row.lastSeen = Date.now();
-    if (Number.isFinite(Number(bridge?.fps))) row.fps = Number(bridge.fps);
-    if (Array.isArray(bridge?.apriltags)) {
-      row.apriltags = bridge.apriltags.map((t) => ({
-        id: Number(t?.id),
-        dist: Number(t?.floor_z_error ?? t?.z ?? 0),
-        x: Number(t?.x ?? 0),
-        y: Number(t?.y ?? 0),
-        corners: Array.isArray(t?.corners) ? t.corners : []
-      }));
-      const idsThisFrame = row.apriltags.map((t) => t.id).filter((id) => Number.isFinite(id));
-      row.tagFrameHistory = row.tagFrameHistory || [];
-      row.tagFrameHistory.push(idsThisFrame);
-      if (row.tagFrameHistory.length > 300) row.tagFrameHistory.splice(0, row.tagFrameHistory.length - 300);
-      row.lastTagById = row.lastTagById || new Map();
-      for (const t of row.apriltags) {
-        row.lastTagById.set(t.id, {
-          dist: t.dist,
-          x: t.x,
-          y: t.y,
-          corners: t.corners,
-          lastSeenTs: Date.now()
-        });
-      }
-    }
-    if (Array.isArray(bridge?.objects)) {
-      row.objects = bridge.objects.map((o) => ({
-        className: String(o?.class_name ?? ""),
-        conf: Number(o?.confidence ?? 0),
-        dist: Number(o?.z ?? 0),
-        x: Number(Array.isArray(o?.bbox) ? o.bbox[0] : 0),
-        y: Number(Array.isArray(o?.bbox) ? o.bbox[1] : 0),
-        bbox: `BBox: [${Array.isArray(o?.bbox) ? o.bbox.join(",") : ""}]`,
-        bboxWidth: Number(Array.isArray(o?.bbox) ? o.bbox[2] : 0),
-        bboxHeight: Number(Array.isArray(o?.bbox) ? o.bbox[3] : 0)
-      }));
-    }
-    if (bridge?.robot_pose && Number.isFinite(Number(bridge.robot_pose.x)) && Number.isFinite(Number(bridge.robot_pose.y))) {
-      state.robotPose = {
-        x: Number(bridge.robot_pose.x),
-        y: Number(bridge.robot_pose.y),
-        tags_used: Number(bridge.robot_pose.tags_used || 0),
-        floor_z_error_avg: Number(bridge.robot_pose.floor_z_error_avg || 0)
-      };
-    } else {
-      state.robotPose = null;
-    }
-    if (!state.tagMap && Number.isFinite(Number(bridge?.field?.length)) && Number.isFinite(Number(bridge?.field?.width))) {
-      state.tagMap = { tags: [], field: { length: Number(bridge.field.length), width: Number(bridge.field.width) } };
-    }
-    if (state.selectedCamera == null) {
-      state.selectedCamera = cam;
-      renderRuntimeFormForCurrentCamera();
-    }
-    renderDetectionTable();
-    scheduleOverlayDraw();
   });
   window.vortexApi.onDeployProgress((p) => {
     const status = String(p?.status || "");
@@ -1542,9 +1594,14 @@ async function init() {
   }
 
   el.previewImage.onload = () => {
+    if (finishServiceFrame()) return;
     previewLoadPending = false;
     scheduleOverlayDraw();
     if (pendingPreviewDataUrl) pushPreviewFrame(pendingPreviewDataUrl);
+  };
+  el.previewImage.onerror = () => {
+    if (serviceImageLoading) showServiceFrame(null);
+    previewLoadPending = false;
   };
   window.addEventListener("resize", () => {
     scheduleOverlayDraw();

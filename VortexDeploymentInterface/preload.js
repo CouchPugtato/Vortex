@@ -43,6 +43,8 @@ contextBridge.exposeInMainWorld("vortexApi", {
   onPreviewState: makeSubscriber("preview-state"),
   onPreviewFrame: makeSubscriber("preview-frame"),
   onBridgeState: makeSubscriber("bridge-state"),
+  onServiceFrame: makeSubscriber("service-frame"),
+  onServiceStatus: makeSubscriber("service-status"),
   onDeployProgress: makeSubscriber("deploy-progress"),
   onMonitorStartProgress: makeSubscriber("monitor-start-progress"),
   onOnnxUploadProgress: makeSubscriber("onnx-upload-progress"),

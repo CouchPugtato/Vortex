@@ -282,16 +282,55 @@ The service name defaults to `vortex-vision.service` in bootstrap. Set
 should be stopped/resumed around the current tools. Stop failures abort the operation.
 The service-control commands use noninteractive sudo and require suitable permissions.
 
-## Legacy diagnostics
+## Production diagnostics and watchdog
 
-Before managed activation, **Start Diagnostics** can temporarily replace production capture with
-`orin_bridge`, which provides the existing single-camera preview and diagnostics
-but not the production telemetry. It now uses the same Python launcher and runtime
-configuration, verifies its build before launching, and never installs packages,
-deletes lockfiles, or silently chooses another build profile.
+Use **Attach Diagnostics** after activating a release built with this feature.
+The app observes the managed service over its existing SSH connection. It does not
+launch a second pipeline, open cameras, stop the service, or change runtime config.
+**Next Camera** switches the preview subscription; **Detach Diagnostics** releases
+it and leaves production running. Attachments reconnect across connection loss or
+service restart, including activation/rollback. Older binaries must be rebuilt and
+activated; the app does not fall back to replacing production with `orin_bridge`.
+Runtime form edits save locally; Stage and Activate applies the selected configuration
+snapshot. Attaching diagnostics no longer enables automatic writes to the legacy
+deployment's configuration.
 
-Legacy diagnostics is blocked when a managed release is selected so it cannot
-kill/reconfigure production capture. Service-attached preview remains a later stage.
+The native detector offers its own processed grayscale pixels and corresponding
+accepted detections to a bounded, nonblocking preview worker. Only the subscribed
+camera is copied, at most five times per second. With no live subscription, frames
+are not copied or encoded. JPEG previews fit within 640×480 at quality 65 without
+changing detection resolution. One pending frame and three retained JPEGs bound
+the queue and storage. A preview lease expires after three seconds without renewal;
+another client waits for the owner to detach or expire.
+
+Each immutable JPEG and its metadata share a frame ID, camera, process ID, release,
+launch token and client ID. Metadata is published after the image. The controller
+rejects stale/mismatched frames and the UI applies detections when that image loads.
+Original image dimensions keep overlays aligned with downscaled previews. Stale
+images are cleared during outages/restarts rather than appearing live. Preview
+quality/rate and SSH overhead still need Jetson performance measurement.
+
+Diagnostics shows processing FPS, detector-processing milliseconds, camera-dequeue
+to processing-completion milliseconds, the remote read round trip, watchdog state,
+service result and restart count. These timings do not measure sensor exposure or
+an exact end-to-end camera-to-display delay. The detector-to-monitor statistics
+queue is also bounded, so a slow telemetry consumer cannot build an unlimited backlog.
+
+The managed unit accepts notifications from its main process. New runtimes opt in
+to systemd's watchdog using the native main PID; older binaries and legacy rollback
+targets do not opt in. Startup has a 30-second grace period with a 40-second initial
+watchdog deadline. Once all cameras process frames, or the grace period ends, the
+deadline becomes ten seconds. Heartbeats continue only while every configured
+camera has processed a frame within three seconds, reports a working pipeline,
+and has the required detector backends. Empty scenes are healthy; missing AprilTags
+do not trigger restarts. A blocked main loop also stops heartbeats. Preview failures
+alone do not restart vision.
+
+Systemd restarts a failed/watchdog-stalled process after two seconds, subject to the
+existing five-starts-per-minute limit. The watchdog does not automatically switch
+releases; startup activation still owns verified rollback. Use **Initialize Jetson**
+with this version to update the stable controller/unit, then **Activate** its prepared
+release. This is necessary to install notification access and start the new native code.
 
 ## Local checks
 
@@ -312,7 +351,7 @@ Jetson validation.
 
 ## Remaining implementation order
 
-1. Add service-owned preview and a continuous frame-processing watchdog.
+1. Validate service installation, preview performance and watchdog recovery on a Jetson.
 2. Add offline provisioning bundles, broader hardware/JetPack compatibility coverage,
    and release retention cleanup.
 

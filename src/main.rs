@@ -8,6 +8,7 @@ mod preprocess;
 mod pose;
 mod yolo_detector;
 mod runtime_health;
+mod runtime_diagnostics;
 mod deployment_smoke;
 
 use nalgebra as _;
@@ -52,6 +53,7 @@ pub struct AprilTagPose {
     pub y: f64,
     pub z: f64,
     pub floor_z_error: f64,
+    pub corners: [[f64; 2]; 4],
 }
 
 const MAX_TAG_REPROJECTION_RMSE_PX: f64 = 2.0;
@@ -83,6 +85,8 @@ struct PipelineStats {
     timestamp: Instant,
     backends: Vec<String>,
     pipeline_ok: bool,
+    processing_ms: f64,
+    latency_ms: f64,
 }
 
 struct NtCameraTopics {
@@ -507,6 +511,7 @@ fn main() -> anyhow::Result<()> {
 
     if camera_indices.is_empty() { camera_indices.push(0); }
     let mut health = runtime_health::Reporter::from_env(&camera_indices)?;
+    let diagnostics = runtime_diagnostics::Hub::from_env()?;
 
     println!("Starting Multi-Camera AprilTag Detector");
     println!("Cameras: {:?}", camera_indices);
@@ -562,7 +567,7 @@ fn main() -> anyhow::Result<()> {
     println!("Allocating {} detector threads per camera (Total Cameras: {}, Total Cores: {})", 
         threads_per_cam, camera_indices.len(), total_cores);
 
-    let (tx_stats, rx_stats) = mpsc::channel();
+    let (tx_stats, rx_stats) = mpsc::sync_channel(camera_indices.len()*2);
 
     for &idx in &camera_indices {
         spawn_camera_pipeline(
@@ -573,6 +578,7 @@ fn main() -> anyhow::Result<()> {
             runtime_config.processing,
             runtime_config.object_detection,
             tag_map_by_id.clone(),
+            diagnostics.clone(),
         );
     }
 
@@ -641,7 +647,8 @@ fn main() -> anyhow::Result<()> {
         }
         if let Ok(stat) = rx_stats.recv_timeout(Duration::from_millis(100)) {
             if let Some(reporter) = health.as_mut() {
-                reporter.record(stat.camera_index, stat.timestamp, stat.backends.clone(), stat.pipeline_ok);
+                reporter.record_metrics(stat.camera_index, stat.timestamp, stat.backends.clone(), stat.pipeline_ok,
+                    stat.processing_ms, stat.latency_ms);
             }
             cam_detections.insert(stat.camera_index, stat.detections.0);
             cam_joint_pose.insert(stat.camera_index, stat.joint_robot_pose);
@@ -812,16 +819,17 @@ fn main() -> anyhow::Result<()> {
 fn spawn_camera_pipeline(
     camera_index: usize, 
     detector_threads: i32, 
-    tx_stats: mpsc::Sender<PipelineStats>,
+    tx_stats: mpsc::SyncSender<PipelineStats>,
     camera_config: CameraConfig,
     processing_config: ProcessingConfig,
     object_detection_config: ObjectDetectionConfig,
     tag_map_by_id: HashMap<usize, FieldTagPose>,
+    diagnostics: Option<runtime_diagnostics::Hub>,
 ) {
     println!("Spawning pipeline for Camera {}...", camera_index);
 
-    let (tx_capture, rx_capture) = mpsc::sync_channel(1); 
-    let (tx_decode, rx_decode) = mpsc::sync_channel(1);
+    let (tx_capture, rx_capture) = mpsc::sync_channel::<(Vec<u8>, Instant)>(1);
+    let (tx_decode, rx_decode) = mpsc::sync_channel::<(Vec<u8>, usize, usize, Instant)>(1);
 
     // 1. capture thread
     std::thread::spawn(move || {
@@ -902,7 +910,7 @@ fn spawn_camera_pipeline(
                 match stream.next() {
                     Ok((buf, _meta)) => {
                         let buf_vec = buf.to_vec();
-                        match tx_capture.try_send(buf_vec) {
+                        match tx_capture.try_send((buf_vec, Instant::now())) {
                             Ok(_) => {},
                             Err(mpsc::TrySendError::Full(_)) => {},
                             Err(mpsc::TrySendError::Disconnected(_)) => return, // exit outer loop, pipeline dead
@@ -930,7 +938,7 @@ fn spawn_camera_pipeline(
         };
 
         loop {
-            if let Ok(buf) = rx_capture.recv() {
+            if let Ok((buf, captured)) = rx_capture.recv() {
                 let header = match decompressor.read_header(&buf) {
                     Ok(h) => h,
                     Err(_) => continue,
@@ -948,7 +956,7 @@ fn spawn_camera_pipeline(
                 };
                 
                 if decompressor.decompress(&buf, image).is_ok() {
-                    match tx_decode.try_send((pixels, width, height)) {
+                    match tx_decode.try_send((pixels, width, height, captured)) {
                         Ok(_) => {},
                         Err(mpsc::TrySendError::Full(_)) => {}, // drop if detector is busy
                         Err(mpsc::TrySendError::Disconnected(_)) => break,
@@ -1033,7 +1041,8 @@ fn spawn_camera_pipeline(
         let mut detectors: Vec<DetectorWrapper> = Vec::new();
 
         loop {
-            if let Ok((mut pixels, width, height)) = rx_decode.recv() {
+            if let Ok((mut pixels, width, height, captured)) = rx_decode.recv() {
+                let processing_started = Instant::now();
                 apply_processing(&mut pixels, &processing_config);
                 if detectors.is_empty() {
                     let mut tag_initialized = false;
@@ -1215,6 +1224,7 @@ fn spawn_camera_pipeline(
                                     y,
                                     z,
                                     floor_z_error,
+                                    corners: apr_det.corners,
                                 }));
                             }
                             Detection::Yolo(yolo_det) => {
@@ -1288,18 +1298,34 @@ fn spawn_camera_pipeline(
                     None
                 };
 
+                let completed = Instant::now();
+                let processing_ms = completed.duration_since(processing_started).as_secs_f64()*1000.0;
+                let latency_ms = completed.saturating_duration_since(captured).as_secs_f64()*1000.0;
+                if let Some(hub) = diagnostics.as_ref() {
+                    hub.offer(camera_index, &pixels, width, height, captured, || {
+                        let tags: Vec<_> = processed_detections.iter().filter_map(|d| match d {
+                            ProcessedDetection::AprilTag(tag) => Some(tag), _ => None }).collect();
+                        let objects: Vec<_> = processed_detections.iter().filter_map(|d| match d {
+                            ProcessedDetection::Yolo(object) => Some(object), _ => None }).collect();
+                        serde_json::json!({"apriltags": tags, "objects": objects, "processing_ms": processing_ms,
+                            "pipeline_ok": pipeline_ok, "robot_pose": joint_robot_pose.map(|(x, y, used, err)|
+                                RobotPoseOut { x, y, tags_used: used, floor_z_error_avg: err })})
+                    });
+                }
                 let stat = PipelineStats {
                     camera_index,
                     detections: ProcessedDetections(processed_detections),
                     joint_robot_pose,
-                    timestamp: Instant::now(),
+                    timestamp: completed,
                     backends,
                     pipeline_ok,
+                    processing_ms,
+                    latency_ms,
                 };
 
-                if tx_stats.send(stat).is_err() {
-                    eprintln!("Stats channel disconnected for cam {}", camera_index);
-                    break; // exit loop, thread will terminate
+                match tx_stats.try_send(stat) {
+                    Ok(_) | Err(mpsc::TrySendError::Full(_)) => {},
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
         }

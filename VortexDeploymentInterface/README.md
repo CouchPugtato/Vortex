@@ -33,9 +33,8 @@ Available packaging scripts:
   camera permissions and managed startup, without opening an SSH terminal.
 - Stage a checksummed source release over SSH/SFTP and build it without replacing
   or restarting the running installation.
-- Start/stop monitor command and parse AprilTag/Object output by camera.
-- Live camera preview by running remote capture command and fetching image frames.
-- Monitor command presets for main pipeline launch patterns.
+- Attach to production camera previews and detections without replacing the pipeline.
+- Inspect FPS, processing/transfer timing, watchdog state and restart counts.
 
 ## Notes
 
@@ -55,11 +54,10 @@ Available packaging scripts:
   **Activate** starts it afterward. GPU/TensorRT need matching NVIDIA components.
 - Python is needed on the desktop; the Jetson needs Python, the pinned Rust
   toolchain, native libraries, and cached dependencies. Builds are offline.
-- **Start Diagnostics** currently replaces production capture with the legacy
-  bridge and is blocked once a managed release is selected. Service-attached
-  monitoring is planned.
+- **Attach Diagnostics** observes the active service. **Next Camera** changes the
+  subscription; **Detach Diagnostics** leaves vision running. Previews are generated
+  on demand, capped at 5 FPS and 640×480. Empty scenes do not trigger the processing watchdog.
+- Run **Initialize Jetson** with this version, then **Activate** its prepared release
+  to enable production diagnostics and watchdog notifications.
 
 - Connection errors like `ECONNREFUSED` / `10061` mean host/port are unreachable.
-- Preview command template supports:
-  - `{cam}` for camera index
-  - `{path}` for remote image path

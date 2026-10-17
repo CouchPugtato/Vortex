@@ -10,6 +10,8 @@ mod pose;
 mod tag_refine;
 #[path = "../../../src/runtime_health.rs"]
 mod runtime_health;
+#[path = "../../../src/runtime_diagnostics.rs"]
+mod runtime_diagnostics;
 #[path = "../../../src/deployment_smoke.rs"]
 mod deployment_smoke;
 
