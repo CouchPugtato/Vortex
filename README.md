@@ -92,6 +92,7 @@ live camera capture and Jetson GPU performance require hardware validation.
 | Directory | Purpose |
 | --- | --- |
 | [src/](src/) | Rust vision pipeline, pose estimation, and telemetry |
+| [deployment/](deployment/README.md) | Native Rust deployment controller and regression tests |
 | [config/](config/) | Runtime settings and field tag maps |
 | [chassis_sim/](chassis_sim/) | Interactive simulator and captured-case replay |
 | [simulation_tests/](simulation_tests/) | Synthetic image generation and native replay tests |

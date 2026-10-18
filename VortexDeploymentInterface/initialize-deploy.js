@@ -5,6 +5,7 @@ const os = require("os");
 const crypto = require("crypto");
 const { packageLocally, managedRoot, quote } = require("./staging-deploy");
 const { logFollower } = require("./job-progress");
+const { verifyController } = require("./native-controller");
 
 // Send the sudo password through SSH stdin, never argv, the shell or a file.
 // No PTY means terminal echo cannot put it in stdout/logs.
@@ -58,32 +59,32 @@ async function initializeJetson(settings, remoteTarget, password, deps) {
       emit(2, "Checking Jetson connection...");
       // These tools exist on supported JetPack/Ubuntu images; no working project,
       // Rust installation, user manager or managed vision service is needed yet.
-      await checked("{ test \"$(uname -s)\" = Linux && command -v python3 >/dev/null && command -v systemd-run >/dev/null && command -v sudo >/dev/null; } || " +
-        "{ echo 'Initialization needs Ubuntu/JetPack with SSH, Python 3, systemd and sudo enabled.' >&2; exit 1; }");
+      await checked("{ test \"$(uname -s)\" = Linux && command -v sha256sum >/dev/null && command -v systemd-run >/dev/null && command -v sudo >/dev/null; } || " +
+        "{ echo 'Initialization needs Ubuntu/JetPack with SSH, systemd and sudo enabled.' >&2; exit 1; }");
+      if (!deps.package) {
+        const architecture = (await checked("uname -m")).stdout.trim();
+        if (!["aarch64", "x86_64"].includes(architecture)) throw new Error("Unsupported device architecture: "+architecture);
+        settings = { ...settings, deployment_architecture: architecture };
+      }
       directory = await fs.mkdtemp(path.join(os.tmpdir(), "vortex-initialize-"));
       emit(5, "Preparing initialization snapshot...");
       metadata = await (deps.package || packageLocally)(settings, directory, deps.appDir);
       if (metadata.schema_version !== 1 || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(metadata.release_id) ||
-          ![metadata.archive_sha256, metadata.controller_sha256, metadata.initializer_sha256].every((value) => /^[a-f0-9]{64}$/.test(value))) {
+          ![metadata.archive_sha256, metadata.controller_sha256].every((value) => /^[a-f0-9]{64}$/.test(value))) {
         throw new Error("Invalid initialization package metadata");
       }
       const incoming = `${root}/incoming/${metadata.release_id}`;
       await checked(`mkdir -p -- ${quote(incoming)} ${quote(root+"/jobs")}`);
       const sftp = await deps.getSftp(conn);
       emit(10, "Uploading setup snapshot...");
-      for (const file of ["release.tar.gz", "controller.py", "initialize_jetson.py"]) {
+      for (const file of ["release.tar.gz", "vortexctl"]) {
         await deps.upload(sftp, path.join(directory, file), incoming+"/"+file);
       }
-      const verify = "import hashlib,sys; " +
-        "sys.exit(0 if all(hashlib.sha256(open(sys.argv[i],'rb').read()).hexdigest()==sys.argv[i+1] for i in (1,3)) else 1)";
-      await checked(`python3 -c ${quote(verify)} ${quote(incoming+"/controller.py")} ${quote(metadata.controller_sha256)} `+
-        `${quote(incoming+"/initialize_jetson.py")} ${quote(metadata.initializer_sha256)}`);
-      // The initializer imports this verified controller under its normal module name.
-      await checked(`cp -- ${quote(incoming+"/controller.py")} ${quote(incoming+"/deploy_release.py")}`);
+      await checked(verifyController(incoming+"/vortexctl", metadata.controller_sha256, quote));
       metadata = { ...metadata, kind: "initialize", operation_id: operation };
       await deps.remember?.(metadata);
       emit(20, "Starting administrator setup...");
-      const command = `/usr/bin/python3 ${quote(incoming+"/initialize_jetson.py")} submit --root ${quote(root)} `+
+      const command = `${quote(incoming+"/vortexctl")} initialize-submit --root ${quote(root)} `+
         `--legacy-root ${quote(remoteTarget)} --job-id ${quote(operation)} --release-id ${quote(metadata.release_id)} `+
         `--sha256 ${quote(metadata.archive_sha256)} --user ${quote(user)} --service ${quote(service)}`;
       await (deps.execAdministrator || execAdministrator)(conn, command, password);
@@ -91,14 +92,14 @@ async function initializeJetson(settings, remoteTarget, password, deps) {
     }
     if (!metadata || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(metadata.release_id) ||
         !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(operation)) throw new Error("Invalid saved initialization job");
-    const helper = `${root}/incoming/${metadata.release_id}/initialize_jetson.py`;
+    const helper = `${root}/incoming/${metadata.release_id}/vortexctl`;
     const deadline = Date.now()+(deps.timeoutMs ?? 3*60*60*1000);
     const delay = deps.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     let disconnects = 0, starting = 0;
     while (Date.now() < deadline) {
       let response;
       try {
-        response = await checked(`python3 ${quote(helper)} status --root ${quote(root)} --job-id ${quote(operation)}`);
+        response = await checked(`${quote(helper)} status --root ${quote(root)} --job-id ${quote(operation)}`);
         disconnects = 0;
       } catch (error) {
         conn?.end(); conn = null;

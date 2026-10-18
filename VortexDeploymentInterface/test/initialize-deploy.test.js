@@ -29,7 +29,7 @@ function harness(states = ["ready"]) {
     },
     getSftp: async () => ({}), upload: async (sftp, local, destination) => { await fs.access(local); uploads.push(destination); },
     package: async (settings, folder) => {
-      for (const file of ["release.tar.gz", "controller.py", "initialize_jetson.py"]) await fs.writeFile(path.join(folder, file), "snapshot");
+      for (const file of ["release.tar.gz", "vortexctl"]) await fs.writeFile(path.join(folder, file), "snapshot");
       return metadata;
     },
     execAdministrator: async (conn, command, password) => {
@@ -49,8 +49,8 @@ test("initialization uploads and verifies setup, then uses privileged stdin subm
   const h = harness(["packages", "toolchain", "building", "service", "ready"]);
   const result = await initializeJetson({}, remote, "private-admin-value", h.deps);
   assert.equal(result.activated, false);
-  assert.equal(h.uploads.length, 3);
-  assert(h.commands.some((command) => command.includes("hashlib")));
+  assert.equal(h.uploads.length, 2);
+  assert(h.commands.some((command) => command.includes("sha256sum")));
   assert.equal(h.administrator.length, 1);
   assert.equal(h.administrator[0].password, "private-admin-value");
   assert.equal(h.saved.kind, "initialize");
@@ -79,13 +79,13 @@ test("a lost SSH connection follows the original setup job without another root 
 });
 
 test("checksum/upload failures prevent privileged setup", async () => {
-  for (const failure of ["upload", "hashlib"]) {
+  for (const failure of ["upload", "sha256sum"]) {
     const h = harness();
     if (failure === "upload") h.deps.upload = async () => { throw new Error("upload failed"); };
     else {
       const checked = h.deps.execChecked;
       h.deps.execChecked = async (conn, command) => {
-        if (command.includes("hashlib")) throw new Error("checksum failed");
+        if (command.includes("sha256sum")) throw new Error("checksum failed");
         return checked(conn, command);
       };
     }
@@ -127,7 +127,7 @@ function administratorChannel(code = 0, stderr = "") {
 test("administrator passwords travel only through stdin, including shell metacharacters", async () => {
   const h = administratorChannel();
   const secret = "admin' $(touch /tmp/test) `value`";
-  await execAdministrator(h.conn, "/usr/bin/python3 /setup.py submit", secret);
+  await execAdministrator(h.conn, "/vortexctl initialize-submit", secret);
   assert(h.command.startsWith("sudo -S -k -p '' -- "));
   assert(!h.command.includes(secret));
   assert.equal(h.input, secret+"\n");
@@ -135,14 +135,14 @@ test("administrator passwords travel only through stdin, including shell metacha
 
 test("passwordless sudo is noninteractive and sends no password", async () => {
   const h = administratorChannel();
-  await execAdministrator(h.conn, "/setup.py submit", "");
+  await execAdministrator(h.conn, "/vortexctl initialize-submit", "");
   assert(h.command.startsWith("sudo -n -- "));
   assert.equal(h.input, "");
 });
 
 test("authentication errors are actionable without echoing privileged output", async () => {
   const h = administratorChannel(1, "Sorry, try again. private-value");
-  await assert.rejects(execAdministrator(h.conn, "/setup.py submit", "private-value"), (error) => {
+  await assert.rejects(execAdministrator(h.conn, "/vortexctl initialize-submit", "private-value"), (error) => {
     assert.equal(error.notSubmitted, true);
     assert(!error.message.includes("private-value"));
     assert(error.message.includes("authentication failed"));

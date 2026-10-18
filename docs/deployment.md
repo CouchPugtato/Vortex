@@ -16,7 +16,7 @@ click **Initialize Jetson**. The SSH account must already exist and have adminis
 permission. Flashing JetPack/Ubuntu and enabling SSH remain image setup tasks.
 
 Initialization supports Ubuntu 20.04/22.04/24.04 on aarch64 and x86_64, requires
-Python 3/systemd/sudo on the device and at least 6 GiB free after extraction, and
+systemd/sudo on the device and at least 6 GiB free after extraction, and
 downloads packages/toolchains/dependencies using the Jetson's internet connection.
 Architecture, OS, disk space and selected GPU/TensorRT prerequisites are checked
 before package installation. NVIDIA components must already match the installed
@@ -24,7 +24,7 @@ JetPack; setup reports missing components and does not change the chosen profile
 VPI 2/3 layouts supported by this project's build are checked, including NVIDIA's
 `lib/aarch64-linux-gnu` layout. These checks are not hardware certification.
 
-The app uploads/checksums a source snapshot and setup controllers, then submits a
+The app uploads/checksums a source snapshot and native controller, then submits a
 root-owned systemd job. The sudo password goes through SSH stdin without a PTY;
 it is excluded from command arguments, files, logs, and saved preferences. SSH
 passwords are kept only for the app session, so enter them again after reopening
@@ -49,9 +49,12 @@ configuration; click **Activate** afterward to start and check real cameras.
 ## Stage a release
 
 Select the intended camera, networking, build profile, runtime configuration, and
-field map in the interface, then click **Stage Release**. Python is required on the
-desktop as well as the Jetson; set `python_executable` in desktop preferences if the
-default `python` (Windows) or `python3` command is unavailable.
+field map in the interface, then click **Stage Release**. The app bundles native
+Rust `vortexctl` executables for Windows x64 and static Linux ARM64/x64. Neither
+desktop packaging nor remote deployment requires Python. The app reads the device
+architecture, selects the matching controller and verifies its checksum before
+execution. Source builds of the desktop app must first prepare the native artifacts;
+see [controller builds](../deployment/README.md).
 
 The app creates one compressed snapshot containing Rust sources, Cargo manifests,
 the toolchain pin, launch scripts, and selected configuration/field resources.
@@ -123,7 +126,7 @@ endpoint also stages a new snapshot instead of modifying the active tree.
 To inspect a saved job on the Jetson:
 
 ```text
-python3 /home/vortex/deployments/Vortex.deployment/incoming/RELEASE_ID/controller.py status --root /home/vortex/deployments/Vortex.deployment --release-id RELEASE_ID
+/home/vortex/deployments/Vortex.deployment/incoming/RELEASE_ID/vortexctl status --root /home/vortex/deployments/Vortex.deployment --release-id RELEASE_ID
 ```
 
 ## Activate and roll back
@@ -175,7 +178,7 @@ State files are `selection.json`, `active.json`, `previous.json`, `activation.js
 Manual recovery, using the deployed controller on the Jetson:
 
 ```text
-python3 /home/vortex/deployments/Vortex.deployment/activate_release.py recover --root /home/vortex/deployments/Vortex.deployment
+/home/vortex/deployments/Vortex.deployment/vortexctl recover --root /home/vortex/deployments/Vortex.deployment
 ```
 
 A failed confirmation or interrupted switch never edits either release's camera
@@ -184,8 +187,8 @@ another snapshot; it does not alter an already prepared release.
 
 ## Runtime and configuration
 
-Production runs `dumapril-taglocalization` through `scripts/run_vortex.py`.
-`run_vortex.sh` is a location-independent compatibility wrapper around that Python
+Production runs `dumapril-taglocalization` through the Rust `vortexctl` launcher.
+`run_vortex.sh` is a location-independent compatibility wrapper around that native
 launcher. Startup never downloads dependencies or builds an executable.
 
 `config/device.json` is the versioned launch configuration:
@@ -204,8 +207,8 @@ runtime libraries, a saved-image CPU smoke test, and actual camera processing.
 The interface snapshots camera/network/profile settings into the package's
 `config/device.json`; its selected field map uses `config/apriltag_map.json`.
 SSH credentials and desktop paths are not included in the device settings payload.
-Other live runtime edits still use the existing remote config sync behavior;
-production application of those edits may require a restart.
+Runtime edits are saved locally; stage and activate another snapshot to apply them
+to production.
 
 Desktop preferences are stored in Electron's user-data directory. Existing
 repository preferences are migrated on first launch if no new preferences exist.
@@ -231,16 +234,16 @@ fails instead of triggering a download. See [Rustup environment settings](https:
 From the repository root on the Jetson:
 
 ```text
-python3 scripts/run_vortex.py --validate-config
-python3 scripts/run_vortex.py --build
-python3 scripts/run_vortex.py --check
-python3 scripts/run_vortex.py
+tools/vortexctl launch --source . --validate-config
+tools/vortexctl launch --source . --build
+tools/vortexctl launch --source . --check
+tools/vortexctl launch --source .
 ```
 
 For first-time dependency provisioning, explicitly allow downloads:
 
 ```text
-python3 scripts/run_vortex.py --build --online --with-debug-bridge
+tools/vortexctl launch --source . --build --online --with-debug-bridge
 ```
 
 Successful builds write `target/release/vortex-build.json`. Launch verifies the
@@ -250,7 +253,7 @@ require recompilation; changing source, toolchain pin, or profile does.
 
 ## Migrating an existing Jetson
 
-Stage Release requires Python, the pinned Rust toolchain, native build libraries,
+Stage Release requires the pinned Rust toolchain, native build libraries,
 and cached Cargo dependencies on the Jetson. Use **Initialize Jetson** to prepare
 these prerequisites and the managed service without a terminal. The standalone
 bootstrap script remains available for operators who prefer it.
@@ -260,22 +263,22 @@ preparation requires root privileges; Activate attempts noninteractive sudo and
 directs users to **Jetson Setup → Initialize Jetson** if permission is unavailable.
 That flow also updates controllers when a new release needs privileged setup.
 Existing packages from before this feature must be restaged to include the updated
-controllers and initialization module.
+controller. Existing manifests remain readable by the native controller, including
+their original snapshot fingerprints. Older ready releases remain rollback targets;
+a legacy source deployment uses its original startup script when restored.
 
 The installer supports migration of the existing `run_vortex.sh` systemd unit.
 It rejects unexpected launch commands and service drop-ins rather than discarding
 custom behavior. Managed service/root paths must not contain spaces or systemd
-specifier characters. It backs up the old unit, installs stable management scripts,
+specifier characters. It backs up the old unit, installs a stable native controller,
 and grants only start/stop/reset-failed permission for that specific unit through
 a validated sudoers entry. Installing/upgrading the controller itself still needs
 root; ordinary Activate/Rollback operations run as the runtime user.
 
-`scripts/setup_jetson_environment.sh` now installs Python, provisions the pinned
-toolchain, grants the runtime user membership in `video`, builds through the shared
-launcher, and verifies the build before installing/restarting the service. It still
-requires a flashed Jetson and an existing runtime user. The app initializer adds
-compatibility checks and performs provisioning without an initial project copy on
-the device; it stages its uploaded snapshot and defers activation.
+`scripts/setup_jetson_environment.sh` is an optional terminal wrapper around
+`vortexctl initialize-submit`. It takes the same explicit package/job arguments as
+the controller. The app prepares those arguments automatically and works without
+an initial project copy on the device; initialization always defers activation.
 
 The service name defaults to `vortex-vision.service` in bootstrap. Set
 `startup_service_name` to that name in the interface preferences if the service
@@ -337,12 +340,13 @@ release. This is necessary to install notification access and start the new nati
 These checks use temporary files and mocked remote operations; no Jetson is contacted:
 
 ```text
-python -m unittest discover -s scripts -p "test_*.py"
+cargo test --manifest-path deployment/Cargo.toml --locked
 ```
 
 From `VortexDeploymentInterface/`:
 
 ```text
+npm run check:native
 npm test
 ```
 

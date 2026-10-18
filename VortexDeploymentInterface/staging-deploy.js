@@ -6,6 +6,7 @@ const os = require("os");
 const { spawn } = require("child_process");
 const { buildDeviceConfig } = require("./launch-config");
 const { logFollower } = require("./job-progress");
+const { nativeController, verifyController } = require("./native-controller");
 
 function quote(value) { return `'${String(value).replace(/'/g, `'\\''`)}'`; }
 
@@ -22,14 +23,13 @@ async function packageLocally(settings, directory, appDir) {
   const source = path.resolve(appDir, settings.local_path);
   const devicePath = path.join(directory, "device.json");
   await fs.writeFile(devicePath, JSON.stringify(buildDeviceConfig(settings)), "utf8");
-  const helper = path.join(source, "scripts", "deploy_release.py");
-  await fs.access(helper);
-  const args = [helper, "pack", "--source", source, "--output", directory, "--device-config", devicePath];
+  const helper = await nativeController(appDir, process.platform, process.arch);
+  const controller = await nativeController(appDir, "linux", settings.deployment_architecture === "x86_64" ? "x64" : "arm64");
+  const args = ["pack", "--source", source, "--output", directory, "--device-config", devicePath, "--controller", controller];
   if (settings.runtime_config_path) args.push("--runtime-config", path.resolve(appDir, settings.runtime_config_path));
   if (settings.tag_map_path) args.push("--tag-map", path.resolve(appDir, settings.tag_map_path));
-  const python = settings.python_executable || (process.platform === "win32" ? "python" : "python3");
   await new Promise((resolve, reject) => {
-    const child = spawn(python, args, { windowsHide: true, cwd: source, shell: false });
+    const child = spawn(helper, args, { windowsHide: true, cwd: source, shell: false });
     let output = "";
     const consume = (bytes) => { output = (output+bytes.toString("utf8")).slice(-16000); };
     child.stdout.on("data", consume);
@@ -55,6 +55,11 @@ async function stageProject(settings, remoteTarget, deps) {
   };
   try {
     emit(2, deps.resume ? "Reconnecting to saved staging job..." : "Packaging release snapshot...");
+    if (!deps.resume && !deps.package) {
+      const architecture = (await checked("uname -m")).stdout.trim();
+      if (!["aarch64", "x86_64"].includes(architecture)) throw new Error("Unsupported device architecture: "+architecture);
+      settings = { ...settings, deployment_architecture: architecture };
+    }
     metadata = deps.resume || await (deps.package || packageLocally)(settings, directory, deps.appDir);
     if (metadata.schema_version !== 1 || metadata.build_profile !== device.build_profile ||
         !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(metadata.release_id) ||
@@ -62,7 +67,7 @@ async function stageProject(settings, remoteTarget, deps) {
       throw new Error("Invalid release package metadata");
     }
     const incoming = `${root}/incoming/${metadata.release_id}`;
-    const controller = `${incoming}/controller.py`;
+    const controller = `${incoming}/vortexctl`;
     const archive = `${incoming}/release.tar.gz`;
     deps.log(`Release ${metadata.release_id}: staging at ${root}; production will keep running.`);
     if (!deps.resume) {
@@ -72,15 +77,12 @@ async function stageProject(settings, remoteTarget, deps) {
       await deps.upload(sftp, path.join(directory, "release.tar.gz"), archive, {
         step: (sent, chunk, total) => emit(10+Math.round(25*sent/Math.max(total, 1)), "Uploading release archive...")
       });
-      await deps.upload(sftp, path.join(directory, "controller.py"), controller);
+      await deps.upload(sftp, path.join(directory, "vortexctl"), controller);
       // Verify the small bootstrap controller before executing it. The controller
       // separately checks the entire archive and every extracted payload file.
-      const verify = "import hashlib,sys; p=sys.argv[1]; expected=sys.argv[2]; " +
-        "actual=hashlib.sha256(open(p,'rb').read()).hexdigest(); " +
-        "sys.exit(0 if actual==expected else 1)";
-      await checked(`python3 -c ${quote(verify)} ${quote(controller)} ${quote(metadata.controller_sha256)}`);
+      await checked(verifyController(controller, metadata.controller_sha256, quote));
       emit(38, "Starting isolated build...");
-      const command = `python3 ${quote(controller)} start-job --root ${quote(root)} --kind stage ` +
+      const command = `${quote(controller)} start-job --root ${quote(root)} --kind stage ` +
         `--job-id ${quote(metadata.release_id)} --sha256 ${quote(metadata.archive_sha256)} --release-id ${quote(metadata.release_id)}`;
       // Save before submission so a lost SSH reply cannot cause a second launch.
       await deps.remember?.({ kind: "stage", ...metadata });
@@ -88,7 +90,7 @@ async function stageProject(settings, remoteTarget, deps) {
       await checked(command);
     }
     launched = true;
-    const poll = `python3 ${quote(controller)} status --root ${quote(root)} --release-id ${quote(metadata.release_id)}`;
+    const poll = `${quote(controller)} status --root ${quote(root)} --release-id ${quote(metadata.release_id)}`;
     const start = Date.now();
     const timeout = deps.timeoutMs ?? 60*60*1000;
     const delay = deps.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));

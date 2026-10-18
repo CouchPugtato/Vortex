@@ -41,7 +41,7 @@ function fake(states = [ready]) {
     package: async (config, directory) => {
       localDirectory = directory;
       await fs.writeFile(path.join(directory, "release.tar.gz"), "archive");
-      await fs.writeFile(path.join(directory, "controller.py"), "controller");
+      await fs.writeFile(path.join(directory, "vortexctl"), "controller");
       return metadata;
     },
     progress: (event) => events.push(event), log: (line) => logs.push(line)
@@ -57,7 +57,7 @@ test("archive upload and managed build never delete or restart the current insta
   assert(h.uploads.every((file) => file.startsWith(`${root}/incoming/`)));
   assert(h.commands.some((command) => command.includes(" start-job ") && command.includes("--kind stage")));
   assert(!h.commands.some((command) => /systemctl|pkill|rm -rf|find |syncRemoteStartupScript/.test(command)));
-  assert(h.commands.findIndex((command) => command.includes("hashlib")) < h.commands.findIndex((command) => command.includes(" start-job ")));
+  assert(h.commands.findIndex((command) => command.includes("sha256sum")) < h.commands.findIndex((command) => command.includes(" start-job ")));
   assert.equal(h.events.at(-1).text, "Release ready — not activated");
   await assert.rejects(fs.access(h.directory));
 });
@@ -87,7 +87,7 @@ test("checksum verification failure prevents launching the controller", async ()
   const h = fake();
   const execute = h.deps.execChecked;
   h.deps.execChecked = async (conn, command) => {
-    if (command.includes("hashlib")) throw new Error("checksum mismatch");
+    if (command.includes("sha256sum")) throw new Error("checksum mismatch");
     return execute(conn, command);
   };
   await assert.rejects(stageProject(settings, target, h.deps), /checksum mismatch/);
@@ -140,7 +140,7 @@ test("real local packager snapshots the repository and selected configuration", 
   const result = await packageLocally({ ...settings, local_path: repository,
     runtime_config_path: path.join(repository, "config/config.json"),
     tag_map_path: path.join(repository, "config/2026-rebuilt-welded.json"),
-    python_executable: process.env.VORTEX_TEST_PYTHON || (process.platform === "win32" ? "python" : "python3") },
+    deployment_architecture: "aarch64" },
   directory, path.dirname(__dirname));
   const bytes = await fs.readFile(path.join(directory, "release.tar.gz"));
   assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), result.archive_sha256);

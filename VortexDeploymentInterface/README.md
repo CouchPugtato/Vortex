@@ -5,6 +5,7 @@
 ```powershell
 cd VortexDeploymentInterface
 npm install
+npm run build:native
 npm start
 ```
 
@@ -13,6 +14,7 @@ npm start
 ```powershell
 cd VortexDeploymentInterface
 npm install
+npm run build:native
 npm run dist:win
 ```
 
@@ -25,6 +27,10 @@ Available packaging scripts:
 - `npm run pack` (unpacked app directory)
 - `npm run dist` (default targets from `package.json`)
 - `npm run dist:win` (Windows targets only)
+
+`pack` creates an unsigned local app and skips executable editing, allowing the
+packaging check to run without Windows signing-tool symlink privileges. Installer
+builds retain the normal Electron Builder signing settings.
 
 ## Features
 
@@ -39,7 +45,7 @@ Available packaging scripts:
 ## Notes
 
 - See [deployment architecture and migration](../docs/deployment.md) for the shared
-  Python launcher, device settings, build profiles, and staged deployment upgrade.
+  native Rust controller, device settings, build profiles, and staged deployment upgrade.
 - **Stage Release** packages required files, verifies checksums, acquires the
   device deployment lock, and creates an isolated verified build.
 - Deployment jobs run under systemd and survive closing the app. Reopening restores
@@ -50,10 +56,13 @@ Available packaging scripts:
   **Rollback** switches back manually. First-time service setup needs administrator
   credentials entered in **Jetson Setup**; passwords are not saved.
 - Initialization needs an existing Ubuntu/JetPack image, SSH-enabled administrator
-  account, Python 3, systemd, internet and free disk space. It prepares a release;
+  account, systemd, internet and free disk space. It prepares a release;
   **Activate** starts it afterward. GPU/TensorRT need matching NVIDIA components.
-- Python is needed on the desktop; the Jetson needs Python, the pinned Rust
-  toolchain, native libraries, and cached dependencies. Builds are offline.
+- Packaged apps bundle Windows x64 and static Linux ARM64/x64 `vortexctl`
+  executables. Deployment needs no Python. Source builds need Rust, Zig and MinGW;
+  see [native build instructions](../deployment/README.md), including CI artifacts.
+  The Jetson vision build needs the pinned Rust toolchain, native libraries and
+  cached dependencies. Ordinary staging builds offline.
 - **Attach Diagnostics** observes the active service. **Next Camera** changes the
   subscription; **Detach Diagnostics** leaves vision running. Previews are generated
   on demand, capped at 5 FPS and 640×480. Empty scenes do not trigger the processing watchdog.

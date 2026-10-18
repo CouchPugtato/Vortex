@@ -46,17 +46,23 @@ test("unsafe or ambiguous settings fail rather than silently becoming defaults",
   }
 });
 
-test("every generated profile and NT mode is accepted by the Python launcher", () => {
+test("every generated profile and NT mode is accepted by the native launcher", async () => {
   const samples = PROFILES.flatMap((profile) => ["team", "custom", "local"].map((mode) =>
     buildDeviceConfig({ build_profile: profile, vortex_nt_enable: true,
       vortex_nt_mode: mode, vortex_nt_server: "robot.local" })));
-  const script = "import json, sys; sys.path.insert(0, sys.argv[1]); from run_vortex import validate_config; " +
-    "[validate_config(value) for value in json.load(sys.stdin)]";
-  const python = process.env.VORTEX_TEST_PYTHON || "python";
-  const result = spawnSync(python, ["-c", script, path.resolve(__dirname, "../../scripts")], {
-    input: JSON.stringify(samples), encoding: "utf8"
-  });
-  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  const { nativeController } = require("../native-controller");
+  const executable = await nativeController(path.resolve(__dirname, ".."), process.platform, process.arch);
+  const os = require("node:os");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-config-test-"));
+  try {
+    for (const sample of samples) {
+      const filename = path.join(directory, "device.json");
+      fs.writeFileSync(filename, JSON.stringify(sample));
+      const result = spawnSync(executable, ["launch", "--source", path.resolve(__dirname, "../.."),
+        "--device-config", filename, "--validate-config"], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr || result.error?.message);
+    }
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("packaged app includes the launch configuration module", () => {

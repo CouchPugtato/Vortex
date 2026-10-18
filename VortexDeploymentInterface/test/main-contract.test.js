@@ -13,6 +13,8 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-deployment-test-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const commands = [], writes = new Map(), handlers = new Map(), stageCalls = [], activationCalls = [], initializeCalls = [], diagnosticsCalls = [];
+  const appEvents = new Map();
+  let quits = 0, diagnosticsStops = 0;
   const overview = { ready: ["new"], active: { kind: "none" }, previous: { kind: "none" } };
   class FakeClient extends EventEmitter {
     connect() { queueMicrotask(() => this.emit("ready")); return this; }
@@ -41,7 +43,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
   }
   const appDir = path.resolve(__dirname, "..");
   const electron = {
-    app: { getPath: () => directory, whenReady: () => ({ then() {} }), on() {} },
+    app: { getPath: () => directory, whenReady: () => ({ then() {} }), on: (name, fn) => appEvents.set(name, fn), quit: () => { quits++; } },
     BrowserWindow: { getAllWindows: () => [] },
     ipcMain: { handle: (name, handler) => handlers.set(name, handler) }, dialog: {}, Menu: {}
   };
@@ -52,7 +54,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
       if (name === "./service-diagnostics") return { ServiceDiagnostics: class {
         constructor() { this.running = false; }
         async start(...args) { diagnosticsCalls.push(args); this.running = true; }
-        async stop() { this.running = false; }
+        async stop() { this.running = false; diagnosticsStops++; }
       } };
       if (name === "./initialize-deploy") return { initializeJetson: async (...args) => { initializeCalls.push(args); return initialize(...args); } };
       if (name === "./launch-config") return require("../launch-config");
@@ -65,9 +67,21 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
     } };
   const source = fs.readFileSync(path.join(appDir, "main.js"), "utf8");
   vm.runInNewContext(source+"\nmodule.exports = { APP_CONFIG_PATH, stopManagedStartupService, " +
-    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, resolveMonitorCommand, startStaging, JOB_PATH, resumeDeployment };", sandbox);
-  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, initializeCalls, diagnosticsCalls, overview, directory, connection: new FakeClient() };
+    "beginManagedToolActivity, serviceGuard, syncRemoteStartupScript, buildMainProgram, startStaging, JOB_PATH, resumeDeployment };", sandbox);
+  return { ...sandbox.module.exports, commands, writes, handlers, stageCalls, activationCalls, initializeCalls, diagnosticsCalls, appEvents,
+    get quits() { return quits; }, get diagnosticsStops() { return diagnosticsStops; }, overview, directory, connection: new FakeClient() };
 }
+
+test("closing the app detaches production diagnostics without invoking removed legacy managers", async (t) => {
+  const h = harness(t);
+  let prevented = false;
+  h.appEvents.get("before-quit")({ preventDefault() { prevented = true; } });
+  await new Promise(setImmediate);
+  assert(prevented);
+  assert.equal(h.diagnosticsStops, 1);
+  assert.equal(h.quits, 1);
+  assert.equal(h.commands.length, 0);
+});
 
 const settings = { local_path: "C:/source/Vortex", remote_path: "/home/vortex/deployments",
   tag_map_path: "", host: "never-contacted", startup_camera_indices: "0,2", build_profile: "gpu",
@@ -104,7 +118,7 @@ test("startup sync writes structured device settings and the common launcher", a
   assert.equal(device.udp.target, "robot.local");
   assert.equal(device.networktables.mode, "local");
   const launcher = [...h.writes.entries()].find(([file]) => file.includes("/run_vortex.sh."))[1].toString();
-  assert(launcher.includes("scripts/run_vortex.py"));
+  assert(launcher.includes("tools/vortexctl"));
   assert(h.commands.some((command) => command.startsWith("mv -f --")));
 });
 
@@ -134,12 +148,12 @@ test("staging does not stop/resume the service and rejects concurrent app reques
   assert.equal(h.startStaging({ ...cfg, build_profile: "invalid" }).ok, false);
 });
 
-test("diagnostics cannot bypass the launcher via legacy command settings", async (t) => {
+test("diagnostics ignores legacy launch commands and only attaches to the service", async (t) => {
   const h = harness(t);
-  const command = await h.resolveMonitorCommand(h.connection,
-    { ...settings, monitor_start_cmd: "unverified-program", preview_camera_index: 2 });
-  assert(command.endsWith("python3 scripts/run_vortex.py --debug-bridge --camera 2"));
-  assert(!command.includes("unverified-program"));
+  const cfg = { ...settings, monitor_start_cmd: "unverified-program", preview_camera_index: 2 };
+  assert.equal((await h.handlers.get("monitor-start")(null, cfg)).ok, true);
+  assert.equal(h.diagnosticsCalls.length, 1);
+  assert.equal(h.commands.length, 0);
 });
 
 test("activation IPC shares the staging guard while diagnostics attaches without service control", async (t) => {

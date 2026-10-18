@@ -24,7 +24,7 @@ class ServiceDiagnostics {
     }
   }
   command(session, action = "diagnostics") {
-    return `python3 ${quote(session.root+"/activate_release.py")} ${action} --root ${quote(session.root)} `+
+    return `${quote(session.root+"/vortexctl")} ${action} --root ${quote(session.root)} `+
       `--camera ${session.camera} --client-id ${quote(session.client)}`;
   }
   async read(session) {

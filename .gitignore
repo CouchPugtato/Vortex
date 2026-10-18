@@ -29,3 +29,8 @@ __pycache__/
 *.pyo
 .venv/
 .pytest_cache/
+
+# Built by VortexDeploymentInterface/scripts/build-native.js
+VortexDeploymentInterface/native/
+tools/vortexctl
+tools/vortexctl.exe

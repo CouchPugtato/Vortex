@@ -3,7 +3,7 @@
 const PROFILES = Object.freeze(["cpu", "gpu", "tensorrt", "gpu-tensorrt"]);
 const LAUNCHER = "#!/usr/bin/env bash\nset -euo pipefail\n\n" +
   'APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"\n' +
-  'exec python3 "$APP_DIR/scripts/run_vortex.py" "$@"\n';
+  'exec "$APP_DIR/tools/vortexctl" launch --source "$APP_DIR" "$@"\n';
 
 function ensure(condition, message) {
   if (!condition) throw new Error(message);

@@ -1,0 +1,58 @@
+name: Native deployment tools
+on:
+  push:
+    paths: ['deployment/**', 'VortexDeploymentInterface/**', '.github/workflows/vortexctl.yml']
+  pull_request:
+    paths: ['deployment/**', 'VortexDeploymentInterface/**', '.github/workflows/vortexctl.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          pip install ziglang==0.13.0
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+          cargo +1.96.0 install cargo-zigbuild --locked --version 0.23.4
+      - name: Check Rust controller
+        working-directory: deployment
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Build all bundled controllers
+        run: node VortexDeploymentInterface/scripts/build-native.js
+      - name: Test desktop integration
+        working-directory: VortexDeploymentInterface
+        run: |
+          npm ci
+          npm run check:native
+          npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vortexctl-native
+          path: VortexDeploymentInterface/native/
+          if-no-files-found: error
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test Windows controller
+        working-directory: deployment
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo test --locked

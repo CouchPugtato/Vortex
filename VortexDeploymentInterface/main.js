@@ -63,8 +63,6 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   serviceDiagnostics.stop();
-  monitorManager.stop();
-  previewManager.stop();
   if (process.platform !== "darwin") app.quit();
 });
 
@@ -75,8 +73,6 @@ app.on("before-quit", (event) => {
   (async () => {
     try {
       await serviceDiagnostics.stop();
-      await monitorManager.stop();
-      previewManager.stop();
       await restartManagedStartupServiceOnExit();
     } catch (err) {
       emitLog(`Shutdown cleanup error: ${err?.message || String(err)}`);
@@ -100,24 +96,9 @@ function emitMonitorState(isRunning) {
   if (win) win.webContents.send("monitor-state", isRunning);
 }
 
-function emitMonitorLine(line) {
-  const win = getWindow();
-  if (win) win.webContents.send("monitor-line", line);
-}
-
 function emitPreviewState(isRunning) {
   const win = getWindow();
   if (win) win.webContents.send("preview-state", isRunning);
-}
-
-function emitPreviewFrame(dataUrl) {
-  const win = getWindow();
-  if (win) win.webContents.send("preview-frame", dataUrl);
-}
-
-function emitBridgeState(state) {
-  const win = getWindow();
-  if (win) win.webContents.send("bridge-state", state);
 }
 
 function emitDeployProgress(progress) {
@@ -141,15 +122,6 @@ function emitOnnxUploadProgress(progress) {
 function emitMainBuildProgress(progress) {
   const win = getWindow();
   if (win) win.webContents.send("main-build-progress", progress);
-}
-
-function isDetectionLine(line) {
-  const s = String(line || "").trim();
-  if (!s) return false;
-  if (/^Camera\s+\d+:\s+[\d.]+\s+FPS/.test(s)) return true;
-  if (/Tag ID:\s*\d+\s*\|/.test(s)) return true;
-  if (/Object:\s*.+\|\s*Dist:/.test(s)) return true;
-  return false;
 }
 
 function defaultAppConfig() {
@@ -706,16 +678,6 @@ function sftpFastPut(sftp, localPath, remotePath, options = {}) {
   });
 }
 
-function sftpReadFile(sftp, remotePath) {
-  return new Promise((resolve, reject) => {
-    const stream = sftp.createReadStream(remotePath);
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-  });
-}
-
 function sftpWriteFile(sftp, remotePath, bytes) {
   return new Promise((resolve, reject) => {
     const ws = sftp.createWriteStream(remotePath, { flags: "w", mode: 0o644 });
@@ -749,134 +711,6 @@ async function buildMainProgram(settings) {
   return deployProject(settings);
 }
 
-async function resolveMonitorCommand(conn, settings) {
-  const remoteTarget = inferRemoteDeployFolder(settings.remote_path, settings.local_path);
-  const camera = Number(settings.preview_camera_index ?? 0);
-  if (!Number.isInteger(camera) || camera < 0 || camera > 5) throw new Error("Invalid debug camera (0-5)");
-  // Legacy diagnostics remain explicit until service-attached preview is implemented.
-  // No hidden builds, feature fallback, dependency installation, or lockfile changes.
-  await syncRemoteStartupScript(conn, settings);
-  await execChecked(conn, `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --check-debug-bridge`);
-  emitLog("Starting legacy bridge diagnostics; this replaces production camera ownership while monitoring.");
-  return `cd ${shSingle(remoteTarget)} && python3 scripts/run_vortex.py --debug-bridge --camera ${camera}`;
-}
-
-const monitorManager = {
-  conn: null,
-  channel: null,
-  restartTimer: null,
-  stopping: false,
-  settings: null,
-  activityHeld: false,
-  async start(settings) {
-    if (this.conn) throw new Error("Monitor already running");
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = null;
-    }
-    this.settings = settings;
-    this.stopping = false;
-    try {
-      emitMonitorStartProgress({ status: "starting", percent: 10, text: "Connecting..." });
-      this.conn = await connectSsh(settings);
-
-      emitMonitorStartProgress({ status: "starting", percent: 55, text: "Resolving monitor..." });
-      const resolvedStart = await resolveMonitorCommand(this.conn, settings);
-      emitMonitorStartProgress({ status: "starting", percent: 70, text: "Freeing camera devices..." });
-      await execCommand(
-        this.conn,
-        "bash -lc \"pkill -f dumapril-taglocalization >/dev/null 2>&1 || true; pkill -f orin_bridge >/dev/null 2>&1 || true; sleep 0.25\""
-      );
-      emitMonitorStartProgress({ status: "starting", percent: 85, text: "Launching monitor..." });
-      const cmd = `bash -lc "${String(resolvedStart).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-      this.channel = await execCommand(this.conn, cmd, { stream: true });
-      emitMonitorState(true);
-      emitMonitorStartProgress({ status: "done", percent: 100, text: "✓ Monitor started" });
-      emitLog(`Monitor started: ${resolvedStart}`);
-
-      let pending = "";
-      this.channel.on("data", (data) => {
-        pending += data.toString("utf8");
-        const lines = pending.split(/\r?\n/);
-        pending = lines.pop() || "";
-        for (const line of lines) {
-          emitMonitorLine(line);
-          if (!isDetectionLine(line)) emitLog(line);
-        }
-      });
-      this.channel.stderr.on("data", (data) => {
-        const msg = data.toString("utf8").trim();
-        if (msg) emitLog(msg);
-      });
-      this.channel.on("close", async (code, signal) => {
-        const restartSettings = this.settings;
-        if (pending.trim()) {
-          emitMonitorLine(pending.trim());
-          if (!isDetectionLine(pending.trim())) emitLog(pending.trim());
-        }
-        if (this.activityHeld && this.stopping) {
-          endManagedToolActivity();
-          this.activityHeld = false;
-        }
-        this.cleanup();
-        emitMonitorState(false);
-        emitMonitorStartProgress({ status: "hidden", percent: 0, text: "" });
-        if (!this.stopping) {
-          const exitCode = typeof code === "number" ? code : "unknown";
-          emitLog(`Monitor stream ended (exit=${exitCode}${signal ? `, signal=${signal}` : ""}).`);
-          emitLog("Monitor exited unexpectedly. Restarting in 2s...");
-          this.restartTimer = setTimeout(async () => {
-            this.restartTimer = null;
-            try {
-              await this.start(restartSettings);
-            } catch (err) {
-              emitLog(`Monitor auto-restart failed: ${err?.message || String(err)}`);
-            }
-          }, 2000);
-        }
-      });
-    } catch (err) {
-      this.cleanup();
-      emitMonitorState(false);
-      emitMonitorStartProgress({ status: "error", percent: 0, text: "✕ Start failed" });
-      throw err;
-    }
-  },
-  async stop() {
-    this.stopping = true;
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
-      this.restartTimer = null;
-    }
-    try {
-      if (this.settings && this.settings.monitor_stop_cmd) {
-        const stopConn = await connectSsh(this.settings);
-        await execCommand(stopConn, this.settings.monitor_stop_cmd);
-        stopConn.end();
-      }
-      if (this.channel) this.channel.close();
-    } catch (err) {
-      emitLog(`Monitor stop failed: ${err.message}`);
-    } finally {
-      if (this.activityHeld) {
-        endManagedToolActivity();
-        this.activityHeld = false;
-      }
-      this.cleanup();
-      emitMonitorState(false);
-      emitMonitorStartProgress({ status: "hidden", percent: 0, text: "" });
-    }
-  },
-  cleanup() {
-    if (this.channel) this.channel = null;
-    if (this.conn) {
-      this.conn.end();
-      this.conn = null;
-    }
-    this.settings = null;
-  }
-};
-
 async function syncTagMapRemote(conn, settings) {
   if (!String(settings.tag_map_path || "").trim()) return;
   const localPath = path.resolve(__dirname, settings.tag_map_path);
@@ -889,87 +723,6 @@ async function syncTagMapRemote(conn, settings) {
     Buffer.from(JSON.stringify(map)+"\n"));
   emitLog(`Tag map synced: ${destination}`);
 }
-
-const previewManager = {
-  running: false,
-  latestFrameDataUrl: null,
-  latestBridgeState: null,
-  emitTimer: null,
-  emitPending: false,
-  scheduleEmit() {
-    if (this.emitPending) return;
-    this.emitPending = true;
-    this.emitTimer = setTimeout(() => {
-      this.emitPending = false;
-      if (!this.running) return;
-      if (this.latestFrameDataUrl) emitPreviewFrame(this.latestFrameDataUrl);
-      if (this.latestBridgeState) emitBridgeState(this.latestBridgeState);
-    }, 120);
-  },
-  async start(settings) {
-    if (this.running) return;
-    this.running = true;
-    this.latestFrameDataUrl = null;
-    this.latestBridgeState = null;
-    this.emitPending = false;
-    emitPreviewState(true);
-    emitLog("Preview started.");
-    let conn = null;
-    let sftp = null;
-    while (this.running) {
-      try {
-        if (!conn) {
-          conn = await connectSsh(settings);
-          sftp = await getSftp(conn);
-        }
-        const bytes = await sftpReadFile(sftp, settings.preview_remote_path);
-        const mime = bytes[0] === 0x89 ? "image/png" : "image/jpeg";
-        this.latestFrameDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
-        try {
-          const stateBytes = await sftpReadFile(
-            sftp,
-            settings.preview_state_path || "/tmp/vortex_bridge_state.json"
-          );
-          const parsed = JSON.parse(stateBytes.toString("utf8"));
-          this.latestBridgeState = parsed;
-        } catch (_stateErr) {
-          // state file may not exist yet, ignore and keep preview alive
-        }
-        this.scheduleEmit();
-      } catch (err) {
-        const msg = err?.message || String(err);
-        emitLog(`Preview error: ${msg}`);
-        if (conn) {
-          try { conn.end(); } catch (_e) {}
-          conn = null;
-          sftp = null;
-        }
-        if (msg.includes("All configured authentication methods failed")) {
-          emitLog("Authentication failed. Check the Jetson address, account and SSH password in Jetson Setup.");
-          this.running = false;
-        }
-        await new Promise((r) => setTimeout(r, 450));
-        continue;
-      }
-      await new Promise((r) => setTimeout(r, 90));
-    }
-    if (conn) {
-      try { conn.end(); } catch (_e) {}
-    }
-    emitPreviewState(false);
-    emitLog("Preview stopped.");
-  },
-  stop() {
-    this.running = false;
-    if (this.emitTimer) {
-      clearTimeout(this.emitTimer);
-      this.emitTimer = null;
-    }
-    this.emitPending = false;
-    this.latestFrameDataUrl = null;
-    this.latestBridgeState = null;
-  }
-};
 
 ipcMain.handle("bootstrap", async () => {
   const appCfg = withSshConfig({ ...defaultAppConfig(), ...(await readPersistedAppConfig()) });
@@ -1251,7 +1004,7 @@ async function resumeDeployment(settings) {
 ipcMain.handle("deployment-resume", async (_evt, settings) => resumeDeployment(settings));
 
 ipcMain.handle("jetson-initialize", async (_evt, settings, administratorPassword) => {
-  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || monitorManager.conn || serviceGuard.activeCount) {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount) {
     return { ok: false, error: "Finish/reconnect the current operation and stop diagnostics before initializing" };
   }
   try {
@@ -1283,7 +1036,7 @@ ipcMain.handle("release-status", async (_evt, settings) => {
 });
 
 ipcMain.handle("release-operate", async (_evt, settings, action, release) => {
-  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || monitorManager.conn || serviceGuard.activeCount) {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount) {
     return { ok: false, error: "Wait for the current operation and stop diagnostics before switching releases" };
   }
   stagingInFlight = true;
@@ -1359,7 +1112,7 @@ ipcMain.handle("apply-monitor-preset", async (_evt, appConfig, preset) => {
   if (!["main_cam_0", "main_cam_0_2", "main_defaults"].includes(preset)) throw new Error("Unknown monitor preset");
   return {
     ...appConfig,
-    monitor_start_cmd: "python3 scripts/run_vortex.py --debug-bridge",
+    monitor_start_cmd: "tools/vortexctl launch --source . --debug-bridge",
     monitor_stop_cmd: "pkill -f orin_bridge || true",
     preview_remote_path: "/tmp/vortex_bridge_frame.jpg",
     preview_state_path: "/tmp/vortex_bridge_state.json"

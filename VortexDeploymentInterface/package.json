@@ -5,9 +5,14 @@
   "description": "Electron deployment and monitoring utility for Vortex",
   "main": "main.js",
   "scripts": {
+    "build:native": "node scripts/build-native.js",
+    "check:native": "node scripts/build-native.js --check",
+    "prepack": "npm run check:native",
+    "predist": "npm run check:native",
+    "predist:win": "npm run check:native",
     "start": "electron .",
     "test": "node --test test/*.test.js",
-    "pack": "electron-builder --dir",
+    "pack": "electron-builder --dir --config.win.signAndEditExecutable=false",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win"
   },
@@ -33,10 +38,12 @@
       "job-progress.js",
       "initialize-deploy.js",
       "service-diagnostics.js",
+      "native-controller.js",
       "preload.js",
       "renderer/**/*",
       "package.json"
     ],
+    "extraResources": [{ "from": "native", "to": "native", "filter": ["**/*"] }],
     "win": {
       "target": [
         {

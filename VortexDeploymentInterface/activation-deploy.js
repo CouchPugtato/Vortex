@@ -13,10 +13,10 @@ async function releaseStatus(settings, remoteTarget, deps) {
   const release = settings.last_ready_release ? identity(settings.last_ready_release) : null;
   const conn = await deps.connect(settings);
   try {
-    const helper = release ? `${root}/releases/${release}/scripts/activate_release.py` : `${root}/activate_release.py`;
+    const helper = release ? `${root}/releases/${release}/tools/vortexctl` : `${root}/vortexctl`;
     const empty = JSON.stringify({ ready: [], active: { kind: "none" }, previous: { kind: "none" }, service_configured: false });
-    const command = release ? `python3 ${quote(helper)} status --root ${quote(root)}` :
-      `if [ -f ${quote(helper)} ]; then python3 ${quote(helper)} status --root ${quote(root)}; ` +
+    const command = release ? `${quote(helper)} status --root ${quote(root)}` :
+      `if [ -f ${quote(helper)} ]; then ${quote(helper)} status --root ${quote(root)}; ` +
       `else printf '%s\\n' ${quote(empty)}; fi`;
     const response = await deps.execChecked(conn, command);
     return JSON.parse(response.stdout);
@@ -38,27 +38,27 @@ async function operateRelease(settings, remoteTarget, action, release, deps) {
   try {
     emit(2, "Preparing managed service...");
     if (!deps.resume) {
-      const installer = `${root}/releases/${prepared}/scripts/activate_release.py`;
+      const installer = `${root}/releases/${prepared}/tools/vortexctl`;
       const name = settings.startup_service_name || "vortex-vision.service";
       if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*\.service$/.test(name)) throw new Error("Invalid managed service name");
       // Read-only status locates an existing installation; only first-time preparation
       // needs sudo. Later activations use narrowly granted systemctl permissions.
-      const overview = JSON.parse((await checked(`python3 ${quote(installer)} status --root ${quote(root)}`)).stdout);
+      const overview = JSON.parse((await checked(`${quote(installer)} status --root ${quote(root)}`)).stdout);
       if (!overview.service_configured || overview.controller_current === false) {
-        const install = `/usr/bin/python3 ${quote(installer)} install-service --root ${quote(root)} ` +
+        const install = `${quote(installer)} install-service --root ${quote(root)} ` +
           `--legacy-root ${quote(remoteTarget)} --service ${quote(name)} --user ${quote(deps.user || "vortex")}`;
         try { await checked(`sudo -n ${install}`); }
         catch (error) {
           throw new Error("Managed service setup needs administrator access. Open Jetson Setup and use Initialize Jetson, then retry Activate.");
         }
       }
-      const command = `python3 ${quote(root+"/deploy_release.py")} start-job --kind ${quote(action)} --root ${quote(root)} --job-id ${quote(operation)}` +
+      const command = `${quote(root+"/vortexctl")} start-job --kind ${quote(action)} --root ${quote(root)} --job-id ${quote(operation)}` +
         (action === "activate" ? ` --release-id ${quote(prepared)}` : "");
       await deps.remember?.({ kind: action, operation_id: operation, release_id: prepared });
       started = true;
       await checked(command);
     }
-    const helper = `${root}/activate_release.py`;
+    const helper = `${root}/vortexctl`;
     started = true;
     const deadline = Date.now()+(deps.timeoutMs ?? 180000);
     const delay = deps.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -66,7 +66,7 @@ async function operateRelease(settings, remoteTarget, action, release, deps) {
     while (Date.now() < deadline) {
       let response;
       try {
-        response = await checked(`python3 ${quote(helper)} status --root ${quote(root)} --operation-id ${quote(operation)}`);
+        response = await checked(`${quote(helper)} status --root ${quote(root)} --operation-id ${quote(operation)}`);
         disconnected = 0;
       } catch (error) {
         if (conn) conn.end();
