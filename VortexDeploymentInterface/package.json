@@ -40,6 +40,9 @@
       "service-diagnostics.js",
       "native-controller.js",
       "maintenance.js",
+      "robot-network.js",
+      "network-setup.js",
+      "radio-transfer.js",
       "preload.js",
       "renderer",
       "package.json"

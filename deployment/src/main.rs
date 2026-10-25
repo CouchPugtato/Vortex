@@ -4,14 +4,14 @@ use common::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use vortexctl::{
-    activation, common, initialize, jobs, launcher, offline, package, retention, service,
+    activation, common, initialize, jobs, launcher, network, offline, package, retention, service,
     validation,
 };
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native Vortex deployment controller")]
 struct Args {
-    #[arg(value_parser=["launch","pack","stage","start-job","status","activate","rollback","recover","service-run","install-service","preflight","diagnostics","diagnostics-stop","initialize-submit","initialize-run","cleanup","offline-create","offline-download","validate-device"])]
+    #[arg(value_parser=["launch","pack","stage","start-job","status","activate","rollback","recover","service-run","install-service","preflight","diagnostics","diagnostics-stop","initialize-submit","initialize-run","cleanup","offline-create","offline-download","validate-device","network-info","network-submit","network-worker","network-status","network-confirm"])]
     action: String,
     #[arg(long)]
     root: Option<PathBuf>,
@@ -81,11 +81,44 @@ struct Args {
     profile: String,
     #[arg(long, default_value = "30")]
     duration_seconds: u64,
+    #[arg(long)]
+    interface: Option<String>,
+    #[arg(long, default_value = "509")]
+    team: u32,
+    #[arg(long, default_value = "12")]
+    device: u32,
+    #[arg(long, default_value = "5808")]
+    ssh_port: u16,
+    #[arg(long)]
+    token: Option<String>,
+    #[arg(long)]
+    radio_preview: bool,
 }
 fn required<T>(v: Option<T>, name: &str) -> Result<T> {
     v.with_context(|| format!("--{name} is required"))
 }
 fn run(a: Args) -> Result<Value> {
+    match a.action.as_str() {
+        "network-info" => return network::info(),
+        "network-submit" => {
+            return network::submit(
+                &required(a.interface, "interface")?,
+                a.team,
+                a.device,
+                &a.user,
+                a.ssh_port,
+            )
+        }
+        "network-worker" => return network::worker(&required(a.operation_id, "operation-id")?),
+        "network-status" => return network::status(&required(a.operation_id, "operation-id")?),
+        "network-confirm" => {
+            return network::confirm(
+                &required(a.operation_id, "operation-id")?,
+                &required(a.token, "token")?,
+            )
+        }
+        _ => {}
+    }
     if a.action == "offline-download" {
         return offline::download(&required(a.output, "output")?);
     }
@@ -216,12 +249,13 @@ fn run(a: Args) -> Result<Value> {
             &a.service,
             &a.user,
         ),
-        "diagnostics" | "diagnostics-stop" => service::diagnostics(
+        "diagnostics" | "diagnostics-stop" => service::diagnostics_options(
             &root,
             a.camera,
             &required(a.client_id, "client-id")?,
             a.action == "diagnostics-stop",
             &activation::Systemd::new(&root)?,
+            a.radio_preview,
         ),
         "initialize-submit" | "initialize-run" => {
             let legacy = required(a.legacy_root, "legacy-root")?;

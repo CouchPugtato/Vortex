@@ -25,13 +25,22 @@ class ServiceDiagnostics {
   }
   command(session, action = "diagnostics") {
     return `${quote(session.root+"/vortexctl")} ${action} --root ${quote(session.root)} `+
-      `--camera ${session.camera} --client-id ${quote(session.client)}`;
+      `--camera ${session.camera} --client-id ${quote(session.client)}`+
+      (session.settings.connection_mode === "radio" && session.settings.radio_bandwidth_mode !== false && !session.legacyRadio ? " --radio-preview" : "");
   }
   async read(session) {
     if (!session.conn) session.conn = await this.deps.connect(session.settings);
     if (this.session !== session) { session.conn.end(); return; }
     const requested = Date.now();
-    const response = await this.deps.execChecked(session.conn, this.command(session));
+    let response;
+    try { response = await this.deps.execChecked(session.conn, this.command(session)); }
+    catch (error) {
+      if (!session.legacyRadio && /(?:unexpected argument|unknown).*radio-preview/i.test(error.message)) {
+        session.legacyRadio = true;
+        this.deps.log("Installed controller predates radio previews; Initialize Jetson and Activate an updated release for reduced preview size.");
+        response = await this.deps.execChecked(session.conn, this.command(session));
+      } else throw error;
+    }
     if (this.session !== session) return;
     const value = JSON.parse(response.stdout);
     if (value.schema_version !== 1 || typeof value.ready !== "boolean" || value.camera_index !== session.camera) {
@@ -66,7 +75,7 @@ class ServiceDiagnostics {
   async loop(session) {
     const delay = this.deps.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     while (this.session === session) {
-      await delay(this.deps.pollMs ?? 250);
+      await delay(session.settings.connection_mode === "radio" && session.settings.radio_bandwidth_mode !== false ? 1000 : (this.deps.pollMs ?? 250));
       if (this.session !== session) return;
       try { await this.read(session); }
       catch (error) {

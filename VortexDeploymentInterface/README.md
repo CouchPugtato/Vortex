@@ -1,5 +1,9 @@
 # Vortex Deployment Interface (Electron)
 
+The default connection is **Robot Ethernet / radio** (`10.TE.AM.12:5808`). Use
+**USB recovery / first-time setup** to initialize a new Jetson, then configure its
+Ethernet address through the app. See the [robot network guide](../docs/robot-network.md).
+
 ## Run
 
 ```powershell
@@ -84,3 +88,4 @@ controllers and renderer files, checks the running page and preload API, then
 uninstalls it. The artifact includes `installer-smoke.json`. For an existing
 unpacked app, run `node scripts/smoke-installed.js --probe-only dist/win-unpacked`
 to check packaged resources without installing or launching the UI.
+Add `--launch` to also check the app in a hidden window, including radio/USB mode switching.

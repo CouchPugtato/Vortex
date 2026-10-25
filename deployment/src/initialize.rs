@@ -22,6 +22,8 @@ pub const PACKAGES: &[&str] = &[
     "libv4l-dev",
     "v4l-utils",
     "dbus-user-session",
+    "network-manager",
+    "avahi-daemon",
 ];
 pub struct Options<'a> {
     pub root: &'a Path,

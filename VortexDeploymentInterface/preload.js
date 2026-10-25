@@ -10,6 +10,10 @@ function makeSubscriber(channel) {
 
 contextBridge.exposeInMainWorld("vortexApi", {
   bootstrap: () => ipcRenderer.invoke("bootstrap"),
+  networkResolve: settings => ipcRenderer.invoke("network-resolve", settings),
+  networkDiscover: settings => ipcRenderer.invoke("network-discover", settings),
+  networkCheck: settings => ipcRenderer.invoke("network-check", settings),
+  networkSetup: (settings, action, iface, password) => ipcRenderer.invoke("network-setup", settings, action, iface, password),
   chooseFolder: () => ipcRenderer.invoke("choose-folder"),
   chooseFile: (opts) => ipcRenderer.invoke("choose-file", opts),
   loadTagMap: (mapPath) => ipcRenderer.invoke("load-tag-map", mapPath),

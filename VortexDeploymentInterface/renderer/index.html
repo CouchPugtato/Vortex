@@ -10,15 +10,29 @@
     <div class="app-shell">
       <section class="left-panel">
         <section class="card block">
-          <details id="jetsonSetup">
+          <details id="jetsonSetup" open>
             <summary>Jetson Setup</summary>
+            <label for="connectionMode">Connection</label>
+            <select id="connectionMode"><option value="radio">Robot Ethernet / radio (default)</option><option value="usb">USB recovery / first-time setup</option><option value="custom">Custom address</option></select>
+            <div class="row"><label>Team <input id="radioTeam" type="number" min="1" max="25599" value="509" /></label><label>Device <input id="radioDevice" type="number" min="6" max="19" value="12" /></label></div>
+            <label for="radioPort">Robot SSH port</label><input id="radioPort" type="number" min="5800" max="5810" value="5808" />
+            <label for="radioHostname">Device hostname (optional discovery fallback)</label><input id="radioHostname" placeholder="jetson.local" />
+            <label><input id="radioBandwidth" type="checkbox" checked /> Limit radio traffic (1 FPS previews and capped uploads)</label>
             <label for="jetsonHost">Jetson address</label>
-            <div class="row"><input id="jetsonHost" placeholder="192.168.55.1" aria-label="Jetson address" />
-              <input id="jetsonPort" value="22" type="number" min="1" max="65535" aria-label="SSH port" /></div>
+            <div class="row"><input id="jetsonHost" placeholder="10.5.9.12" aria-label="Jetson address" />
+              <input id="jetsonPort" value="5808" type="number" min="1" max="65535" aria-label="SSH port" /></div>
             <label for="jetsonUser">Jetson account</label>
             <input id="jetsonUser" autocomplete="username" placeholder="vortex" />
             <label for="jetsonPassword">SSH password</label>
             <input id="jetsonPassword" type="password" autocomplete="off" placeholder="Kept for this app session only" />
+            <div class="row"><button id="discoverRobot">Find Device</button><button id="checkRobot">Check Connection</button></div>
+            <div id="networkStatus" class="hint" role="status">Connect your laptop to the robot network. First-time Jetsons can use USB recovery, then Configure Ethernet below.</div>
+            <details><summary>Configure robot Ethernet</summary>
+              <div class="hint">Connect by USB first. Plug the Jetson Ethernet into the robot radio/switch and connect this laptop to that robot network too. Choose an unused device address. Setup uses NetworkManager and reverts an unconfirmed change automatically. USB recovery stays available. Deploy updates while tethered or in the pits; field diagnostics use the team TCP port.</div>
+              <button id="inspectEthernet">Inspect Ethernet</button>
+              <label for="ethernetInterface">Ethernet interface</label><select id="ethernetInterface"><option value="">Inspect the Jetson first</option></select>
+              <button id="configureEthernet">Configure Ethernet</button>
+            </details>
             <label for="setupLocal">Project source folder</label>
             <div class="row"><input id="setupLocal" /><button id="browseSetupLocal">Browse</button></div>
             <label for="setupRemote">Deployment parent folder on Jetson</label>

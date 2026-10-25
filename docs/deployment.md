@@ -1,5 +1,8 @@
 # Deployment
 
+The app defaults to the robot Ethernet/radio network. First-time setup and USB
+recovery are described in the [robot network guide](robot-network.md).
+
 **Stage Release** now packages, uploads, verifies, and builds a versioned release
 without replacing files in the running installation or stopping its service.
 **Activate** performs preflight checks, switches the systemd service, and verifies

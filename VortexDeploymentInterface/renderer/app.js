@@ -58,6 +58,18 @@ const CAMERA_ACTIVE_MS = 4000;
 const TAG_OVERLAY_STICKY_MS = 450;
 
 const el = {
+  connectionMode: document.querySelector("#connectionMode"),
+  radioTeam: document.querySelector("#radioTeam"),
+  radioDevice: document.querySelector("#radioDevice"),
+  radioPort: document.querySelector("#radioPort"),
+  radioHostname: document.querySelector("#radioHostname"),
+  radioBandwidth: document.querySelector("#radioBandwidth"),
+  discoverRobot: document.querySelector("#discoverRobot"),
+  checkRobot: document.querySelector("#checkRobot"),
+  networkStatus: document.querySelector("#networkStatus"),
+  inspectEthernet: document.querySelector("#inspectEthernet"),
+  ethernetInterface: document.querySelector("#ethernetInterface"),
+  configureEthernet: document.querySelector("#configureEthernet"),
   jetsonSetup: document.querySelector("#jetsonSetup"),
   jetsonHost: document.querySelector("#jetsonHost"),
   jetsonPort: document.querySelector("#jetsonPort"),
@@ -307,8 +319,16 @@ function setBuildIndicator(stateKind, text, percent = null) {
 
 function hydrateAppConfig(cfg) {
   state.appConfig = cfg;
-  el.jetsonHost.value = cfg.host || "192.168.55.1";
-  el.jetsonPort.value = cfg.port || "22";
+  el.connectionMode.value = cfg.connection_mode || "radio";
+  el.radioTeam.value = cfg.radio_team || "509";
+  el.radioDevice.value = cfg.radio_device || "12";
+  el.radioPort.value = cfg.radio_port || (cfg.connection_mode === "radio" ? cfg.port : "5808") || "5808";
+  el.radioHostname.value = cfg.radio_hostname || "";
+  el.radioBandwidth.checked = cfg.radio_bandwidth_mode !== false;
+  el.jetsonHost.value = cfg.host || "10.5.9.12";
+  el.jetsonPort.value = cfg.port || "5808";
+  el.jetsonHost.readOnly = el.connectionMode.value !== "custom";
+  el.jetsonPort.readOnly = el.connectionMode.value !== "custom";
   el.jetsonUser.value = cfg.user || "vortex";
   el.setupLocal.value = cfg.local_path || "";
   el.setupRemote.value = cfg.remote_path || "/home/vortex/deployments";
@@ -409,6 +429,12 @@ function readAppConfigFromUI() {
   const udpPort = el.udpPort?.value ?? state.appConfig?.vortex_udp_port ?? 5809;
   return {
     ...state.appConfig,
+    connection_mode: el.connectionMode.value,
+    radio_team: el.radioTeam.value,
+    radio_device: el.radioDevice.value,
+    radio_port: el.radioPort.value,
+    radio_hostname: el.radioHostname.value.trim(),
+    radio_bandwidth_mode: el.radioBandwidth.checked,
     host: el.jetsonHost.value.trim(),
     port: el.jetsonPort.value.trim(),
     user: el.jetsonUser.value.trim(),
@@ -1181,6 +1207,57 @@ async function init() {
   state.runtimeConfig = boot.runtimeConfig;
   renderRuntimeFormForCurrentCamera();
   await loadTagMapFromPath(state.tagMapPath, { log: false });
+
+  async function resolveConnection(event) {
+    try {
+      const settings = readAppConfigFromUI();
+      if ([el.radioTeam, el.radioDevice, el.jetsonHost].includes(event?.target)) { settings.host_key = ""; delete settings.host_key_algorithm; }
+      if (settings.connection_mode === "radio") settings.port = el.radioPort.value;
+      const resolved = await window.vortexApi.networkResolve(settings);
+      state.appConfig = resolved;
+      el.jetsonHost.value = resolved.host;
+      el.jetsonPort.value = resolved.port;
+      el.jetsonHost.readOnly = resolved.connection_mode !== "custom";
+      el.jetsonPort.readOnly = resolved.connection_mode !== "custom";
+      await window.vortexApi.saveAppConfig(resolved);
+    } catch (error) { el.networkStatus.textContent = error.message; }
+  }
+  for (const input of [el.connectionMode, el.radioTeam, el.radioDevice, el.radioPort, el.radioHostname, el.radioBandwidth, el.jetsonHost, el.jetsonPort]) input.addEventListener("change", resolveConnection);
+  async function networkAction(button, action) {
+    button.disabled = true;
+    el.networkStatus.textContent = "Checking robot connection…";
+    try { await action(); }
+    catch (error) { el.networkStatus.textContent = error.message; appendLog(`Robot network: ${error.message}`); }
+    finally { button.disabled = false; }
+  }
+  el.discoverRobot.addEventListener("click", () => networkAction(el.discoverRobot, async () => {
+    const results = await window.vortexApi.networkDiscover(readAppConfigFromUI());
+    el.networkStatus.textContent = results.map(r => `${r.host}:${r.port} — ${r.reason}`).join("; ");
+  }));
+  el.checkRobot.addEventListener("click", () => networkAction(el.checkRobot, async () => {
+    const cfg = readAppConfigFromUI();
+    const result = await window.vortexApi.networkCheck(cfg);
+    cfg.host_key = result.host_key;
+    cfg.host_key_algorithm = result.host_key_algorithm;
+    state.appConfig = cfg;
+    await window.vortexApi.saveAppConfig(cfg);
+    el.networkStatus.textContent = `Connected to ${result.identity.replace(/\n/g, " / ")} at ${result.endpoint.host}:${result.endpoint.port}`;
+  }));
+  el.inspectEthernet.addEventListener("click", () => networkAction(el.inspectEthernet, async () => {
+    const result = await window.vortexApi.networkSetup(readAppConfigFromUI(), "inspect");
+    el.ethernetInterface.replaceChildren();
+    for (const device of result.interfaces.filter(d => d.eligible)) el.ethernetInterface.add(new Option(`${device.interface} — ${device.state} ${device.addresses.join(", ")}`, device.interface));
+    if (!el.radioHostname.value && result.hostname) el.radioHostname.value = result.hostname.split(".")[0]+".local";
+    el.networkStatus.textContent = el.ethernetInterface.options.length ? "Select the Ethernet port connected to the robot radio/switch, then Configure Ethernet. Enter the administrator password below if needed." : "No eligible managed Ethernet interface found. USB recovery interfaces are excluded.";
+  }));
+  el.configureEthernet.addEventListener("click", () => networkAction(el.configureEthernet, async () => {
+    const password = el.administratorPassword.value;
+    el.administratorPassword.value = "";
+    el.networkStatus.textContent = "Applying robot Ethernet and checking the new address. Unconfirmed changes revert automatically…";
+    const result = await window.vortexApi.networkSetup(readAppConfigFromUI(), "apply", el.ethernetInterface.value, password);
+    hydrateAppConfig(result);
+    el.networkStatus.textContent = `Robot Ethernet configured: ${result.host}:${result.port}. USB recovery remains available.`;
+  }));
 
   el.browseSetupLocal.addEventListener("click", async () => {
     const folder = await window.vortexApi.chooseFolder();

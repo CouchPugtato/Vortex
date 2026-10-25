@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf, sync::{mpsc, Arc, Mutex}, time::{Duration, Instant,
 pub fn now_ms() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
 
 #[derive(Clone)]
-struct Lease { camera: usize, client: String, expires: u128 }
+struct Lease { camera: usize, client: String, expires: u128, radio: bool }
 struct Control { lease: Option<Lease>, offered: Option<Instant> }
 struct Frame { pixels: Vec<u8>, width: usize, height: usize, captured: Instant, metadata: Value, lease: Lease }
 
@@ -61,7 +61,7 @@ impl Hub {
         let Some(lease) = control.lease.clone() else { return };
         let now = Instant::now();
         if lease.camera != camera || lease.expires <= now_ms() ||
-            control.offered.map_or(false, |last| now.saturating_duration_since(last) < Duration::from_millis(200)) { return }
+            control.offered.map_or(false, |last| now.saturating_duration_since(last) < Duration::from_millis(if lease.radio {1000} else {200})) { return }
         control.offered = Some(now);
         drop(control);
         // At most one frame waits for the worker. Preview never waits on disk/JPEG I/O.
@@ -78,19 +78,20 @@ fn read_lease(directory: &std::path::Path, release: &str, token: &str, now: u128
     if value["release_id"] != release || value["launch_token"] != token ||
         value["pid"] != std::process::id() || expires <= now || expires > now+5000 ||
         client.is_empty() || client.len() > 96 || !client.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return None }
-    Some(Lease { camera: usize::try_from(value["camera_index"].as_u64()?).ok()?, client: client.into(), expires })
+    Some(Lease { camera: usize::try_from(value["camera_index"].as_u64()?).ok()?, client: client.into(), expires, radio: value["radio"].as_bool().unwrap_or(false) })
 }
 
 fn write_frame(directory: &std::path::Path, release: &str, token: &str, sequence: u64, mut frame: Frame,
                retained: &mut std::collections::VecDeque<PathBuf>) -> anyhow::Result<()> {
     let gray = image::GrayImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
         .ok_or_else(|| anyhow::anyhow!("Invalid preview pixels"))?;
-    let scale = (640.0/frame.width as f64).min(480.0/frame.height as f64).min(1.0);
+    let (max_width, max_height) = if frame.lease.radio { (320.0, 240.0) } else { (640.0, 480.0) };
+    let scale = (max_width/frame.width as f64).min(max_height/frame.height as f64).min(1.0);
     let width = ((frame.width as f64*scale).round() as u32).max(1);
     let height = ((frame.height as f64*scale).round() as u32).max(1);
     let resized = image::imageops::resize(&gray, width, height, image::imageops::FilterType::Nearest);
     let mut jpeg = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 65).encode(resized.as_raw(), width, height, image::ColorType::L8)?;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, if frame.lease.radio {50} else {65}).encode(resized.as_raw(), width, height, image::ColorType::L8)?;
     let name = format!("frame-{}-{sequence}.jpg", std::process::id());
     let path = directory.join(&name);
     frame.metadata["schema_version"] = json!(1);
@@ -128,6 +129,24 @@ mod tests {
     use super::*;
     use image::GenericImageView;
     #[test]
+    fn radio_lease_limits_work_and_image_size() {
+        let directory = std::env::temp_dir().join(format!("vortex-radio-preview-{}-{}",std::process::id(),now_ms()));
+        fs::create_dir_all(&directory).unwrap();
+        let lease = Lease { camera: 0, client: "radio".into(), expires: now_ms()+3000, radio: true };
+        let (tx,rx) = mpsc::sync_channel(1);
+        let hub = Hub { tx, control: Arc::new(Mutex::new(Control {lease:Some(lease.clone()),offered:Some(Instant::now()-Duration::from_millis(500))})) };
+        hub.offer(0,&[1],1,1,Instant::now(),||panic!("radio throttle must skip metadata and frame copying"));
+        assert!(rx.try_recv().is_err());
+        let frame = Frame {pixels:vec![70;1280*720],width:1280,height:720,captured:Instant::now(),metadata:json!({}),lease};
+        let mut retained = std::collections::VecDeque::new();
+        write_frame(&directory,"r","t",1,frame,&mut retained).unwrap();
+        let state:Value=serde_json::from_slice(&fs::read(directory.join("preview.json")).unwrap()).unwrap();
+        let image=image::open(directory.join(state["frame_id"].as_str().unwrap())).unwrap();
+        assert_eq!(image.dimensions(),(320,180));
+        assert_eq!(state["source_width"],1280);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
     fn no_subscription_wrong_camera_expired_lease_and_throttle_do_not_copy_frames() {
         let (tx, rx) = mpsc::sync_channel(1);
         let control = Arc::new(Mutex::new(Control { lease: None, offered: None }));
@@ -135,7 +154,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let metadata = || { calls.set(calls.get()+1); json!({}) };
         hub.offer(0, &[1], 1, 1, Instant::now(), metadata);
-        control.lock().unwrap().lease = Some(Lease { camera: 2, client: "c".into(), expires: now_ms()+2000 });
+        control.lock().unwrap().lease = Some(Lease { camera: 2, client: "c".into(), expires: now_ms()+2000, radio: false });
         hub.offer(0, &[1], 1, 1, Instant::now(), metadata);
         hub.offer(2, &[1], 1, 1, Instant::now(), metadata);
         hub.offer(2, &[1], 1, 1, Instant::now(), metadata);
@@ -154,7 +173,7 @@ mod tests {
         for sequence in 1..=5 {
             let frame = Frame { pixels: vec![70; 1280*720], width: 1280, height: 720, captured: Instant::now(),
                 metadata: json!({"apriltags": [{"id": sequence}], "objects": []}),
-                lease: Lease { camera: 2, client: "client".into(), expires: now_ms()+3000 } };
+                lease: Lease { camera: 2, client: "client".into(), expires: now_ms()+3000, radio: false } };
             write_frame(&directory, "release", "token", sequence, frame, &mut retained).unwrap();
         }
         let state: Value = serde_json::from_slice(&fs::read(directory.join("preview.json")).unwrap()).unwrap();
@@ -187,7 +206,7 @@ mod tests {
         let mut retained = std::collections::VecDeque::new();
         for sequence in 1..=4 {
             let frame = Frame { pixels: vec![1; 16], width: 4, height: 4, captured: Instant::now(), metadata: json!({}),
-                lease: Lease { camera: 0, client: "c".into(), expires: now_ms()+2000 } };
+                lease: Lease { camera: 0, client: "c".into(), expires: now_ms()+2000, radio: false } };
             assert!(write_frame(&directory, "r", "t", sequence, frame, &mut retained).is_err());
         }
         assert!(retained.is_empty());

@@ -41,6 +41,7 @@ async function evaluate(url, expression) {
 async function main() {
   assert.equal(process.platform, "win32", "Installer smoke test requires Windows");
   const probeOnly = process.argv.includes("--probe-only");
+  const launch = !probeOnly || process.argv.includes("--launch");
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-installer-"));
   const installed = probeOnly ? path.resolve(process.argv[process.argv.indexOf("--probe-only") + 1]) : path.join(work, "app");
   const dist = path.resolve(__dirname, "../dist");
@@ -69,7 +70,7 @@ async function main() {
             if (result.status !== 0 || !['offline-create','validate-device','cleanup'].every(x => result.stdout.includes(x))) throw new Error('Installed controller failed');
           }
         }
-        for (const name of ['maintenance','initialize-deploy','staging-deploy','service-diagnostics']) require(path.join(root, name+'.js'));
+        for (const name of ['maintenance','initialize-deploy','staging-deploy','service-diagnostics','robot-network','network-setup','radio-transfer']) require(path.join(root, name+'.js'));
         const fs = require('fs');
         for (const name of ['renderer/index.html','renderer/app.js','renderer/styles.css','preload.js']) if (!fs.existsSync(path.join(root,name))) throw new Error('Missing '+name);
         console.log('INSTALLED_PROBE_PASS');
@@ -77,11 +78,11 @@ async function main() {
     `;
     const output = run(executable, ["-e", probe], { env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" } });
     assert.ok(output.includes("INSTALLED_PROBE_PASS"), "Installed application probe did not finish");
-    if (!probeOnly) {
+    if (launch) {
       const env = { ...process.env };
       delete env.ELECTRON_RUN_AS_NODE;
       const port = await debugPort();
-      gui = spawn(executable, [`--user-data-dir=${path.join(work, "profile")}`, "--disable-gpu", `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"], { windowsHide: true, env, stdio: ["ignore", "pipe", "pipe"] });
+      gui = spawn(executable, [`--user-data-dir=${path.join(work, "profile")}`, "--deployment-smoke-test", "--disable-gpu", `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"], { windowsHide: true, env, stdio: ["ignore", "pipe", "pipe"] });
       let errors = "";
       gui.stdout.resume();
       gui.stderr.on("data", chunk => { errors += chunk; });
@@ -94,12 +95,18 @@ async function main() {
       const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       const page = targets.find(target => target.type === "page" && /renderer\/index\.html$/.test(target.url));
       assert.ok(page, "Installed renderer page did not load");
-      const ui = await evaluate(page.webSocketDebuggerUrl, "({title:document.title,setup:!!document.querySelector('#jetsonSetup'),api:typeof window.vortexApi?.bootstrap,ready:document.readyState,styled:document.styleSheets.length>0})");
-      assert.deepEqual(ui, { title: "Vortex Deployment Interface", setup: true, api: "function", ready: "complete", styled: true });
+      const ui = await evaluate(page.webSocketDebuggerUrl, "({title:document.title,setup:!!document.querySelector('#jetsonSetup'),api:typeof window.vortexApi?.networkSetup,ready:document.readyState,styled:document.styleSheets.length>0,connection:document.querySelector('#connectionMode')?.value})");
+      assert.deepEqual(ui, { title: "Vortex Deployment Interface", setup: true, api: "function", ready: "complete", styled: true, connection: "radio" });
+      await evaluate(page.webSocketDebuggerUrl, "document.querySelector('#connectionMode').value='usb';document.querySelector('#connectionMode').dispatchEvent(new Event('change'));true");
+      await delay(300);
+      assert.deepEqual(await evaluate(page.webSocketDebuggerUrl, "({host:document.querySelector('#jetsonHost').value,port:document.querySelector('#jetsonPort').value})"), {host:"192.168.55.1",port:"22"});
+      await evaluate(page.webSocketDebuggerUrl, "document.querySelector('#connectionMode').value='radio';document.querySelector('#connectionMode').dispatchEvent(new Event('change'));true");
+      await delay(300);
+      assert.deepEqual(await evaluate(page.webSocketDebuggerUrl, "({host:document.querySelector('#jetsonHost').value,port:document.querySelector('#jetsonPort').value})"), {host:"10.5.9.12",port:"5808"});
       run("taskkill", ["/PID", String(gui.pid), "/T", "/F"]);
       gui = null;
     }
-    const result = { passed: true, installed: !probeOnly, controllersVerified: 3, guiStartup: !probeOnly };
+    const result = { passed: true, installed: !probeOnly, controllersVerified: 3, guiStartup: launch };
     if (!probeOnly) {
       const uninstaller = fs.readdirSync(installed).find(n => /^Uninstall.*\.exe$/i.test(n));
       assert.ok(uninstaller, "Uninstaller is missing");

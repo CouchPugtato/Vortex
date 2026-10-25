@@ -4,6 +4,7 @@ pub mod common;
 pub mod initialize;
 pub mod jobs;
 pub mod launcher;
+pub mod network;
 pub mod offline;
 pub mod package;
 pub mod retention;

@@ -48,6 +48,27 @@ test("attachment, camera switching and detach never control production or open c
   assert.deepEqual(h.monitor, [true, false, true, false, true, false]);
 });
 
+test("radio subscriptions request reduced previews and poll at one second",async()=>{
+  const h=harness();const waits=[];
+  h.deps.delay=ms=>{waits.push(ms);return new Promise(()=>{});};
+  await h.client.start({...settings,connection_mode:"radio"},target);
+  assert.match(h.commands[0],/--radio-preview/);
+  assert.equal(waits[0],1000);
+  await h.client.stop();
+});
+
+test("older installed controllers keep diagnostics working at the lower poll rate",async()=>{
+  const h=harness();const exec=h.deps.execChecked;
+  h.deps.execChecked=async(conn,command)=>{
+    if(command.includes("--radio-preview"))throw new Error("unexpected argument '--radio-preview' found");
+    return exec(conn,command);
+  };
+  await h.client.start({...settings,connection_mode:"radio"},target);
+  assert.equal(h.frames.length,1);
+  assert.ok(h.logs.some(line=>line.includes("predates radio previews")));
+  await h.client.stop();
+});
+
 test("repeated polls do not reload the same frame", async () => {
   const h = harness([{}, {}, { state: { frame_id: "frame-44-8.jpg" } }]);
   await h.client.start(settings, target);

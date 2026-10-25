@@ -19,7 +19,7 @@ async function offlineMetadata(filename) {
 
 // Send the sudo password through SSH stdin, never argv, the shell or a file.
 // No PTY means terminal echo cannot put it in stdout/logs.
-function execAdministrator(conn, command, password = "") {
+function execAdministrator(conn, command, password = "", purpose = "initialize") {
   if (typeof password !== "string" || /[\r\n\0]/.test(password)) return Promise.reject(new Error("Invalid administrator password"));
   return new Promise((resolve, reject) => {
     const prefix = password ? "sudo -S -k -p '' -- " : "sudo -n -- ";
@@ -37,8 +37,8 @@ function execAdministrator(conn, command, password = "") {
         if (code !== 0) {
           const authentication = /incorrect password|try again|password is required|sudoers|not allowed/i.test(stderr);
           const failure = new Error(authentication ?
-            "Administrator authentication failed. Check the sudo password and account permissions, then retry Initialize Jetson." :
-            "Administrator setup could not start. Refresh Releases to check its saved job, then retry Initialize Jetson.");
+            (purpose === "network" ? "Administrator authentication failed. Check the sudo password and account permissions, then retry Configure Ethernet." : "Administrator authentication failed. Check the sudo password and account permissions, then retry Initialize Jetson.") :
+            (purpose === "network" ? "Ethernet setup could not complete. Check the selected interface and unused SSH port. USB recovery remains available; unconfirmed changes revert automatically." : "Administrator setup could not start. Refresh Releases to check its saved job, then retry Initialize Jetson."));
           failure.notSubmitted = authentication;
           return reject(failure);
         }

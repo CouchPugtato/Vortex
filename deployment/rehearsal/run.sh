@@ -23,6 +23,8 @@ cargo +1.96.0 build --manifest-path "$repo/deployment/Cargo.toml" --target-dir "
 cargo +1.96.0 test --manifest-path "$repo/deployment/Cargo.toml" --target-dir "$target" --locked --release --test systemd --no-run --message-format=json > "$run/build.json"
 testbin=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "systemd") | .executable // empty' "$run/build.json")
 test -x "$testbin"
+cargo +1.96.0 test --manifest-path "$repo/deployment/Cargo.toml" --target-dir "$target" --locked --release --test network --no-run --message-format=json > "$run/network-build.json"
+networktest=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "network") | .executable // empty' "$run/network-build.json")
 bundle=${VORTEX_VM_BUNDLE:-}
 if [[ -z "$bundle" ]]; then
   # APT download does not install host packages. Offline export uses the current lockfile.
@@ -32,6 +34,7 @@ if [[ -z "$bundle" ]]; then
 fi
 mkdir "$run/payload"
 cp "$testbin" "$run/payload/systemd-test"
+cp "$networktest" "$run/payload/network-test"
 cp "$target/release/vortexctl" "$run/payload/vortexctl"
 cp "$target/release/examples/service_fixture" "$run/payload/service_fixture"
 cp "$bundle" "$run/payload/offline.tar.gz"
@@ -52,7 +55,20 @@ write_files:
     content: disposable
 EOF
 printf 'instance-id: vortex-%s\nlocal-hostname: vortex-rehearsal\n' "$(basename "$run")" > "$run/meta-data"
-cloud-localds "$run/seed.img" "$run/user-data" "$run/meta-data"
+cat > "$run/network-config" <<EOF
+version: 2
+ethernets:
+  management:
+    match: {macaddress: '52:54:00:65:43:21'}
+    set-name: eth0
+    dhcp4: true
+  radio:
+    match: {macaddress: '52:54:00:12:34:56'}
+    set-name: eth1
+    dhcp4: false
+    optional: true
+EOF
+cloud-localds --network-config="$run/network-config" "$run/seed.img" "$run/user-data" "$run/meta-data"
 qemu-img create -q -f qcow2 -F qcow2 -b "$cache/$image" "$run/disk.qcow2" 24G
 port=${VORTEX_VM_PORT:-22229}
 accel=tcg
@@ -60,7 +76,10 @@ accel=tcg
 echo "Starting fresh Ubuntu 24.04 guest ($accel); outbound networking blocked by QEMU"
 qemu-system-x86_64 -accel "$accel" -m 6144 -smp 4 -display none -serial "file:$run/serial.log" \
   -drive "file=$run/disk.qcow2,if=virtio" -drive "file=$run/seed.img,format=raw,if=virtio" \
-  -nic "user,restrict=on,hostfwd=tcp:127.0.0.1:$port-:22" > "$run/qemu.log" 2>&1 &
+  -netdev "user,id=management,restrict=on,hostfwd=tcp:127.0.0.1:$port-:22" \
+  -device virtio-net-pci,netdev=management,mac=52:54:00:65:43:21 \
+  -netdev user,id=radio,restrict=on,net=10.5.9.0/24,host=10.5.9.1,dhcpstart=10.5.9.200 \
+  -device virtio-net-pci,netdev=radio,mac=52:54:00:12:34:56 > "$run/qemu.log" 2>&1 &
 vm_pid=$!
 trap 'kill "$vm_pid" 2>/dev/null || true; wait "$vm_pid" 2>/dev/null || true' EXIT
 opts=(-i "$run/key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$run/known_hosts" -o ConnectTimeout=3)
@@ -84,9 +103,10 @@ trap cleanup EXIT
 ready
 remote 'sudo cloud-init status --wait'
 scp "${opts[@]}" -P "$port" "$run/payload/"* rehearsal@127.0.0.1:.
-remote 'mkdir repository; tar -xf repository.tar -C repository; chmod +x systemd-test vortexctl service_fixture'
+remote 'mkdir repository; tar -xf repository.tar -C repository; chmod +x systemd-test network-test vortexctl service_fixture'
 environment='sudo env VORTEX_TEST_REPOSITORY=/home/rehearsal/repository VORTEX_TEST_CONTROLLER=/home/rehearsal/vortexctl VORTEX_SERVICE_FIXTURE=/home/rehearsal/service_fixture'
 remote "$environment VORTEX_OFFLINE_BUNDLE=/home/rehearsal/offline.tar.gz ./systemd-test --ignored --exact actual_offline_initialization --nocapture"
+remote "$environment ./network-test --ignored --exact real_network_confirmation_and_rollback --nocapture"
 remote "$environment VORTEX_OFFLINE_BUNDLE=/home/rehearsal/offline.tar.gz ./systemd-test --ignored --exact actual_service_lifecycle --nocapture"
 remote "$environment VORTEX_REBOOT_PHASE=prepare ./systemd-test --ignored --exact actual_reboot_recovery --nocapture"
 reboot_guest() {
@@ -100,11 +120,12 @@ reboot_guest() {
   return 1
 }
 reboot_guest
+remote "$environment ./network-test --ignored --exact real_network_survives_reboot --nocapture"
 remote "$environment VORTEX_REBOOT_PHASE=interrupt ./systemd-test --ignored --exact actual_reboot_recovery --nocapture"
 reboot_guest
 remote "$environment VORTEX_REBOOT_PHASE=recover ./systemd-test --ignored --exact actual_reboot_recovery --nocapture"
 # Expand the account lookup inside the guest, not on the host.
 # shellcheck disable=SC2016
 remote 'test -z "$(getent passwd | cut -d: -f1 | grep ^vortex-test- || true)"'
-printf '{"passed":true,"guest":"Ubuntu 24.04 x64","network":"outbound blocked","actual_initialization":true,"real_cpu_build_and_smoke":true,"actual_package_install":true,"actual_reboots":2,"service_runtime":"fixture"}\n' > "$run/result.json"
+printf '{"passed":true,"guest":"Ubuntu 24.04 x64","network":"outbound blocked","actual_initialization":true,"real_cpu_build_and_smoke":true,"actual_package_install":true,"network_confirmation_and_rollback":true,"network_reboot":true,"actual_reboots":2,"service_runtime":"fixture"}\n' > "$run/result.json"
 echo "PASS: actual offline initialization and CPU build/smoke, lifecycle, rollback, watchdog, two real reboots. Report: $run/result.json"

@@ -181,6 +181,16 @@ pub fn diagnostics(
     stop: bool,
     m: &dyn activation::Manager,
 ) -> Result<Value> {
+    diagnostics_options(root, camera, client, stop, m, false)
+}
+pub fn diagnostics_options(
+    root: &Path,
+    camera: u64,
+    client: &str,
+    stop: bool,
+    m: &dyn activation::Manager,
+    radio: bool,
+) -> Result<Value> {
     ensure!(
         camera <= 63
             && !client.is_empty()
@@ -249,7 +259,7 @@ pub fn diagnostics(
     }
     atomic(
         &request,
-        &json!({"schema_version":1,"release_id":sel["release_id"],"launch_token":sel["launch_token"],"pid":info["pid"],"camera_index":camera,"client_id":client,"expires_ms":now+3000}),
+        &json!({"schema_version":1,"release_id":sel["release_id"],"launch_token":sel["launch_token"],"pid":info["pid"],"camera_index":camera,"client_id":client,"expires_ms":now+3000,"radio":radio}),
     )?;
     let mut state = optional(dir.join("preview.json"), json!({}))?;
     if state["schema_version"] != 1

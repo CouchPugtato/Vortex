@@ -30,6 +30,9 @@ The rehearsal verifies:
   recovery across another real reboot. Both phases require a changed boot ID and
   fresh process health.
 - Removal of the dedicated test accounts and services.
+- Real NetworkManager address confirmation and automatic rollback on a separate
+  Ethernet NIC, while retaining management access and both SSH listeners. A real
+  reboot also verifies the confirmed address and robot SSH listener return.
 
 Reports, serial output, guest build/job logs and VM disks remain in
 `~/.cache/vortex-vm/run-*`. `result.json` appears only after success. Failed runs

@@ -59,6 +59,9 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
       if (name === "./initialize-deploy") return { initializeJetson: async (...args) => { initializeCalls.push(args); return initialize(...args); } };
       if (name === "./launch-config") return require("../launch-config");
       if (name === "./maintenance") return require("../maintenance");
+      if (name === "./robot-network") return require("../robot-network");
+      if (name === "./network-setup") return require("../network-setup");
+      if (name === "./radio-transfer") return require("../radio-transfer");
       if (name === "./activation-deploy") return {
         operateRelease: async (...args) => { activationCalls.push(args); return operation(...args); },
         releaseStatus: async () => overview
@@ -274,4 +277,19 @@ test("saved initialization reattaches through the app without requiring a sudo p
   finish({ state: "ready", release_id: "new" });
   for (let i = 0; i < 30 && !fs.existsSync(h.APP_CONFIG_PATH); i++) await new Promise((resolve) => setTimeout(resolve, 5));
   await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test("fresh app bootstrap defaults to robot Ethernet and pending USB jobs keep their endpoint", async t => {
+  const h=harness(t);
+  fs.writeFileSync(h.APP_CONFIG_PATH,"{}");
+  let boot=await h.handlers.get("bootstrap")();
+  assert.equal(boot.appConfig.connection_mode,"radio");
+  assert.equal(boot.appConfig.host,"10.5.9.12");
+  assert.equal(boot.appConfig.port,"5808");
+  fs.writeFileSync(h.APP_CONFIG_PATH,JSON.stringify({host:"192.168.55.1",port:"22",user:"vortex"}));
+  fs.writeFileSync(h.JOB_PATH,"{}");
+  boot=await h.handlers.get("bootstrap")();
+  assert.equal(boot.appConfig.connection_mode,"custom");
+  assert.equal(boot.appConfig.host,"192.168.55.1");
+  assert.equal(boot.appConfig.port,"22");
 });

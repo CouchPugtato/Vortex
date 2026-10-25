@@ -10,6 +10,9 @@ const { operateRelease, releaseStatus } = require("./activation-deploy");
 const { initializeJetson } = require("./initialize-deploy");
 const { ServiceDiagnostics } = require("./service-diagnostics");
 const { maintain } = require("./maintenance");
+const robotNetwork = require("./robot-network");
+const networkSetup = require("./network-setup");
+const radioTransfer = require("./radio-transfer");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const JOB_PATH = path.join(app.getPath("userData"), "pending_deployment_job.json");
@@ -38,6 +41,7 @@ const serviceDiagnostics = new ServiceDiagnostics({
 
 function createWindow() {
   const win = new BrowserWindow({
+    show: !process.argv.includes("--deployment-smoke-test"),
     width: 1440,
     height: 920,
     minWidth: 1200,
@@ -127,8 +131,13 @@ function emitMainBuildProgress(progress) {
 
 function defaultAppConfig() {
   return {
-    host: "192.168.55.1",
-    port: DEFAULT_SSH.port,
+    connection_mode: "radio",
+    radio_team: "509",
+    radio_device: "12",
+    radio_hostname: "",
+    radio_bandwidth_mode: true,
+    host: "10.5.9.12",
+    port: "5808",
     user: DEFAULT_SSH.user,
     pass: "",
     remote_path: "/home/vortex/deployments",
@@ -157,6 +166,7 @@ function defaultAppConfig() {
 
 const sessionPasswords = new Map();
 function withSshConfig(cfg = {}) {
+  cfg = robotNetwork.connectionSettings(cfg);
   const user = cfg.user || DEFAULT_SSH.user;
   const port = String(cfg.port || DEFAULT_SSH.port);
   const host = String(cfg.host || "192.168.55.1").trim();
@@ -606,20 +616,8 @@ async function setJetsonPowerLimit(settings, requestedWatts) {
 }
 
 function connectSsh(settings) {
-  return new Promise((resolve, reject) => {
-    const conn = new Client();
-    const cfg = withSshConfig(settings);
-    conn
-      .on("ready", () => resolve(conn))
-      .on("error", (err) => reject(err))
-      .connect({
-        host: cfg.host,
-        port: Number(cfg.port || 22),
-        username: cfg.user,
-        password: cfg.pass,
-        readyTimeout: 8000
-      });
-  });
+  const cfg = withSshConfig(settings);
+  return robotNetwork.connect(cfg, Client, cfg.pass);
 }
 
 function execCommand(conn, command, { stream = false } = {}) {
@@ -678,6 +676,9 @@ function sftpFastPut(sftp, localPath, remotePath, options = {}) {
     });
   });
 }
+function uploadFor(settings) {
+  return radioTransfer.radioLimited(settings) ? radioTransfer.upload : sftpFastPut;
+}
 
 function sftpWriteFile(sftp, remotePath, bytes) {
   return new Promise((resolve, reject) => {
@@ -695,7 +696,7 @@ async function deployProject(settings) {
     connect: connectSsh,
     execChecked,
     getSftp,
-    upload: sftpFastPut,
+    upload: uploadFor(settings),
     log: emitLog,
     progress: (event) => emitDeployProgress({ ...event, current: event.percent, total: 100 })
   });
@@ -726,7 +727,8 @@ async function syncTagMapRemote(conn, settings) {
 }
 
 ipcMain.handle("bootstrap", async () => {
-  const appCfg = withSshConfig({ ...defaultAppConfig(), ...(await readPersistedAppConfig()) });
+  const saved = await readPersistedAppConfig();
+  const appCfg = withSshConfig({ ...defaultAppConfig(), ...robotNetwork.migrateConnection(saved, fsSync.existsSync(JOB_PATH)) });
   appCfg.pass = "";
   delete appCfg.admin_password;
   delete appCfg.preview_camera_index;
@@ -804,7 +806,7 @@ ipcMain.handle("upload-onnx-build-engine", async (_evt, settings, localOnnxPath)
     const localSize = Number(fsSync.statSync(localPath)?.size || 0);
     let lastPercent = -1;
     emitOnnxUploadProgress({ status: "uploading", percent: 10, text: "Uploading 0%" });
-    await sftpFastPut(sftp, localPath, remoteOnnx, {
+    await uploadFor(settings)(sftp, localPath, remoteOnnx, {
       step: (transferred, _chunk, total) => {
         const denom = Number(total) || localSize || 1;
         const frac = Math.max(0, Math.min(1, Number(transferred || 0) / denom));
@@ -1014,6 +1016,31 @@ ipcMain.handle("deployment-maintenance", async (_evt, settings, action) => {
   finally { stagingInFlight = false; }
 });
 
+ipcMain.handle("network-resolve", (_evt, settings) => robotNetwork.connectionSettings(settings));
+ipcMain.handle("network-discover", async (_evt, settings) => robotNetwork.discover(withSshConfig(settings)));
+ipcMain.handle("network-check", async (_evt, settings) => {
+  const conn = await connectSsh(settings);
+  try {
+    const identity = (await execChecked(conn, "uname -s; hostname")).stdout.trim();
+    return { endpoint: conn.vortexEndpoint, identity, host_key: conn.vortexHostKey, host_key_algorithm: conn.vortexHostAlgorithm };
+  } finally { conn.end(); }
+});
+ipcMain.handle("network-setup", async (_evt, settings, action, iface, password) => {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount || serviceDiagnostics.running) {
+    throw new Error("Finish the current operation and detach diagnostics before Ethernet setup");
+  }
+  if (!["inspect", "apply"].includes(action)) throw new Error("Unknown network operation");
+  const cfg = withSshConfig(settings);
+  stagingInFlight = true;
+  try {
+    const deps = { appDir: __dirname, connect: connectSsh, execChecked, getSftp, upload: uploadFor(cfg), log: emitLog };
+    if (action === "inspect") return await networkSetup.inspect(cfg, deps);
+    const result = await networkSetup.configure(cfg, iface, password, deps);
+    await writeJson(APP_CONFIG_PATH, { ...result, pass: "" });
+    return result;
+  } finally { stagingInFlight = false; }
+});
+
 ipcMain.handle("jetson-initialize", async (_evt, settings, administratorPassword) => {
   if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount) {
     return { ok: false, error: "Finish/reconnect the current operation and stop diagnostics before initializing" };
@@ -1025,7 +1052,7 @@ ipcMain.handle("jetson-initialize", async (_evt, settings, administratorPassword
   } catch (error) { return { ok: false, error: error.message }; }
   stagingInFlight = true;
   initializeJetson(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), administratorPassword, {
-    ...activationDependencies(settings), appDir: __dirname, getSftp, upload: sftpFastPut
+    ...activationDependencies(settings), appDir: __dirname, getSftp, upload: uploadFor(settings)
   }).then(async (result) => {
     const config = await readPersistedAppConfig();
     await writeJson(APP_CONFIG_PATH, { ...config, last_ready_release: result.release_id });
