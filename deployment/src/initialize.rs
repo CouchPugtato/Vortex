@@ -13,6 +13,7 @@ pub const PACKAGES: &[&str] = &[
     "build-essential",
     "pkg-config",
     "cmake",
+    "nasm",
     "clang",
     "libclang-dev",
     "libssl-dev",
@@ -221,6 +222,15 @@ pub fn initialize(o: &Options) -> Result<Value> {
         let work: PathBuf;
         {
             let _lock = Lock::acquire(&lock)?;
+            // The privileged submitter creates jobs before the runtime account
+            // stages a release. Shared directories must remain writable by that
+            // account, including on a completely new installation.
+            service::chown(o.root, &a)?;
+            for name in ["jobs", "staging", "releases", "build-cache"] {
+                let directory = child(o.root, name)?;
+                fs::create_dir_all(&directory)?;
+                service::chown(&directory, &a)?;
+            }
             update("verifying", json!({}))?;
             regular(&archive)?;
             ensure!(

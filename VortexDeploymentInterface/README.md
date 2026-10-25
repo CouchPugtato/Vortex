@@ -78,3 +78,9 @@ Tag pushes matching `v*` build the installer and portable executable with SHA256
 checksums and upload a draft GitHub release. Manual workflow dispatch produces
 artifacts without publishing. Installers currently ship unsigned. Native files
 and installers are generated artifacts rather than checked-in binaries.
+
+Installer CI silently installs the NSIS executable, verifies all bundled
+controllers and renderer files, checks the running page and preload API, then
+uninstalls it. The artifact includes `installer-smoke.json`. For an existing
+unpacked app, run `node scripts/smoke-installed.js --probe-only dist/win-unpacked`
+to check packaged resources without installing or launching the UI.

@@ -41,6 +41,7 @@ Cargo caches and the vision build. The worker checks extraction size plus a 6 Gi
 reserve; unusually large build profiles can need more. The normal release remains
 unselected until **Activate**. Ordinary staging reuses the restored caches offline.
 
-Recreate the bundle after changing the dependency lock, Rust version, profile or
-target Ubuntu/architecture. Real clean-image/JetPack initialization remains part of
-the [hardware acceptance run](deployment-validation.md).
+Recreate the bundle after changing deployment prerequisites, the dependency lock, Rust version, profile or
+target Ubuntu/architecture. The [clean Ubuntu VM rehearsal](../deployment/rehearsal/README.md)
+exercises actual x64 CPU initialization with guest networking blocked. JetPack and
+ARM64 initialization remain part of the [hardware acceptance run](deployment-validation.md).

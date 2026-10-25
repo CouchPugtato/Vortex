@@ -41,7 +41,7 @@
       "native-controller.js",
       "maintenance.js",
       "preload.js",
-      "renderer/**/*",
+      "renderer",
       "package.json"
     ],
     "extraResources": [{ "from": "native", "to": "native", "filter": ["**/*"] }],

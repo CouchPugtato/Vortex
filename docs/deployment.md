@@ -380,8 +380,9 @@ the Windows installer and portable app with checksums and upload a **draft** Git
 release. Workflow dispatch builds downloadable artifacts without publishing a release.
 Release signing is not configured; the generated executables are unsigned.
 
-Linux service installation, sudoers validation, real camera timing, GPU/TensorRT,
-and boot recovery still require Jetson testing. Local transaction tests inject
-service failures and power interruption; Windows cannot exercise the real Linux
-systemd/symlink operations. The Rust smoke/health modules are compiled and tested
-through the native CPU replay harness.
+The [clean Ubuntu VM rehearsal](../deployment/rehearsal/README.md) tests actual
+offline CPU initialization, service installation, sudoers, rollback, watchdog and
+recovery across real guest reboots. Installer CI checks installation, the rendered
+page and preload API, bundled controllers, and uninstallation. Jetson camera timing,
+GPU/TensorRT, ARM64 initialization and physical power-loss behavior still need
+hardware validation.

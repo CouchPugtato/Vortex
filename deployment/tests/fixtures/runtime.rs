@@ -57,7 +57,7 @@ fn main() {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
-            let report = json!({"schema_version":1,"pid":std::process::id(),"release_id":env::var("VORTEX_RELEASE_ID").unwrap(),"launch_token":env::var("VORTEX_LAUNCH_TOKEN").unwrap(),"uptime_ms":started.elapsed().as_millis(),"timestamp_ms":now,"diagnostics_version":1,"watchdog":"healthy","cameras":[{"index":0,"frames":frames,"last_frame_age_ms":0,"pipeline_ok":true,"backends":["apriltag-cpu"],"fps":10}]});
+            let report = json!({"schema_version":1,"pid":std::process::id(),"boot_id":fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"release_id":env::var("VORTEX_RELEASE_ID").unwrap(),"launch_token":env::var("VORTEX_LAUNCH_TOKEN").unwrap(),"uptime_ms":started.elapsed().as_millis(),"timestamp_ms":now,"diagnostics_version":1,"watchdog":"healthy","cameras":[{"index":0,"frames":frames,"last_frame_age_ms":0,"pipeline_ok":true,"backends":["apriltag-cpu"],"fps":10}]});
             write(Path::new(&env::var("VORTEX_HEALTH_PATH").unwrap()), &report);
         }
         std::thread::sleep(Duration::from_millis(100));

@@ -44,12 +44,16 @@ jobs:
           npm test
           npm run dist:win -- --publish never --config.win.signAndEditExecutable=false
           node scripts/release-checksums.js
+      - name: Install, launch, verify and uninstall the application
+        working-directory: VortexDeploymentInterface
+        run: node scripts/smoke-installed.js
       - uses: actions/upload-artifact@v4
         with:
           name: vortex-windows-installers
           path: |
             VortexDeploymentInterface/dist/*.exe
             VortexDeploymentInterface/dist/SHA256SUMS
+            VortexDeploymentInterface/dist/installer-smoke.json
           if-no-files-found: error
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -64,4 +68,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" installers/* --verify-tag --draft --generate-notes --title "Vortex $RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" installers/*.exe installers/SHA256SUMS --verify-tag --draft --generate-notes --title "Vortex $RELEASE_TAG"

@@ -1,5 +1,9 @@
 # Deployment validation
 
+Without robot hardware, use the [clean Ubuntu VM rehearsal](../deployment/rehearsal/README.md).
+It performs actual offline initialization and a CPU vision build, then exercises
+the fixture service across two real guest reboots. CI retains logs and results.
+
 The opt-in Linux test uses actual systemd, loginctl, sudoers and native processes.
 It creates a unique `vortex-test-*` account and service and removes its resources
 on completion. Run it on a disposable Ubuntu VM or WSL systemd distribution as
@@ -10,7 +14,7 @@ cd deployment
 cargo build --example service_fixture --locked
 cargo test --test systemd --no-run --message-format=json > target/systemd-build.json
 TEST_BINARY=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "systemd") | .executable // empty' target/systemd-build.json)
-sudo env VORTEX_SERVICE_FIXTURE="$PWD/target/debug/examples/service_fixture" "$TEST_BINARY" --ignored --nocapture
+sudo env VORTEX_SERVICE_FIXTURE="$PWD/target/debug/examples/service_fixture" "$TEST_BINARY" --ignored --exact actual_service_lifecycle --nocapture
 ```
 
 This covers installation, restricted service control, jobs surviving the submitting

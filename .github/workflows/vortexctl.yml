@@ -37,7 +37,7 @@ jobs:
           cargo build --example service_fixture --locked
           cargo test --test systemd --no-run --message-format=json > systemd-build.json
           TEST_BINARY=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "systemd") | .executable // empty' systemd-build.json)
-          sudo env VORTEX_SERVICE_FIXTURE="$PWD/target/debug/examples/service_fixture" "$TEST_BINARY" --ignored --nocapture
+          sudo env VORTEX_SERVICE_FIXTURE="$PWD/target/debug/examples/service_fixture" "$TEST_BINARY" --ignored --exact actual_service_lifecycle --nocapture
       - name: Build all bundled controllers
         run: node VortexDeploymentInterface/scripts/build-native.js
       - name: Test desktop integration
