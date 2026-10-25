@@ -84,7 +84,7 @@ python -m unittest discover -s chassis_sim -p "test_*.py"
 
 This is a kinematic chassis with field-boundary limits, not drivetrain physics or
 collision response. The camera renders static CAD geometry and exact tag textures,
-with simple lighting and an ideal pinhole lens. It doesn't model moving opponents,
+with simple lighting and a pinhole lens, with optional sensor effects. It doesn't model moving opponents,
 lens distortion, or shadows. The chassis can pass through geometry, putting the
 camera inside an obstacle. Frames pass through production CPU detection/pose code;
 ground truth only scores the output. Vortex's GPU detector and live camera capture
@@ -132,3 +132,18 @@ disable saving. Limits and thresholds can be changed with `--capture-position-m`
 `--capture-heading-deg`, `--capture-cooldown`, `--capture-max-cases`,
 `--capture-max-mb`, and `--capture-dir`. `CapturesSaved` and `CaptureDropped` are
 published to AdvantageScope. Use the synthetic test runner for generated datasets.
+
+## Routes, camera effects, and comparisons
+
+The window now includes camera profiles, mount presets, and **Run route / Stop**.
+Space stops a route. For repeatable reports and automatic capture replay:
+
+```text
+python chassis_sim/benchmark.py --routes approach --profiles clean --mount-presets matched
+python chassis_sim/benchmark.py
+```
+
+The full matrix runs 100 combinations (7,600 frames by default). Reports go to
+`chassis_sim/generated/benchmark_TIMESTAMP/` as Markdown, JSON, and CSV.
+See [simulator testing](../docs/simulator-testing.md) for profiles, extrinsic
+experiments, custom routes, baseline comparisons, and scoring limits.

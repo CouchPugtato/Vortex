@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import fields
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -12,7 +13,32 @@ from drive import HERE, StreamReplay, robot_pose
 from failure_capture import CapturePolicy, classify, json_safe
 
 
-def replay_cases(root, executable, include_experiments=False):
+def compare_reports(current, baseline):
+    """Stable relative IDs allow comparisons across machines and checkouts."""
+    old = {c.get('case_id', c['case']): c for c in baseline['cases']}
+    changes = dict(fixed=[], regressed=[], improved=[], worsened=[], new=[], removed=[], incomparable=[])
+    seen = set()
+    for case in current['cases']:
+        key = case.get('case_id', case['case'])
+        seen.add(key)
+        before = old.get(key)
+        if before is None:
+            changes['new'].append(key)
+            continue
+        if before.get('input_signature') != case.get('input_signature'):
+            changes['incomparable'].append(key)
+            continue
+        if before['passed'] != case['passed']:
+            changes['fixed' if case['passed'] else 'regressed'].append(key)
+        for metric, epsilon in (('position_error_m', .01), ('heading_error_deg', .25)):
+            a, b = before['evaluation'].get(metric), case['evaluation'].get(metric)
+            if a is not None and b is not None and abs(a-b) > epsilon:
+                changes['improved' if b < a else 'worsened'].append(dict(case=key, metric=metric, before=a, after=b))
+    changes['removed'] = sorted(set(old)-seen)
+    return changes
+
+
+def replay_cases(root, executable, include_experiments=False, baseline=None, output_path=None):
     cases = [root/'capture.json'] if (root/'capture.json').is_file() else sorted(root.rglob('capture.json'))
     env = os.environ.copy()
     if os.name == 'nt':
@@ -49,13 +75,21 @@ def replay_cases(root, executable, include_experiments=False):
             outcome = classify(ghost, frame['chassis_pose'], report, frame['visibility'],
                                [tag['id'] for tag in manifest['tags']], policy)
             passed = not outcome['reasons']
-            results.append(dict(case=str(case), passed=passed, evaluation=outcome, result=report))
+            signature = hashlib.sha256((case/'image.png').read_bytes()+json.dumps(
+                dict(manifest=manifest, truth=frame['chassis_pose'], mount=frame['assumed_mount'],
+                     visibility=frame['visibility'], policy=capture['policy']), sort_keys=True).encode()).hexdigest()
+            results.append(dict(case=str(case), case_id=case.relative_to(root).as_posix(), input_signature=signature,
+                                passed=passed, evaluation=outcome, result=report))
             print(f"{'PASS' if passed else 'FAIL'} {case.name}: {outcome['reasons']}")
     finally:
         if stream is not None:
             stream.close()
     output = dict(total=len(results), passed=sum(result['passed'] for result in results), cases=results)
-    (root/'capture_replay_report.json').write_text(json.dumps(json_safe(output), indent=2), encoding='utf-8')
+    if baseline is not None:
+        output['changes'] = compare_reports(output, baseline)
+    destination = output_path or root/'capture_replay_report.json'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(json_safe(output), indent=2), encoding='utf-8')
     return output
 
 
@@ -66,10 +100,19 @@ def main():
         'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name == 'nt'
         else 'release/vortex-synthetic-replay'))
     parser.add_argument('--include-experiments', action='store_true')
+    parser.add_argument('--baseline', type=Path, help='Previous report to compare without overwriting it')
+    parser.add_argument('--report', type=Path, help='Output report (defaults to capture directory)')
     args = parser.parse_args()
     if not args.path.is_dir() or not args.replay_executable.is_file():
         parser.error('Capture directory and built replay executable must exist')
-    result = replay_cases(args.path.resolve(), args.replay_executable.resolve(), args.include_experiments)
+    destination = (args.report or args.path/'capture_replay_report.json').resolve()
+    if args.baseline and args.baseline.resolve() == destination:
+        parser.error('Baseline and output report must be different files')
+    baseline = json.loads(args.baseline.read_text(encoding='utf-8')) if args.baseline else None
+    result = replay_cases(args.path.resolve(), args.replay_executable.resolve(), args.include_experiments,
+                          baseline, destination)
+    if 'changes' in result:
+        print('Changes: '+', '.join(f'{key}={len(value)}' for key, value in result['changes'].items()))
     print(f"Captured cases: {result['passed']}/{result['total']} pass")
     return int(result['passed'] != result['total']) if result['total'] else 2
 

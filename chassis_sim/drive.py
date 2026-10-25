@@ -23,6 +23,8 @@ sys.path.insert(0, str(HERE.parent / "simulation_tests"))
 from generate import render_fast, tag_geometry, tag_texture
 from run import replay_command
 from ghost_prediction import GhostPredictor
+from camera_effects import CameraEffects, PROFILES, Sensor
+from dataclasses import asdict
 
 MOUNT_KEYS = ("x_offset", "y_offset", "z_offset", "roll_deg", "pitch_deg", "yaw_deg")
 
@@ -156,6 +158,13 @@ def step(chassis, forward, left, turn, dt, field):
 class Harness:
     def __init__(self, args):
         self.args = args
+        settings = asdict(PROFILES[getattr(args, 'camera_profile', 'clean')])
+        for key in settings:
+            value = getattr(args, key, None)
+            if value is not None:
+                settings[key] = value
+        self.sensor = Sensor(CameraEffects(**settings), getattr(args, 'seed', 509))
+        self.sensor_started = time.perf_counter()
         raw = json.loads(args.config.read_text())
         self.camera = dict(raw.get("camera_profiles", {}).get(str(args.camera_index), raw["camera"]))
         self.actual = {k: float(self.camera.get(k, 0)) for k in MOUNT_KEYS}
@@ -237,13 +246,15 @@ class Harness:
             source_hashes = {name: hashlib.sha256((HERE.parent/name).read_bytes()).hexdigest()
                 for name in ('src/detector.rs', 'src/pose.rs', 'src/tag_refine.rs', 'src/config.rs',
                              'simulation_tests/replay/src/main.rs', 'simulation_tests/replay/Cargo.lock',
-                             'chassis_sim/drive.py', 'chassis_sim/field_renderer.py', 'chassis_sim/failure_capture.py')}
+                             'chassis_sim/drive.py', 'chassis_sim/field_renderer.py', 'chassis_sim/failure_capture.py',
+                             'chassis_sim/camera_effects.py', 'chassis_sim/routes.py')}
             asset = None if self.field_asset is None else dict(path=str(self.field_asset),
                 model_sha256=hashlib.sha256((self.field_asset/'model.glb').read_bytes()).hexdigest(),
                 config=json.loads((self.field_asset/'config.json').read_text(encoding='utf-8')))
             context = dict(camera=self.camera, tags=self.tags, field_map=raw_field, runtime_config=raw,
                            renderer='field' if self.field_renderer else 'fast', asset=asset,
-                           code_revision=revision, source_sha256=source_hashes)
+                           code_revision=revision, source_sha256=source_hashes,
+                           camera_effects=asdict(self.sensor.settings), seed=getattr(args, 'seed', 509))
             policy = CapturePolicy(position_m=getattr(args, 'capture_position_m', .2),
                 heading_deg=getattr(args, 'capture_heading_deg', 5.),
                 cooldown_s=getattr(args, 'capture_cooldown', 5.), max_cases=getattr(args, 'capture_max_cases', 50),
@@ -258,7 +269,7 @@ class Harness:
         if self.field_renderer is not None:
             self.field_renderer.close()
 
-    def localize(self, chassis, actual, assumed):
+    def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True):
         started = time.perf_counter()
         from failure_capture import utc_now
         captured_utc = utc_now()
@@ -267,10 +278,7 @@ class Harness:
                  "camera_position": position.tolist(), "camera_rotation": rotation.tolist(),
                  "expected_ids": []}
         if self.field_renderer is not None:
-            if self.capture is not None:
-                image, visibility = self.field_renderer.render(position, rotation, with_visibility=True)
-            else:
-                image, visibility = self.field_renderer.render(position, rotation), []
+            image, visibility = self.field_renderer.render(position, rotation, with_visibility=True)
         else:
             background = ground_background(position, rotation, self.floor_camera, self.floor_width,
                                            self.floor_height, self.field, self.rays)
@@ -281,28 +289,37 @@ class Harness:
             # fully visible tags; retain all mapped IDs as allowed for cropped tags.
             visibility = [dict(id=t['id'], visible_fraction=1., clearly_visible=t['id'] in expected)
                           for t in self.tags]
+        timestamp = started-self.sensor_started if timestamp is None else timestamp
+        image, effects = self.sensor.apply(image, timestamp, motion, self.camera['fx'])
         rendered_at = time.perf_counter()
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         try:
-            report = self.replay.request(gray)
+            report = (dict(joint_pose=None, poses=[], detected_ids=[]) if effects['dropped_frame']
+                      else self.replay.request(gray))
         except Exception as error:
             if self.capture is None:
                 raise
             report = dict(joint_pose=None, poses=[], detected_ids=[], pipeline_error=str(error))
         report["render_ms"] = (rendered_at-started)*1000
         report["vortex_ms"] = (time.perf_counter()-rendered_at)*1000
+        report['sensor'] = effects
+        report['sensor_settings'] = asdict(self.sensor.settings)
+        report['visibility'] = visibility
         estimate = report["joint_pose"]
         if estimate is None and report["poses"]:
             estimate = min(report["poses"], key=lambda p: p["reprojection_rmse_px"])
         ghost = None if estimate is None else robot_pose(
             estimate["camera_position"], estimate["camera_rotation"], assumed)
-        if self.capture is not None:
+        if self.capture is not None and not effects['dropped_frame']:
             self.capture.observe(dict(gray=gray, image=image, ghost=ghost, chassis=chassis.copy(),
                 report=dict(report), actual_mount=dict(actual), assumed_mount=dict(assumed),
                 camera_position=position.tolist(), camera_rotation=rotation.tolist(), visibility=visibility,
                 monotonic_s=started, captured_utc=captured_utc))
             report['capture'] = self.capture.status()
-        return ghost, image, report, chassis.copy(), time.perf_counter() - started
+        if realtime and effects['injected_latency_ms'] > 0:
+            time.sleep(effects['injected_latency_ms']/1000)
+        return ghost, image, report, chassis.copy(), time.perf_counter() - started + (
+            0 if realtime else effects['injected_latency_ms']/1000)
 
 
 class Telemetry:
@@ -463,6 +480,26 @@ def gui(harness, telemetry):
     open_button.grid(row=12, column=0, columnspan=2)
     capture_count = tk.StringVar(value='Captures: 0')
     ttk.Label(root, textvariable=capture_count).grid(row=12, column=2, columnspan=2)
+    from routes import ROUTES, MOUNT_PRESETS, Route, mounts_for
+    controls = ttk.Frame(root)
+    controls.grid(row=13, columnspan=4, sticky='ew')
+    ttk.Label(controls, text='Camera').pack(side='left')
+    profile_var = tk.StringVar(value=harness.args.camera_profile)
+    ttk.Combobox(controls, textvariable=profile_var, values=list(PROFILES), state='readonly', width=11).pack(side='left')
+    ttk.Label(controls, text='Mount').pack(side='left')
+    mount_var = tk.StringVar(value='matched')
+    mount_box = ttk.Combobox(controls, textvariable=mount_var, values=MOUNT_PRESETS, state='readonly', width=17)
+    mount_box.pack(side='left')
+    def apply_mount_preset(event=None):
+        for col, mount in enumerate(mounts_for(mount_var.get(), harness.actual)):
+            for key in MOUNT_KEYS:
+                variables[col, key].set(str(mount[key]))
+    mount_box.bind('<<ComboboxSelected>>', apply_mount_preset)
+    route_var = tk.StringVar(value='approach')
+    ttk.Combobox(controls, textvariable=route_var, values=list(ROUTES), state='readonly', width=14).pack(side='left')
+    active_route = None
+    route_started = 0.
+    active_profile = harness.args.camera_profile
     preview.bind("<Button-1>", lambda _: preview.focus_set())
     keys = set()
     predictor = GhostPredictor()
@@ -472,7 +509,8 @@ def gui(harness, telemetry):
     preview.bind("<KeyRelease>", lambda e: keys.discard(e.keysym.lower()))
     preview.bind("<FocusOut>", lambda _: keys.clear())
     def reset():
-        nonlocal generation, result_captured_at
+        nonlocal generation, result_captured_at, active_route
+        active_route = None
         keys.clear()
         harness.chassis = harness.initial.copy()
         generation += 1
@@ -484,6 +522,19 @@ def gui(harness, telemetry):
             telemetry.entries[name].setDouble(float('nan'))
         telemetry.publish_display(None, 0.)
     ttk.Button(root, text="Reset chassis", command=reset).grid(row=8, column=0)
+    def start_route():
+        nonlocal active_route, route_started
+        reset()
+        route = Route.load(route_var.get(), ROUTES[route_var.get()])
+        active_route = route.timeline(harness.initial, harness.field)
+        route_started = time.perf_counter()
+        preview.focus_set()
+    ttk.Button(controls, text='Run route', command=start_route).pack(side='left')
+    def stop_route():
+        nonlocal active_route
+        active_route = None
+        keys.clear()
+    ttk.Button(controls, text='Stop', command=stop_route).pack(side='left')
     def save():
         mounts = read_mounts()
         if mounts:
@@ -507,7 +558,7 @@ def gui(harness, telemetry):
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame
+        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame, active_route, active_profile
         now = time.perf_counter()
         if harness.capture is not None:
             counts = harness.capture.status()
@@ -529,10 +580,17 @@ def gui(harness, telemetry):
         else:
             capture_count.set('Captures disabled')
         if "space" in keys:
+            active_route = None
             keys.clear()
         commands = ((int("w" in keys)-int("s" in keys))*2,
                     (int("a" in keys)-int("d" in keys))*2,
                     (int(bool(keys & {"q", "left"}))-int(bool(keys & {"e", "right"})))*1.5)
+        if active_route is not None:
+            elapsed = now-route_started
+            commands = active_route.command(elapsed)
+            if elapsed >= active_route.times[-1]:
+                harness.chassis = active_route.poses[-1].copy()
+                active_route = None
         # Poll camera completion more often than physics: otherwise a 17 ms
         # worker takes two 20 ms callbacks and caps sampling at 25 FPS.
         if now >= physics_at:
@@ -543,7 +601,8 @@ def gui(harness, telemetry):
             if now-dt > previous:
                 predictor.record(previous, now-dt, 0., 0., 0.)
             predictor.record(now-dt, now, *commands)
-            harness.chassis = step(harness.chassis, *commands, dt, harness.field)
+            harness.chassis = (active_route.pose(now-route_started) if active_route is not None else
+                               step(harness.chassis, *commands, dt, harness.field))
         live_mounts = read_mounts()
         telemetry.publish_actual(harness.chassis, live_mounts[0] if live_mounts else None)
         if pending is not None and pending.done():
@@ -553,13 +612,15 @@ def gui(harness, telemetry):
                     pending = None
                     root.after(1, tick)
                     return
-                telemetry.publish_result(result, display_raw=False)
-                result_captured_at = captured_at
                 ghost, image, report, _, latency = result
-                predictor.observe(ghost, captured_at)
+                if not report.get('sensor', {}).get('dropped_frame'):
+                    telemetry.publish_result(result, display_raw=False)
+                    result_captured_at = captured_at
+                    predictor.observe(ghost, captured_at)
                 preview_frame = image
                 redraw_preview()
-                status.set(f"Tags: {report['detected_ids']} | {'pose valid' if ghost is not None else 'no pose'} | "
+                state = 'frame dropped' if report.get('sensor', {}).get('dropped_frame') else 'pose valid' if ghost is not None else 'no pose'
+                status.set(f"Tags: {report['detected_ids']} | {state} | "
                            f"frame {latency*1000:.0f} ms (render {report['render_ms']:.0f}, Vortex {report['vortex_ms']:.0f})")
                 if 'capture' in report:
                     info = report['capture']
@@ -582,9 +643,12 @@ def gui(harness, telemetry):
                                   now-result_captured_at <= predictor.max_age else None,
                                   last-result_captured_at if result_captured_at is not None else 0.)
         if pending is None and now >= sample_at:
+            if profile_var.get() != active_profile:
+                active_profile = profile_var.get()
+                harness.sensor = Sensor(PROFILES[active_profile], harness.args.seed)
             mounts = live_mounts
             if mounts:
-                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts)
+                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts, motion=commands)
                 captured_at = last
                 pending_generation = generation
             sample_at = max(sample_at + 1 / harness.args.camera_hz, now)
@@ -603,7 +667,7 @@ def gui(harness, telemetry):
             timer.timeEndPeriod(1)
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=HERE.parent / "config/config.json")
     parser.add_argument("--field", type=Path, default=HERE.parent / "config/2026-rebuilt-welded.json")
@@ -633,6 +697,16 @@ def main():
     parser.add_argument("--mingw-root", type=Path, default=Path("C:/msys64/mingw64"))
     parser.add_argument("--replay-executable", type=Path)
     parser.add_argument("--headless-frames", type=int, default=0, help="Finite integration check without GUI")
+    parser.add_argument('--camera-profile', choices=PROFILES, default='clean')
+    parser.add_argument('--seed', type=int, default=509)
+    for key in asdict(CameraEffects()):
+        parser.add_argument('--'+key.replace('_', '-'), type=float,
+                            help=f'Override camera profile {key}')
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.use_config_mount:
         args.mounts = None
@@ -647,6 +721,11 @@ def main():
     args.max_error_meters = .20
     from failure_capture import CapturePolicy
     try:
+        settings = asdict(PROFILES[args.camera_profile])
+        settings.update({key: getattr(args, key) for key in settings if getattr(args, key) is not None})
+        CameraEffects(**settings)
+        if args.seed < 0:
+            raise ValueError('Seed must be nonnegative')
         CapturePolicy(position_m=args.capture_position_m, heading_deg=args.capture_heading_deg,
                       cooldown_s=args.capture_cooldown, max_cases=args.capture_max_cases,
                       max_bytes=int(args.capture_max_mb*1024*1024))

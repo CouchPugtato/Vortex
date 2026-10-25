@@ -1,0 +1,40 @@
+name: Simulator regression tests
+on:
+  push:
+    paths: ['chassis_sim/**', 'simulation_tests/**', 'src/**', 'config/**', 'rust-toolchain.toml', '.github/workflows/simulator.yml']
+  pull_request:
+    paths: ['chassis_sim/**', 'simulation_tests/**', 'src/**', 'config/**', 'rust-toolchain.toml', '.github/workflows/simulator.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  simulator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU replay and simulator dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libgl1
+          pip install -r chassis_sim/requirements.txt
+          rustup toolchain install 1.96.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: simulation_tests/replay/target
+          key: simulator-${{ runner.os }}-${{ hashFiles('simulation_tests/replay/Cargo.lock') }}
+      - name: Build current production CPU replay
+        run: cargo build --release --locked --manifest-path simulation_tests/replay/Cargo.toml
+      - name: Test simulator and replay available captures
+        run: python -m unittest discover -s chassis_sim -p 'test_*.py'
+      - name: Run deterministic driving smoke route
+        run: python chassis_sim/benchmark.py --renderer fast --routes approach --profiles clean --mount-presets matched --sample-hz 2 --no-capture --output chassis_sim/generated/ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulator-reports
+          path: chassis_sim/generated/ci/
+          if-no-files-found: warn

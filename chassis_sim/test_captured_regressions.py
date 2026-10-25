@@ -8,6 +8,8 @@ from replay_captures import replay_cases
 
 class CapturedRegressionTests(unittest.TestCase):
     def test_reviewed_small_tag_captures_pass_position_and_heading(self):
+        if not list((HERE.parent/'simulation_tests/captured_cases').rglob('capture.json')):
+            self.skipTest('Reviewed capture pixels are local ignored fixtures; none available')
         executable = HERE.parent/'simulation_tests/replay/target'/(
             'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name == 'nt'
             else 'release/vortex-synthetic-replay')
