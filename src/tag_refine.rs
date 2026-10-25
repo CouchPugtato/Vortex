@@ -33,6 +33,19 @@ impl std::fmt::Debug for TagPatch {
 
 impl TagPatch {
     pub fn new(data: &[u8], width: usize, height: usize, corners: [[f64; 2]; 4]) -> Option<Self> {
+        Self::with_pattern(data, width, height, corners, None)
+    }
+
+    pub fn with_pattern(
+        data: &[u8],
+        width: usize,
+        height: usize,
+        corners: [[f64; 2]; 4],
+        pattern: Option<&[bool]>,
+    ) -> Option<Self> {
+        if pattern.is_some_and(|bits| bits.len() != 64) {
+            return None;
+        }
         if width < 2 || height < 2 || width.checked_mul(height) != Some(data.len()) {
             return None;
         }
@@ -43,7 +56,7 @@ impl TagPatch {
             })
             .collect();
         let side = lengths.iter().sum::<f64>() / 4.0;
-        if !(12.0..=40.0).contains(&side) {
+        if !(7.0..=40.0).contains(&side) {
             return None;
         }
         let lo = [
@@ -95,7 +108,7 @@ impl TagPatch {
                 samples.push([x as usize, y as usize]);
             }
         }
-        if samples.len() < 100 {
+        if samples.len() < 32 {
             return None;
         }
         let mut rows = Vec::new();
@@ -141,7 +154,7 @@ impl TagPatch {
                     || x == 7
                     || y == 0
                     || y == 7
-                    || cells[y * 8 + x] < black + contrast * 0.5
+                    || pattern.map_or(cells[y * 8 + x] < black + contrast * 0.5, |p| p[y * 8 + x])
                 {
                     0
                 } else {
@@ -162,7 +175,11 @@ impl TagPatch {
             .map(|i| {
                 let x = i % 8;
                 let y = i / 8;
-                x == 0 || x == 7 || y == 0 || y == 7 || cells[i] < black + contrast * 0.5
+                x == 0
+                    || x == 7
+                    || y == 0
+                    || y == 7
+                    || pattern.map_or(cells[i] < black + contrast * 0.5, |p| p[i])
             })
             .collect();
         let noise = cells
@@ -443,6 +460,158 @@ impl TagPatch {
         }
         best.map(|(_, estimate)| estimate)
     }
+}
+
+/// Joint pixel alignment on a calibrated, level chassis. Unlike independent
+/// square PnP, all patches share one X/Y/yaw; only edge spread varies per tag.
+/// The inputs are decoded tag patches, mapped tag transforms and camera mount.
+pub fn refine_planar_field_pose(
+    patches: &[(&TagPatch, Pose)],
+    candidates: &[PoseEstimate],
+    camera: &CameraConfig,
+    mount: &pose::RobotMount,
+    field_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+) -> Option<PoseEstimate> {
+    if patches.is_empty() || candidates.is_empty() {
+        return None;
+    }
+    let models: Vec<_> = patches
+        .iter()
+        .map(|(patch, transform)| {
+            let rays: Vec<_> = patch
+                .samples
+                .iter()
+                .map(|p| {
+                    let (u, v) = pose::undistort_normalized_point(
+                        (
+                            (patch.origin[0] + p[0]) as f64,
+                            (patch.origin[1] + p[1]) as f64,
+                        ),
+                        camera,
+                    );
+                    Vector3::new(u, v, 1.)
+                })
+                .collect();
+            let observed: Vec<_> = patch
+                .samples
+                .iter()
+                .map(|p| {
+                    (patch.image.get_pixel(p[0] as u32, p[1] as u32)[0] as f64 - patch.black)
+                        / patch.contrast
+                })
+                .collect();
+            (*patch, transform, rays, observed)
+        })
+        .collect();
+    let residual = |params: &DVector<f64>| -> Option<DVector<f64>> {
+        if !params.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let camera_pose = mount.field_pose(params);
+        let mut values = Vec::new();
+        for (index, (patch, transform, rays, observed)) in models.iter().enumerate() {
+            let width = params[3 + index].exp();
+            if !(0.01..=1.5).contains(&width) {
+                return None;
+            }
+            let r = camera_pose.rotation * transform.rotation;
+            let t = camera_pose.rotation * transform.translation + camera_pose.translation;
+            if t.z <= 0. {
+                return None;
+            }
+            let inverse =
+                Matrix3::from_columns(&[r.column(0).into_owned(), r.column(1).into_owned(), t])
+                    .try_inverse()?;
+            for (ray, observed) in rays.iter().zip(observed) {
+                let local = inverse * ray;
+                if local.z <= 0. {
+                    return None;
+                }
+                let u = (local.x / local.z / camera.tag_size_m + 0.5) * 8.;
+                let v = (local.y / local.z / camera.tag_size_m + 0.5) * 8.;
+                values.push(soft_cell_value(&patch.bits, u, v, width) - observed);
+            }
+        }
+        Some(DVector::from_vec(values))
+    };
+    let mut best: Option<(f64, PoseEstimate)> = None;
+    for candidate in candidates.iter().take(6) {
+        let robot_rotation = candidate.pose.rotation.transpose() * mount.rotation().transpose();
+        let yaw = robot_rotation[(1, 0)].atan2(robot_rotation[(0, 0)]);
+        let position = -candidate.pose.rotation.transpose() * candidate.pose.translation
+            - Rotation3::from_axis_angle(&Vector3::z_axis(), yaw) * mount.offset();
+        let mut params = DVector::from_vec(vec![position.x, position.y, yaw]);
+        params = params.insert_rows(3, models.len(), 0.4_f64.ln());
+        let Some(mut values) = residual(&params) else {
+            continue;
+        };
+        let mut cost = values.norm_squared();
+        let mut lambda = 1e-3;
+        for _ in 0..60 {
+            let mut jacobian = DMatrix::zeros(values.len(), params.len());
+            for j in 0..params.len() {
+                let mut shifted = params.clone();
+                shifted[j] += 1e-5;
+                if let Some(next) = residual(&shifted) {
+                    jacobian.set_column(j, &((next - &values) / 1e-5));
+                }
+            }
+            let jt = jacobian.transpose();
+            let mut normal = &jt * &jacobian;
+            for j in 0..params.len() {
+                normal[(j, j)] += lambda;
+            }
+            let Some(delta) = normal.lu().solve(&(-&jt * &values)) else {
+                break;
+            };
+            if delta.norm() < 1e-8 {
+                break;
+            }
+            let shifted = &params + delta;
+            if let Some(next) = residual(&shifted) {
+                let next_cost = next.norm_squared();
+                if next_cost < cost {
+                    params = shifted;
+                    values = next;
+                    cost = next_cost;
+                    lambda = (lambda * 0.3).max(1e-8);
+                    continue;
+                }
+            }
+            lambda = (lambda * 10.).min(1e10);
+        }
+        let score = cost / values.len() as f64;
+        if score.sqrt() > 0.15 || !score.is_finite() {
+            continue;
+        }
+        let result = mount.field_pose(&params);
+        let origin = -result.rotation.transpose() * result.translation;
+        if patches
+            .iter()
+            .any(|(_, tag)| (origin - tag.translation).dot(&(-tag.rotation.column(2))) <= 0.)
+        {
+            continue;
+        }
+        let Some(rmse) =
+            pose::correspondence_reprojection_rmse(&result, field_points, image_points, camera)
+        else {
+            continue;
+        };
+        if rmse > 2. {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(old, _)| score < *old) {
+            best = Some((
+                score,
+                PoseEstimate {
+                    pose: result,
+                    reprojection_rmse_px: rmse,
+                },
+            ));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 fn residuals(

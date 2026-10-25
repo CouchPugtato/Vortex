@@ -67,6 +67,9 @@ pub struct CameraConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct ProcessingConfig {
+    /// Opt in only for a calibrated camera on a chassis kept level on the floor.
+    #[serde(default)]
+    pub planar_localization: bool,
     #[serde(default = "default_smoothing_alpha")]
     pub smoothing_alpha: f64,
     #[serde(
@@ -145,6 +148,7 @@ impl RuntimeConfig {
 impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
+            planar_localization: false,
             smoothing_alpha: 0.1,
             resolution_scale_factor: 1.0,
             black_level_offset: 7.0,

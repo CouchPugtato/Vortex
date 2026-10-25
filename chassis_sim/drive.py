@@ -223,9 +223,10 @@ class Harness:
             executable = HERE.parent / "simulation_tests/replay/target" / target / "release" / (
                 "vortex-synthetic-replay.exe" if os.name == "nt" else "vortex-synthetic-replay")
             self.command = [str(executable.resolve()), str(self.root.resolve()), "0.20"]
-        manifest = dict(schema_version=1, width=self.width, height=self.height,
-                        camera=self.camera, tags=self.tags, frames=[])
-        self.replay = StreamReplay(self.command[0], manifest, self.env, self.root)
+        self.manifest = dict(schema_version=1, width=self.width, height=self.height,
+                        camera=self.camera, tags=self.tags, frames=[],
+                        robot_mount=None if getattr(args,'free_pose',False) else dict(self.assumed))
+        self.replay = StreamReplay(self.command[0], self.manifest, self.env, self.root)
         self.field_renderer = None
         self.field_asset = None
         if getattr(args, 'renderer', 'field') == 'field':
@@ -255,6 +256,7 @@ class Harness:
                            renderer='field' if self.field_renderer else 'fast', asset=asset,
                            code_revision=revision, source_sha256=source_hashes,
                            camera_effects=asdict(self.sensor.settings), seed=getattr(args, 'seed', 509))
+            context['planar_localization'] = not getattr(args,'free_pose',False)
             policy = CapturePolicy(position_m=getattr(args, 'capture_position_m', .2),
                 heading_deg=getattr(args, 'capture_heading_deg', 5.),
                 cooldown_s=getattr(args, 'capture_cooldown', 5.), max_cases=getattr(args, 'capture_max_cases', 50),
@@ -271,6 +273,11 @@ class Harness:
 
     def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True):
         started = time.perf_counter()
+        expected_mount = None if getattr(self.args,'free_pose',False) else assumed
+        if self.manifest['robot_mount'] != expected_mount:
+            self.replay.close()
+            self.manifest['robot_mount'] = None if expected_mount is None else dict(expected_mount)
+            self.replay = StreamReplay(self.command[0], self.manifest, self.env, self.root)
         from failure_capture import utc_now
         captured_utc = utc_now()
         position, rotation = camera_pose(chassis, actual)
@@ -699,6 +706,7 @@ def build_parser():
     parser.add_argument("--headless-frames", type=int, default=0, help="Finite integration check without GUI")
     parser.add_argument('--camera-profile', choices=PROFILES, default='clean')
     parser.add_argument('--seed', type=int, default=509)
+    parser.add_argument('--free-pose', action='store_true', help='Use unconstrained 6-DoF pose instead of the level-chassis model')
     for key in asdict(CameraEffects()):
         parser.add_argument('--'+key.replace('_', '-'), type=float,
                             help=f'Override camera profile {key}')

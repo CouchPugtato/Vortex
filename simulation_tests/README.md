@@ -42,11 +42,11 @@ Edit `scenarios_extended.json` or `scenarios_stress.json` to change the sweeps. 
 
 Stress cases have explicit noise seeds. Reproduce one with `python simulation_tests/run.py --suite stress --case single_quality_0000`. Single-tag scenes render exactly one tag and reject detections of any other ID, including IDs present elsewhere in the field map. The position-error limit remains 20 cm.
 
-The position-error limit remains **0.20 m** (`--max-error-meters`). Latest results: **256/256 extended** and **1,019/1,024 stress**. All false detections are eliminated and no required tags are missed. Five isolated-tag pose errors remain at 3 m. All 11 generator checks and ten Rust regression tests pass.
+The position-error limit remains **0.20 m** (`--max-error-meters`). Latest results: **256/256 extended** and **1,020/1,024 stress**. No unexpected IDs or required-tag misses occur in these runs. Four isolated-tag pose errors remain at 3 m. All 11 generator checks and 28 Rust CPU replay tests pass.
 
-The CPU pipeline checks contrast, detects quads at full resolution, and uses a matching coarse hypothesis for small or weak isolated tags. It refines borders and aligns small tags against their pixel patterns. Reports include detection quality, candidate poses, and localization time. Image alignment is skipped for multi-tag views. Jetson performance remains unverified.
+The CPU pipeline checks contrast, detects quads at full resolution, and recovers sparse small-tag frames with a stricter interpolated pass. Border refinement uses pixel-center coordinates and avoids internal tag edges. Reports include detection quality, candidate poses, and localization time. Free-pose image alignment remains limited to isolated tags; the opt-in level-chassis model jointly aligns multi-tag pixels. Jetson performance remains unverified.
 
-Four reviewed field-camera captures are frozen in `captured_cases/`. Run `python chassis_sim/replay_captures.py simulation_tests/captured_cases` to verify their original 20 cm position and 5° heading limits. Current unreviewed captures improve from **0/20 to 14/20**; six pose errors remain.
+Four reviewed field-camera captures are frozen in `captured_cases/`. Run `python chassis_sim/replay_captures.py simulation_tests/captured_cases` to verify their original 20 cm position and 5° heading limits. The current local library improves from **14/82 to 66/82** using the calibrated level-chassis model, with no regressions among the original passing cases. Sixteen pose errors remain. Use `--free-pose` to evaluate unconstrained 6-DoF instead; see [model details and hardware opt-in](../docs/simulator-testing.md#localization-model).
 
 ## Scope
 

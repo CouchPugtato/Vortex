@@ -128,6 +128,7 @@ def run_route(harness, route, profile, preset, args, telemetry=None):
                     camera=harness.camera, tags=harness.tags, field=harness.field, renderer=args.renderer,
                     effects=asdict(harness.sensor.settings), seed=args.seed, sample_hz=args.sample_hz,
                     position_m=policy.position_m, heading_deg=policy.heading_deg)
+    settings['planar_localization'] = not args.free_pose
     # Compare inputs, not source hashes: code changes are what the baseline evaluates.
     if harness.field_asset is not None:
         settings['asset_sha256'] = hashlib.sha256((harness.field_asset/'model.glb').read_bytes()).hexdigest()
@@ -244,7 +245,7 @@ def main(argv=None):
             old = next((r for r in (baseline or {}).get('capture_replays', [])
                         if r.get('root_id', r['root']) == root_id), None)
             result = replay_cases(root, Path(harness.command[0]), baseline=old,
-                                  output_path=output/f'capture-replay-{len(seen)}.json')
+                                  output_path=output/f'capture-replay-{len(seen)}.json', planar=not args.free_pose)
             report['capture_replays'].append(dict(result, root=str(root), root_id=root_id))
     write_reports(output, report)
     print(f'Reports: {output}/report.md and report.json; frames.csv', flush=True)

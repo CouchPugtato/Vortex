@@ -167,6 +167,7 @@ impl GpuDetector {
                             cpu_detection: None,
                             cpu_secondary_detection: None,
                             image_patch: None,
+                            isolated: false,
                         }));
                     }
                     vpi::vpiArrayUnlock(self.output_array);

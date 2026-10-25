@@ -133,6 +133,12 @@ disable saving. Limits and thresholds can be changed with `--capture-position-m`
 `--capture-max-mb`, and `--capture-dir`. `CapturesSaved` and `CaptureDropped` are
 published to AdvantageScope. Use the synthetic test runner for generated datasets.
 
+Simulator poses use a calibrated level-chassis model. `--free-pose` selects
+unconstrained 6-DoF localization in driving, benchmarks, and capture replay. The
+level-chassis solver uses the assumed mount and observed pixels; ground truth
+only scores results. Hardware keeps the unconstrained default. See the
+[localization model](../docs/simulator-testing.md#localization-model) for limits.
+
 ## Routes, camera effects, and comparisons
 
 The window now includes camera profiles, mount presets, and **Run route / Stop**.

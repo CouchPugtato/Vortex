@@ -26,6 +26,7 @@ pub struct AprilTagDetection {
     pub(crate) cpu_detection: Option<AprilRawDetection>,
     pub(crate) cpu_secondary_detection: Option<AprilRawDetection>,
     pub(crate) image_patch: Option<crate::tag_refine::TagPatch>,
+    pub(crate) isolated: bool,
 }
 
 impl AprilTagDetection {
@@ -34,6 +35,25 @@ impl AprilTagDetection {
         camera: &CameraConfig,
         apply_distortion: bool,
         n_iters: usize,
+    ) -> Vec<PoseEstimate> {
+        self.pose_candidates(camera, apply_distortion, n_iters, self.isolated)
+    }
+
+    pub fn cpu_corner_pose_candidates(
+        &self,
+        camera: &CameraConfig,
+        apply_distortion: bool,
+        n_iters: usize,
+    ) -> Vec<PoseEstimate> {
+        self.pose_candidates(camera, apply_distortion, n_iters, false)
+    }
+
+    fn pose_candidates(
+        &self,
+        camera: &CameraConfig,
+        apply_distortion: bool,
+        n_iters: usize,
+        align_image: bool,
     ) -> Vec<PoseEstimate> {
         let Some(det) = self.cpu_detection.as_ref() else {
             return Vec::new();
@@ -93,7 +113,7 @@ impl AprilTagDetection {
         if let Some(estimate) = pose::estimate_pose(&corners, camera, apply_distortion) {
             estimates.push(estimate);
         }
-        if let Some(patch) = &self.image_patch {
+        if let Some(patch) = self.image_patch.as_ref().filter(|_| align_image) {
             if let Some(estimate) = patch.refine(&estimates, camera, &corners, apply_distortion) {
                 return vec![estimate];
             }
@@ -197,11 +217,66 @@ fn detect_corners(
         dst[row * stride..row * stride + width]
             .copy_from_slice(&gray_data[row * width..(row + 1) * width]);
     }
-    let detections: Vec<_> = detector
+    let mut detections: Vec<_> = detector
         .detect(&img)
         .into_iter()
         .filter(|det| det.decision_margin().is_finite() && det.decision_margin() >= 20.0)
         .collect();
+    // Interpolating a sparse small-tag frame improves quad extraction without
+    // pretending to add camera detail. Keep original detections and accept only
+    // independently decoded, higher-contrast additions at the original scale.
+    if detections.len() < 4
+        && detections.iter().all(|det| {
+            let c = det.corners();
+            (0..4)
+                .map(|i| (c[i][0] - c[(i + 1) % 4][0]).hypot(c[i][1] - c[(i + 1) % 4][1]))
+                .sum::<f64>()
+                / 4.
+                < 24.
+        })
+    {
+        let source =
+            image::GrayImage::from_raw(width as u32, height as u32, gray_data.to_vec()).unwrap();
+        let enlarged = image::imageops::resize(
+            &source,
+            width as u32 * 2,
+            height as u32 * 2,
+            image::imageops::FilterType::CatmullRom,
+        );
+        let mut recovery = unsafe { AprilImage::new_uinit(width * 2, height * 2)? };
+        let stride = recovery.stride();
+        let data = recovery.as_mut();
+        data.fill(0);
+        for row in 0..height * 2 {
+            data[row * stride..row * stride + width * 2]
+                .copy_from_slice(&enlarged.as_raw()[row * width * 2..(row + 1) * width * 2]);
+        }
+        for extra in detector.detect(&recovery) {
+            if !extra.decision_margin().is_finite()
+                || extra.decision_margin() < 40.
+                || extra.hamming() > 1
+                || detections.iter().any(|d| d.id() == extra.id())
+            {
+                continue;
+            }
+            let raw = extra.into_raw();
+            let restored = unsafe { AprilRawDetection::from_raw(raw.as_ptr()) };
+            unsafe {
+                let d = &mut *raw.as_ptr();
+                for p in &mut d.p {
+                    p[0] *= 0.5;
+                    p[1] *= 0.5;
+                }
+                d.c[0] *= 0.5;
+                d.c[1] *= 0.5;
+                let h = &mut *d.H;
+                for i in 0..6 {
+                    *h.data.as_mut_ptr().add(i) *= 0.5;
+                }
+            }
+            detections.push(restored);
+        }
+    }
     // Multiple tags constrain the pose geometrically; reserve image alignment
     // for isolated detections instead of repeating it for every field tag.
     let isolated = detections.len() == 1;
@@ -245,10 +320,10 @@ fn detect_corners(
         }
         let corners = det.corners();
         let initial_corners = [
-            [corners[0][0], corners[0][1]],
-            [corners[1][0], corners[1][1]],
-            [corners[2][0], corners[2][1]],
-            [corners[3][0], corners[3][1]],
+            [corners[0][0] - 0.5, corners[0][1] - 0.5],
+            [corners[1][0] - 0.5, corners[1][1] - 0.5],
+            [corners[2][0] - 0.5, corners[2][1] - 0.5],
+            [corners[3][0] - 0.5, corners[3][1] - 0.5],
         ];
         let c_arr = refine_border_corners(gray_data, width, height, initial_corners)
             .unwrap_or(initial_corners);
@@ -256,11 +331,14 @@ fn detect_corners(
         let center = det.center();
         let center_arr = [center[0], center[1]];
 
-        let image_patch = if isolated {
-            crate::tag_refine::TagPatch::new(gray_data, width, height, c_arr)
-        } else {
-            None
-        };
+        let (det, pattern) = decoded_pattern(det);
+        let image_patch = crate::tag_refine::TagPatch::with_pattern(
+            gray_data,
+            width,
+            height,
+            c_arr,
+            pattern.as_deref(),
+        );
         results.push(Detection::AprilTag(AprilTagDetection {
             id: det.id(),
             center: center_arr,
@@ -268,10 +346,45 @@ fn detect_corners(
             cpu_detection: Some(det),
             cpu_secondary_detection,
             image_patch,
+            isolated,
         }));
     }
 
     Ok(results)
+}
+
+fn decoded_pattern(det: AprilRawDetection) -> (AprilRawDetection, Option<Vec<bool>>) {
+    let raw = det.into_raw();
+    // Reestablish RAII ownership immediately; the borrowed family belongs to
+    // the still-live detector. Read its decoded code rather than resampling
+    // and potentially corrupting the template of a tiny tag.
+    let det = unsafe { AprilRawDetection::from_raw(raw.as_ptr()) };
+    let pattern = unsafe {
+        let detection = raw.as_ref();
+        detection.family.as_ref().and_then(|family| {
+            if family.width_at_border != 8
+                || family.nbits != 36
+                || det.id() >= family.ncodes as usize
+                || family.codes.is_null()
+                || family.bit_x.is_null()
+                || family.bit_y.is_null()
+            {
+                return None;
+            }
+            let code = *family.codes.add(det.id());
+            let mut bits = vec![true; 64];
+            for i in 0..family.nbits as usize {
+                let x = *family.bit_x.add(i) as usize;
+                let y = *family.bit_y.add(i) as usize;
+                if x >= 8 || y >= 8 {
+                    return None;
+                }
+                bits[y * 8 + x] = code & (1 << (family.nbits as usize - i - 1)) == 0;
+            }
+            Some(bits)
+        })
+    };
+    (det, pattern)
 }
 
 /// Fit the black/white border at subpixel precision using bilinear samples and
@@ -290,12 +403,13 @@ fn refine_border_corners(
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let length = dx.hypot(dy);
-        if length < 8.0 {
+        if length < 7.0 {
             return None;
         }
         // Native BL/BR/TR/TL winding: this normal points toward the white margin.
         let normal = [-dy / length, dx / length];
         let count = (length as usize).clamp(16, 64);
+        let radius = (length / 16.0).clamp(0.6, 2.0);
         let mut points = Vec::new();
         for i in 0..count {
             let t = 0.15 + 0.7 * (i as f64 + 0.5) / count as f64;
@@ -304,13 +418,13 @@ fn refine_border_corners(
                 data,
                 width,
                 height,
-                base[0] - 2.0 * normal[0],
-                base[1] - 2.0 * normal[1],
+                base[0] - radius * normal[0],
+                base[1] - radius * normal[1],
             )?;
             let mut weight = 0.0;
             let mut moment = 0.0;
             for step in 1..=16 {
-                let offset = -2.0 + step as f64 * 0.25;
+                let offset = -radius + step as f64 * (2.0 * radius / 16.0);
                 let value = sample_gray(
                     data,
                     width,
@@ -318,9 +432,9 @@ fn refine_border_corners(
                     base[0] + offset * normal[0],
                     base[1] + offset * normal[1],
                 )?;
-                let gradient = value - previous;
+                let gradient = (value - previous).max(0.0);
                 weight += gradient;
-                moment += gradient * (offset - 0.125);
+                moment += gradient * (offset - radius / 16.0);
                 previous = value;
             }
             if weight < 60.0 {
@@ -399,6 +513,39 @@ fn solver_corners(corners: [[f64; 2]; 4]) -> [(f64, f64); 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn border_corners_use_integer_pixel_centers() {
+        let printed = image::load_from_memory(include_bytes!(
+            "../simulation_tests/reference/tag36h11_1.png"
+        ))
+        .unwrap()
+        .to_luma8();
+        let printed =
+            image::imageops::resize(&printed, 100, 100, image::imageops::FilterType::Nearest);
+        let mut frame = image::GrayImage::from_pixel(400, 300, image::Luma([255]));
+        image::imageops::overlay(&mut frame, &printed, 120, 40);
+        let mut detector = CpuDetector::new(1).unwrap();
+        let tags = detector.detect(frame.as_raw(), 400, 300).unwrap();
+        let tag = tags
+            .iter()
+            .find_map(|d| match d {
+                Detection::AprilTag(t) if t.id == 1 => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        // The black square covers pixels 130..209 and 50..129. Its physical
+        // boundaries lie halfway between centers, regardless of native units.
+        let expected = [[129.5, 129.5], [209.5, 129.5], [209.5, 49.5], [129.5, 49.5]];
+        for (actual, expected) in tag.corners.iter().zip(expected) {
+            assert!(
+                (actual[0] - expected[0]).hypot(actual[1] - expected[1]) < 0.05,
+                "{:?} != {:?}",
+                actual,
+                expected
+            );
+        }
+    }
 
     #[test]
     fn detects_tags_in_frames_with_padded_native_rows() {

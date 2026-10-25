@@ -38,7 +38,7 @@ def compare_reports(current, baseline):
     return changes
 
 
-def replay_cases(root, executable, include_experiments=False, baseline=None, output_path=None):
+def replay_cases(root, executable, include_experiments=False, baseline=None, output_path=None, planar=True):
     cases = [root/'capture.json'] if (root/'capture.json').is_file() else sorted(root.rglob('capture.json'))
     env = os.environ.copy()
     if os.name == 'nt':
@@ -54,6 +54,10 @@ def replay_cases(root, executable, include_experiments=False, baseline=None, out
                 continue
             manifest = json.loads((case/'manifest.json').read_text(encoding='utf-8'))
             manifest['frames'] = []
+            if planar and capture.get('context', {}).get('renderer') in ('field', 'fast') and capture.get('context',{}).get('planar_localization',True):
+                manifest['robot_mount'] = capture['frame']['assumed_mount']
+            else:
+                manifest.pop('robot_mount',None)
             header = json.dumps(manifest, sort_keys=True)
             if previous_header != header:
                 if stream is not None:
@@ -102,6 +106,7 @@ def main():
     parser.add_argument('--include-experiments', action='store_true')
     parser.add_argument('--baseline', type=Path, help='Previous report to compare without overwriting it')
     parser.add_argument('--report', type=Path, help='Output report (defaults to capture directory)')
+    parser.add_argument('--free-pose', action='store_true', help='Disable the calibrated level-chassis model')
     args = parser.parse_args()
     if not args.path.is_dir() or not args.replay_executable.is_file():
         parser.error('Capture directory and built replay executable must exist')
@@ -110,7 +115,7 @@ def main():
         parser.error('Baseline and output report must be different files')
     baseline = json.loads(args.baseline.read_text(encoding='utf-8')) if args.baseline else None
     result = replay_cases(args.path.resolve(), args.replay_executable.resolve(), args.include_experiments,
-                          baseline, destination)
+                          baseline, destination, planar=not args.free_pose)
     if 'changes' in result:
         print('Changes: '+', '.join(f'{key}={len(value)}' for key, value in result['changes'].items()))
     print(f"Captured cases: {result['passed']}/{result['total']} pass")

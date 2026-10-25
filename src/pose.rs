@@ -14,6 +14,375 @@ pub struct PoseEstimate {
     pub reprojection_rmse_px: f64,
 }
 
+/// Calibrated optical-camera mount for explicitly planar chassis localization.
+/// This is configuration, never a measured/ground-truth chassis position.
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+pub struct RobotMount {
+    pub x_offset: f64,
+    pub y_offset: f64,
+    pub z_offset: f64,
+    pub roll_deg: f64,
+    pub pitch_deg: f64,
+    pub yaw_deg: f64,
+}
+
+impl From<&CameraConfig> for RobotMount {
+    fn from(camera: &CameraConfig) -> Self {
+        Self {
+            x_offset: camera.x_offset,
+            y_offset: camera.y_offset,
+            z_offset: camera.z_offset,
+            roll_deg: camera.roll_deg,
+            pitch_deg: camera.pitch_deg,
+            yaw_deg: camera.yaw_deg,
+        }
+    }
+}
+
+impl RobotMount {
+    pub(crate) fn rotation(self) -> Matrix3<f64> {
+        (Rotation3::from_axis_angle(&Vector3::y_axis(), self.yaw_deg.to_radians())
+            * Rotation3::from_axis_angle(&Vector3::x_axis(), self.pitch_deg.to_radians())
+            * Rotation3::from_axis_angle(&Vector3::z_axis(), self.roll_deg.to_radians()))
+        .into_inner()
+    }
+
+    pub(crate) fn offset(self) -> Vector3<f64> {
+        Vector3::new(self.x_offset, self.y_offset, self.z_offset)
+    }
+
+    pub(crate) fn field_pose(self, params: &DVector<f64>) -> Pose {
+        let yaw = Rotation3::from_axis_angle(&Vector3::z_axis(), params[2]).into_inner();
+        let rotation = (yaw * self.rotation()).transpose();
+        let position = Vector3::new(params[0], params[1], 0.) + yaw * self.offset();
+        Pose {
+            rotation,
+            translation: -rotation * position,
+        }
+    }
+}
+
+/// Fit only chassis X/Y/yaw on a level floor, keeping the calibrated camera
+/// height and attitude relative to the chassis fixed. No field truth is used.
+/// Callers must opt in: this model is unsuitable for ramps or an unknown mount.
+pub fn estimate_planar_pose(
+    object_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+    distortion: bool,
+    mount: &RobotMount,
+    initial_poses: &[Pose],
+) -> Option<PoseEstimate> {
+    planar_pose_candidates(
+        object_points,
+        image_points,
+        camera,
+        distortion,
+        mount,
+        initial_poses,
+    )
+    .into_iter()
+    .next()
+}
+
+pub fn planar_pose_candidates(
+    object_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+    distortion: bool,
+    mount: &RobotMount,
+    initial_poses: &[Pose],
+) -> Vec<PoseEstimate> {
+    if object_points.len() != image_points.len()
+        || object_points.len() < 4
+        || object_points.len() % 4 != 0
+        || ![
+            mount.x_offset,
+            mount.y_offset,
+            mount.z_offset,
+            mount.roll_deg,
+            mount.pitch_deg,
+            mount.yaw_deg,
+            camera.fx,
+            camera.fy,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        || camera.fx <= 0.
+        || camera.fy <= 0.
+    {
+        return Vec::new();
+    }
+    let mount_rotation = mount.rotation();
+    let mut seeds = Vec::new();
+    // Intersect observed rays with each mapped corner's known height, then
+    // align those robot-relative points to the map with a 2D rigid transform.
+    // This provides a seed even when free 6-DoF planar PnP picks its mirror.
+    let mut pairs = Vec::new();
+    for (point, pixel) in object_points.iter().zip(image_points) {
+        let (u, v) = if distortion {
+            undistort_normalized_point(*pixel, camera)
+        } else {
+            (
+                (pixel.0 - camera.cx) / camera.fx,
+                (pixel.1 - camera.cy) / camera.fy,
+            )
+        };
+        let ray = mount_rotation * Vector3::new(u, v, 1.);
+        if ray.z.abs() < 1e-5 {
+            continue;
+        }
+        let depth = (point.z - mount.z_offset) / ray.z;
+        if depth <= 0. || !depth.is_finite() {
+            continue;
+        }
+        pairs.push((mount.offset() + ray * depth, *point));
+    }
+    if pairs.len() >= 2 {
+        let a = pairs.iter().map(|p| p.0).sum::<Vector3<f64>>() / pairs.len() as f64;
+        let b = pairs.iter().map(|p| p.1).sum::<Vector3<f64>>() / pairs.len() as f64;
+        let (mut dot, mut cross) = (0., 0.);
+        for (p, q) in &pairs {
+            let (p, q) = (p - a, q - b);
+            dot += p.x * q.x + p.y * q.y;
+            cross += p.x * q.y - p.y * q.x;
+        }
+        if dot.hypot(cross) > 1e-10 {
+            let yaw = cross.atan2(dot);
+            let position = b - Rotation3::from_axis_angle(&Vector3::z_axis(), yaw) * a;
+            seeds.push(DVector::from_vec(vec![position.x, position.y, yaw]));
+        }
+    }
+    for initial in initial_poses.iter().take(8) {
+        let r = initial.rotation.transpose() * mount_rotation.transpose();
+        let yaw = r[(1, 0)].atan2(r[(0, 0)]);
+        let p = -initial.rotation.transpose() * initial.translation
+            - Rotation3::from_axis_angle(&Vector3::z_axis(), yaw) * mount.offset();
+        seeds.push(DVector::from_vec(vec![p.x, p.y, yaw]));
+    }
+    // A small tag can send every unconstrained seed to the same mirrored
+    // minimum. Cover heading globally; translation for each heading follows
+    // from the observed bearing equations, not a presumed robot location.
+    for index in 0..36 {
+        let yaw = index as f64 * std::f64::consts::TAU / 36.;
+        let rz = Rotation3::from_axis_angle(&Vector3::z_axis(), yaw).into_inner();
+        let r = (rz * mount_rotation).transpose();
+        let mut a = DMatrix::zeros(object_points.len() * 2, 2);
+        let mut b = DVector::zeros(object_points.len() * 2);
+        for (i, (point, pixel)) in object_points.iter().zip(image_points).enumerate() {
+            let (u, v) = if distortion {
+                undistort_normalized_point(*pixel, camera)
+            } else {
+                (
+                    (pixel.0 - camera.cx) / camera.fx,
+                    (pixel.1 - camera.cy) / camera.fy,
+                )
+            };
+            for (j, value) in [u, v].into_iter().enumerate() {
+                let normal = r.row(j) - r.row(2) * value;
+                a[(i * 2 + j, 0)] = normal[0];
+                a[(i * 2 + j, 1)] = normal[1];
+                b[i * 2 + j] = normal.transpose().dot(point) - normal[2] * mount.z_offset;
+            }
+        }
+        let at = a.transpose();
+        if let Some(position) = (&at * &a).lu().solve(&(&at * b)) {
+            let offset = rz * mount.offset();
+            seeds.push(DVector::from_vec(vec![
+                position[0] - offset.x,
+                position[1] - offset.y,
+                yaw,
+            ]));
+        }
+    }
+    let residual = |params: &DVector<f64>| -> Option<DVector<f64>> {
+        if !params.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let pose = mount.field_pose(params);
+        let mut values = Vec::with_capacity(object_points.len() * 2);
+        for (point, observed) in object_points.iter().zip(image_points) {
+            let projected = project_point(point, &pose, camera, distortion)?;
+            values.extend([projected.0 - observed.0, projected.1 - observed.1]);
+        }
+        Some(DVector::from_vec(values))
+    };
+    let mut estimates = Vec::<PoseEstimate>::new();
+    seeds.sort_by(|a, b| {
+        residual(a)
+            .map(|v| v.norm_squared())
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(
+                &residual(b)
+                    .map(|v| v.norm_squared())
+                    .unwrap_or(f64::INFINITY),
+            )
+    });
+    seeds.truncate(18);
+    for mut params in seeds {
+        let Some(mut values) = residual(&params) else {
+            continue;
+        };
+        let mut cost = values.norm_squared();
+        let mut lambda = 1e-3;
+        for _ in 0..60 {
+            let mut jacobian = DMatrix::zeros(values.len(), 3);
+            for j in 0..3 {
+                let mut next = params.clone();
+                next[j] += 1e-6;
+                if let Some(shifted) = residual(&next) {
+                    jacobian.set_column(j, &((shifted - &values) / 1e-6));
+                }
+            }
+            let jt = jacobian.transpose();
+            let mut normal = &jt * &jacobian;
+            for j in 0..3 {
+                normal[(j, j)] += lambda;
+            }
+            let Some(delta) = normal.lu().solve(&(-&jt * &values)) else {
+                break;
+            };
+            if delta.norm() < 1e-9 {
+                break;
+            }
+            let next = &params + delta;
+            if let Some(shifted) = residual(&next) {
+                let next_cost = shifted.norm_squared();
+                if next_cost < cost {
+                    params = next;
+                    values = shifted;
+                    cost = next_cost;
+                    lambda = (lambda * 0.3).max(1e-9);
+                    continue;
+                }
+            }
+            lambda = (lambda * 10.).min(1e12);
+        }
+        let rmse = (cost / (object_points.len() * 2) as f64).sqrt();
+        let pose = mount.field_pose(&params);
+        let origin = -pose.rotation.transpose() * pose.translation;
+        let front_facing = object_points.chunks_exact(4).all(|tag| {
+            let normal = (tag[1] - tag[0]).cross(&(tag[2] - tag[0]));
+            normal.dot(&(origin - tag[0])) > 0.
+        });
+        if front_facing
+            && rmse.is_finite()
+            && !estimates.iter().any(|old| {
+                (old.pose.translation - pose.translation).norm() < 0.01
+                    && (old.pose.rotation - pose.rotation).norm() < 0.01
+            })
+        {
+            estimates.push(PoseEstimate {
+                pose,
+                reprojection_rmse_px: rmse,
+            });
+        }
+    }
+    estimates.sort_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px));
+    estimates.truncate(6);
+    estimates
+}
+
+#[cfg(test)]
+mod planar_tests {
+    use super::*;
+
+    fn camera() -> CameraConfig {
+        serde_json::from_str(r#"{"fx":600,"fy":610,"cx":320,"cy":240,"k1":0,"k2":0,"k3":0,"p1":0,"p2":0,"tag_size_m":0.1651}"#).unwrap()
+    }
+
+    fn wall_tags() -> Vec<Vector3<f64>> {
+        [3., 3.7]
+            .into_iter()
+            .flat_map(|y| {
+                [
+                    Vector3::new(5., y + 0.08255, 0.91745),
+                    Vector3::new(5., y - 0.08255, 0.91745),
+                    Vector3::new(5., y - 0.08255, 1.08255),
+                    Vector3::new(5., y + 0.08255, 1.08255),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn planar_fit_recovers_position_from_pixels_without_pose_seed() {
+        for (height, tilt, distortion) in
+            [(0.65, 90., false), (0.85, 100., false), (0.65, 90., true)]
+        {
+            let mut camera = camera();
+            if distortion {
+                camera.k1 = -0.08;
+                camera.k2 = 0.015;
+                camera.p1 = 0.0003;
+            }
+            let mount = RobotMount {
+                x_offset: 0.2,
+                y_offset: -0.1,
+                z_offset: height,
+                roll_deg: -90.,
+                pitch_deg: 0.,
+                yaw_deg: tilt,
+            };
+            let truth = mount.field_pose(&DVector::from_vec(vec![2., 3., 0.12]));
+            let points = wall_tags();
+            let pixels: Vec<_> = points
+                .iter()
+                .map(|p| project_point(p, &truth, &camera, distortion).unwrap())
+                .collect();
+            let result =
+                estimate_planar_pose(&points, &pixels, &camera, distortion, &mount, &[]).unwrap();
+            assert!((result.pose.rotation - truth.rotation).norm() < 1e-5);
+            assert!((result.pose.translation - truth.translation).norm() < 1e-5);
+            assert!(result.reprojection_rmse_px < 1e-5);
+        }
+    }
+
+    #[test]
+    fn single_tag_planar_fit_escapes_bad_free_pose_seed() {
+        let camera = camera();
+        let mount = RobotMount {
+            x_offset: 0.2,
+            y_offset: -0.1,
+            z_offset: 0.65,
+            roll_deg: -90.,
+            pitch_deg: 0.,
+            yaw_deg: 90.,
+        };
+        let truth = mount.field_pose(&DVector::from_vec(vec![2., 3., 0.1]));
+        let points = wall_tags()[..4].to_vec();
+        let pixels: Vec<_> = points
+            .iter()
+            .map(|p| project_point(p, &truth, &camera, false).unwrap())
+            .collect();
+        let bad = mount.field_pose(&DVector::from_vec(vec![1., 2., 0.6]));
+        let result =
+            estimate_planar_pose(&points, &pixels, &camera, false, &mount, &[bad]).unwrap();
+        assert!((result.pose.translation - truth.translation).norm() < 1e-5);
+    }
+
+    #[test]
+    fn planar_fit_rejects_invalid_mount_and_incomplete_tag() {
+        let camera = camera();
+        let mut mount = RobotMount::from(&camera);
+        mount.z_offset = f64::NAN;
+        assert!(
+            estimate_planar_pose(&wall_tags(), &[(0., 0.); 8], &camera, false, &mount, &[])
+                .is_none()
+        );
+        mount.z_offset = 0.65;
+        assert!(estimate_planar_pose(
+            &wall_tags()[..5],
+            &[(0., 0.); 5],
+            &camera,
+            false,
+            &mount,
+            &[]
+        )
+        .is_none());
+    }
+}
+
 /// estimates 3d pose from 4 image corners
 ///
 /// # Arguments
@@ -231,6 +600,25 @@ pub fn reprojection_rmse_px_for_pose(
         apply_distortion,
     )?;
     Some((cost / (corners.len() as f64 * 2.0)).sqrt())
+}
+
+pub fn correspondence_reprojection_rmse(
+    pose: &Pose,
+    object_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    camera: &CameraConfig,
+) -> Option<f64> {
+    if object_points.len() != image_points.len() || object_points.is_empty() {
+        return None;
+    }
+    let cost = reprojection_cost(
+        &pose_to_params(pose),
+        object_points,
+        image_points,
+        camera,
+        true,
+    )?;
+    Some((cost / (object_points.len() * 2) as f64).sqrt())
 }
 
 fn refine_pose_pnp(

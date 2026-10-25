@@ -28,6 +28,8 @@ jobs:
           key: simulator-${{ runner.os }}-${{ hashFiles('simulation_tests/replay/Cargo.lock') }}
       - name: Build current production CPU replay
         run: cargo build --release --locked --manifest-path simulation_tests/replay/Cargo.toml
+      - name: Test native localization and image alignment
+        run: cargo test --release --locked --manifest-path simulation_tests/replay/Cargo.toml
       - name: Test simulator and replay available captures
         run: python -m unittest discover -s chassis_sim -p 'test_*.py'
       - name: Run deterministic driving smoke route

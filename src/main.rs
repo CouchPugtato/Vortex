@@ -747,7 +747,8 @@ fn main() -> anyhow::Result<()> {
                             .get(&idx)
                             .copied()
                             .flatten()
-                            .or_else(|| robust_fuse_field_pose(&field_candidates));
+                            .or_else(|| if runtime_config.processing.planar_localization { None }
+                                else { robust_fuse_field_pose(&field_candidates) });
                         let mut pose_for_publish: Option<(f64, f64, usize, f64)> = None;
                         if let Some((raw_x, raw_y, used, avg_z_err)) = raw_pose {
                             const MAX_STEP_M: f64 = 5.0;
@@ -1105,6 +1106,7 @@ fn spawn_camera_pipeline(
                 let mut joint_object_points: Vec<Vector3<f64>> = Vec::new();
                 let mut joint_image_points: Vec<(f64, f64)> = Vec::new();
                 let mut joint_initial_poses: Vec<pose::Pose> = Vec::new();
+                let mut joint_patches = Vec::new();
 
                 for detector in &mut detectors {
                     let raw_dets = match detector.detect(&pixels, width, height, &processing_config) {
@@ -1121,7 +1123,7 @@ fn spawn_camera_pipeline(
 
                     for det in raw_dets {
                         match det {
-                            Detection::AprilTag(apr_det) => {
+                            Detection::AprilTag(mut apr_det) => {
                                 // Preserve AprilTag's native corner order: BL, BR, TR, TL.
                                 let c = apr_det.corners;
                                 let corners_raw = [
@@ -1133,7 +1135,10 @@ fn spawn_camera_pipeline(
 
                                 let tag_field = tag_map_by_id.get(&apr_det.id);
                                 let mut best_estimate: Option<(pose::PoseEstimate, Option<(Vector3<f64>, f64)>, f64)> = None;
-                                for estimate in apr_det.cpu_pose_candidates(&effective_config, true, 50) {
+                                let candidates = if processing_config.planar_localization {
+                                    apr_det.cpu_corner_pose_candidates(&effective_config, true, 50)
+                                } else { apr_det.cpu_pose_candidates(&effective_config, true, 50) };
+                                for estimate in candidates {
                                     if let Some(tf) = tag_field {
                                         if estimate.reprojection_rmse_px <= MAX_TAG_REPROJECTION_RMSE_PX
                                             && camera_visible_side_score(&estimate.pose, tf) > 0.0 {
@@ -1226,6 +1231,14 @@ fn spawn_camera_pipeline(
                                     floor_z_error,
                                     corners: apr_det.corners,
                                 }));
+                                if processing_config.planar_localization {
+                                    if let (Some(patch), Some(tag)) = (apr_det.image_patch.take(), tag_field) {
+                                        joint_patches.push((patch, pose::Pose {
+                                            rotation: tag.rot_field_from_tag,
+                                            translation: tag.pos,
+                                        }));
+                                    }
+                                }
                             }
                             Detection::Yolo(yolo_det) => {
                                 let conf_threshold = object_detection_config.confidence_threshold.clamp(0.0, 1.0);
@@ -1277,7 +1290,18 @@ fn spawn_camera_pipeline(
                     }
                 }
 
-                let joint_robot_pose = if joint_object_points.len() >= 8 {
+                let joint_estimate = if processing_config.planar_localization {
+                    let mount = pose::RobotMount::from(&camera_config);
+                    let candidates = pose::planar_pose_candidates(
+                        &joint_object_points, &joint_image_points, &camera_config,
+                        true, &mount, &joint_initial_poses,
+                    );
+                    let patches: Vec<_> = joint_patches.iter().map(|(p, t)| (p, t.clone())).collect();
+                    tag_refine::refine_planar_field_pose(
+                        &patches, &candidates, &camera_config, &mount,
+                        &joint_object_points, &joint_image_points,
+                    ).or_else(|| candidates.into_iter().next())
+                } else if joint_object_points.len() >= 8 {
                     pose::estimate_pose_from_correspondence_candidates(
                             &joint_object_points,
                             &joint_image_points,
@@ -1285,7 +1309,10 @@ fn spawn_camera_pipeline(
                             true,
                             &joint_initial_poses,
                         )
-                        .and_then(|estimate| {
+                } else {
+                    None
+                };
+                let joint_robot_pose = joint_estimate.and_then(|estimate| {
                             if estimate.reprojection_rmse_px > MAX_TAG_REPROJECTION_RMSE_PX {
                                 None
                             } else {
@@ -1293,10 +1320,7 @@ fn spawn_camera_pipeline(
                                     estimate_robot_field_from_field_pose(&estimate.pose, &camera_config);
                                 Some((robot_field.x, robot_field.y, joint_object_points.len() / 4, z_err))
                             }
-                        })
-                } else {
-                    None
-                };
+                        });
 
                 let completed = Instant::now();
                 let processing_ms = completed.duration_since(processing_started).as_secs_f64()*1000.0;

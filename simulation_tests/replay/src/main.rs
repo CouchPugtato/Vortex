@@ -2,18 +2,18 @@
 // Compile production detector and pose modules directly, without Linux camera/GPU dependencies.
 #[path = "../../../src/config.rs"]
 mod config;
+#[path = "../../../src/deployment_smoke.rs"]
+mod deployment_smoke;
 #[path = "../../../src/detector.rs"]
 mod detector;
 #[path = "../../../src/pose.rs"]
 mod pose;
-#[path = "../../../src/tag_refine.rs"]
-mod tag_refine;
-#[path = "../../../src/runtime_health.rs"]
-mod runtime_health;
 #[path = "../../../src/runtime_diagnostics.rs"]
 mod runtime_diagnostics;
-#[path = "../../../src/deployment_smoke.rs"]
-mod deployment_smoke;
+#[path = "../../../src/runtime_health.rs"]
+mod runtime_health;
+#[path = "../../../src/tag_refine.rs"]
+mod tag_refine;
 
 use anyhow::{bail, Context, Result};
 use nalgebra::{Matrix3, Vector3};
@@ -29,6 +29,8 @@ struct Manifest {
     camera: config::CameraConfig,
     tags: Vec<Tag>,
     frames: Vec<Frame>,
+    #[serde(default)]
+    robot_mount: Option<pose::RobotMount>,
 }
 #[derive(Deserialize)]
 struct Tag {
@@ -54,8 +56,13 @@ fn rotation_rows(r: &Matrix3<f64>) -> [[f64; 3]; 3] {
 
 fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--deployment-smoke") {
-        let path = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("Missing smoke image"))?;
-        println!("VORTEX_SMOKE {}", deployment_smoke::run(std::path::Path::new(&path))?);
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("Missing smoke image"))?;
+        println!(
+            "VORTEX_SMOKE {}",
+            deployment_smoke::run(std::path::Path::new(&path))?
+        );
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("--stream") {
@@ -134,8 +141,10 @@ fn evaluate_frame(
     let mut field_seeds = Vec::new();
     let mut detection_quality = Vec::new();
     let mut pose_candidate_diagnostics = Vec::new();
+    let mut field_patches = Vec::new();
+    let mut image_patch_ids = Vec::new();
     for detection in detections {
-        if let detector::Detection::AprilTag(tag_det) = detection {
+        if let detector::Detection::AprilTag(mut tag_det) = detection {
             found.push(tag_det.id);
             detection_quality.push(json!({"id": tag_det.id,
                     "hamming": tag_det.cpu_detection.as_ref().map(|d| d.hamming()),
@@ -144,8 +153,12 @@ fn evaluate_frame(
             if let Some(tag) = tags.get(&tag_det.id) {
                 let r_ft = matrix(tag.rotation) * map_from_solver;
                 // Invert tag->camera and compose with tag->field, exactly as production does.
-                let best = tag_det
-                        .cpu_pose_candidates(&manifest.camera, true, 50)
+                let estimates = if manifest.robot_mount.is_some() {
+                    tag_det.cpu_corner_pose_candidates(&manifest.camera, true, 50)
+                } else {
+                    tag_det.cpu_pose_candidates(&manifest.camera, true, 50)
+                };
+                let best = estimates
                         .into_iter()
                         .filter(|p| p.reprojection_rmse_px <= 2.)
                         .filter_map(|p| {
@@ -194,6 +207,16 @@ fn evaluate_frame(
                             "camera_error_m": error, "reprojection_rmse_px": rmse}),
                     );
                 }
+                if let Some(patch) = tag_det.image_patch.take() {
+                    image_patch_ids.push(tag_det.id);
+                    field_patches.push((
+                        patch,
+                        pose::Pose {
+                            rotation: r_ft,
+                            translation: Vector3::from(tag.position),
+                        },
+                    ));
+                }
             }
         }
     }
@@ -202,7 +225,26 @@ fn evaluate_frame(
         .iter()
         .filter(|id| !valid.contains(id))
         .collect();
-    let raw_joint = if field_points.len() >= 8 {
+    let raw_joint = if let Some(mount) = &manifest.robot_mount {
+        let candidates = pose::planar_pose_candidates(
+            &field_points,
+            &image_points,
+            &manifest.camera,
+            true,
+            mount,
+            &field_seeds,
+        );
+        let patches: Vec<_> = field_patches.iter().map(|(p, t)| (p, t.clone())).collect();
+        tag_refine::refine_planar_field_pose(
+            &patches,
+            &candidates,
+            &manifest.camera,
+            mount,
+            &field_points,
+            &image_points,
+        )
+        .or_else(|| candidates.into_iter().next())
+    } else if field_points.len() >= 8 {
         pose::estimate_pose_from_correspondence_candidates(
             &field_points,
             &image_points,
@@ -227,6 +269,10 @@ fn evaluate_frame(
                         "tags_used": field_points.len() / 4}),
             )
         });
+    let planar_rejected = manifest.robot_mount.is_some() && joint.is_none();
+    if planar_rejected {
+        results.clear();
+    }
     let position_ok = if let Some((error, _)) = &joint {
         error.is_finite() && *error <= max_error
     } else {
@@ -246,6 +292,8 @@ fn evaluate_frame(
     };
     Ok(
         json!({"name": frame.name, "passed": passed, "detected_ids": found,
+            "image_patch_ids": image_patch_ids,
+            "planar_rejected": planar_rejected,
             "detection_quality": detection_quality,
             "pose_candidates": pose_candidate_diagnostics,
             "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results,
@@ -253,7 +301,8 @@ fn evaluate_frame(
             "unexpected_ids": found.iter().filter(|id| frame.allowed_ids.as_ref()
                 .map_or_else(|| !tags.contains_key(id), |ids| !ids.contains(id))).collect::<Vec<_>>(),
             "position_passed": position_ok,
-            "localization_mode": if joint.is_some() { "multi_tag" } else { "single_tag" },
+            "localization_mode": if joint.is_some() && manifest.robot_mount.is_some() { "planar" }
+                else if joint.is_some() { "multi_tag" } else { "single_tag" },
             "joint_reprojection_rmse_px": raw_joint.map(|p| p.reprojection_rmse_px),
             "single_tag_diagnostic_passed": missing.is_empty()
                 && errors.iter().all(|e| e.is_finite() && *e <= max_error),

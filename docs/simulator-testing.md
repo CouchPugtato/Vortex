@@ -102,6 +102,31 @@ pass. Exit code 1 means a matched-mount run failed, was inconclusive, or saved-c
 replay failed. `--max-bad-frames N` permits an explicit outlier allowance.
 This stress suite can expose existing localization failures.
 
+### Localization model
+
+The kinematic simulator uses a calibrated **level-chassis** solver by default.
+It fits robot X/Y/yaw from tag corners and the assumed camera mount, then jointly
+aligns decoded tag patterns against the input pixels when possible. Camera height
+and attitude come from configuration; ground truth is used only for scoring.
+Multiple starting headings avoid relying on one ambiguous square-PnP seed.
+Fits must satisfy front-face visibility and the existing 2-pixel reprojection
+limit. An unsuccessful image fit falls back to the corner fit.
+
+Use `--free-pose` with `drive.py`, `benchmark.py`, or `replay_captures.py` for
+unconstrained 6-DoF localization. Saved simulator captures retain the assumed
+mount and model selection; older simulator captures default to planar. Arbitrary
+synthetic camera scenes retain their unconstrained model.
+
+Hardware retains its unconstrained default. A robot that stays level and has
+calibrated camera extrinsics can opt in with `processing.planar_localization: true`
+in runtime config. Leave it false for ramps, tipping, or uncertain mounts. The
+shared solver and production CPU build are tested; robot hardware validation
+remains outstanding.
+
+Sparse frames with small tags also use an interpolated detection pass, with
+stricter decoding checks on recovered tags. This adds processing cost; inspect
+timing metrics on the target device.
+
 The chassis has no collision response. Routes can cross CAD geometry; obstacle
 sweeps test visibility rather than safe navigation. Blur approximates optical flow
 at 2 m depth rather than integrating rendered scenes throughout an exposure.
