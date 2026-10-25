@@ -9,6 +9,7 @@ const { stageProject } = require("./staging-deploy");
 const { operateRelease, releaseStatus } = require("./activation-deploy");
 const { initializeJetson } = require("./initialize-deploy");
 const { ServiceDiagnostics } = require("./service-diagnostics");
+const { maintain } = require("./maintenance");
 
 const APP_CONFIG_PATH = path.join(app.getPath("userData"), "deployment_tool_config.json");
 const JOB_PATH = path.join(app.getPath("userData"), "pending_deployment_job.json");
@@ -1002,6 +1003,16 @@ async function resumeDeployment(settings) {
 }
 
 ipcMain.handle("deployment-resume", async (_evt, settings) => resumeDeployment(settings));
+ipcMain.handle("deployment-maintenance", async (_evt, settings, action) => {
+  if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount || serviceDiagnostics.running) {
+    throw new Error("Finish the current operation and detach diagnostics before maintenance");
+  }
+  withSshConfig(settings);
+  stagingInFlight = true;
+  try { return await maintain(settings, inferRemoteDeployFolder(settings.remote_path, settings.local_path), action,
+    { connect: connectSsh, execChecked }); }
+  finally { stagingInFlight = false; }
+});
 
 ipcMain.handle("jetson-initialize", async (_evt, settings, administratorPassword) => {
   if (stagingInFlight || fsSync.existsSync(JOB_PATH) || serviceGuard.activeCount) {

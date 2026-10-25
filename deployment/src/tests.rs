@@ -12,6 +12,7 @@ use std::{
 };
 mod archive_cases;
 mod diagnostics_cases;
+mod maintenance_cases;
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -434,6 +435,7 @@ fn initialization_rejects_unsafe_accounts_and_paths() {
             job: "job",
             release: "release",
             sha: &sha,
+            offline: None,
         };
         assert!(o.validate().is_err());
     }

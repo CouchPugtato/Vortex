@@ -58,6 +58,7 @@ function harness(t, exitCode = () => 0, stage = async () => ({ state: "ready" })
       } };
       if (name === "./initialize-deploy") return { initializeJetson: async (...args) => { initializeCalls.push(args); return initialize(...args); } };
       if (name === "./launch-config") return require("../launch-config");
+      if (name === "./maintenance") return require("../maintenance");
       if (name === "./activation-deploy") return {
         operateRelease: async (...args) => { activationCalls.push(args); return operation(...args); },
         releaseStatus: async () => overview

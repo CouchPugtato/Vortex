@@ -1,22 +1,17 @@
-mod activation;
-mod common;
-mod initialize;
-mod jobs;
-mod launcher;
-mod package;
-mod service;
-#[cfg(test)]
-mod tests;
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use common::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use vortexctl::{
+    activation, common, initialize, jobs, launcher, offline, package, retention, service,
+    validation,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Native Vortex deployment controller")]
 struct Args {
-    #[arg(value_parser=["launch","pack","stage","start-job","status","activate","rollback","recover","service-run","install-service","preflight","diagnostics","diagnostics-stop","initialize-submit","initialize-run"])]
+    #[arg(value_parser=["launch","pack","stage","start-job","status","activate","rollback","recover","service-run","install-service","preflight","diagnostics","diagnostics-stop","initialize-submit","initialize-run","cleanup","offline-create","offline-download","validate-device"])]
     action: String,
     #[arg(long)]
     root: Option<PathBuf>,
@@ -70,11 +65,38 @@ struct Args {
     debug_bridge: bool,
     #[arg(long, default_value = "0")]
     camera: u64,
+    #[arg(long, default_value = "3")]
+    keep_releases: usize,
+    #[arg(long, default_value = "14")]
+    max_age_days: u64,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    offline_bundle: Option<PathBuf>,
+    #[arg(long)]
+    offline_sha256: Option<String>,
+    #[arg(long)]
+    packages: Option<PathBuf>,
+    #[arg(long, default_value = "cpu")]
+    profile: String,
+    #[arg(long, default_value = "30")]
+    duration_seconds: u64,
 }
 fn required<T>(v: Option<T>, name: &str) -> Result<T> {
     v.with_context(|| format!("--{name} is required"))
 }
 fn run(a: Args) -> Result<Value> {
+    if a.action == "offline-download" {
+        return offline::download(&required(a.output, "output")?);
+    }
+    if a.action == "offline-create" {
+        return offline::create(
+            &required(a.source, "source")?,
+            &required(a.output, "output")?,
+            &required(a.packages, "packages")?,
+            &a.profile,
+        );
+    }
     if a.action == "pack" {
         return package::pack(
             &required(a.source, "source")?,
@@ -135,6 +157,8 @@ fn run(a: Args) -> Result<Value> {
     }
     let root = root(&required(a.root, "root")?)?;
     match a.action.as_str() {
+        "validate-device" => validation::validate(&root, a.duration_seconds),
+        "cleanup" => retention::cleanup(&root, a.keep_releases, a.max_age_days, a.apply),
         "stage" => package::stage(
             &root,
             &required(a.archive, "archive")?,
@@ -212,6 +236,7 @@ fn run(a: Args) -> Result<Value> {
                 job: &job,
                 release: &release,
                 sha: &sha,
+                offline:match (&a.offline_bundle,&a.offline_sha256){(Some(path),Some(sha))=>Some((path,sha)),(None,None)=>None,_=>anyhow::bail!("Offline initialization requires both --offline-bundle and --offline-sha256")},
             };
             if a.action == "initialize-submit" {
                 initialize::submit(&o)

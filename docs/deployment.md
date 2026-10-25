@@ -355,9 +355,30 @@ Jetson validation.
 
 ## Remaining implementation order
 
-1. Validate service installation, preview performance and watchdog recovery on a Jetson.
-2. Add offline provisioning bundles, broader hardware/JetPack compatibility coverage,
-   and release retention cleanup.
+1. Complete the [Jetson acceptance run](deployment-validation.md), including real
+   reboot/power interruption, preview performance under build load and GPU profiles.
+2. Validate [offline initialization](offline-deployment.md) on each supported clean
+   JetPack image. Native bundle creation and restore tests do not certify JetPack.
+
+## Release maintenance
+
+**Deployment maintenance** offers cleanup preview and explicit cleanup. It retains
+the selected/previous releases, all referenced or nonterminal work, the newest three
+releases and anything newer than 14 days. Unknown uploads/builds are conservatively
+retained. Cleanup takes the deployment lock, refuses unfinished activation recovery,
+rejects symlink trees and does not remove shared compiler caches.
+
+The CLI defaults to preview; add `--apply` to delete the reported old files:
+
+```sh
+vortexctl cleanup --root /path/to/Vortex.deployment --keep-releases 3 --max-age-days 14
+```
+
+Offline initialization is available through Jetson Setup; see the
+[bundle preparation guide](offline-deployment.md). Tag pushes matching `v*` build
+the Windows installer and portable app with checksums and upload a **draft** GitHub
+release. Workflow dispatch builds downloadable artifacts without publishing a release.
+Release signing is not configured; the generated executables are unsigned.
 
 Linux service installation, sudoers validation, real camera timing, GPU/TensorRT,
 and boot recovery still require Jetson testing. Local transaction tests inject

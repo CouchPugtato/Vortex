@@ -6,6 +6,16 @@ const crypto = require("crypto");
 const { packageLocally, managedRoot, quote } = require("./staging-deploy");
 const { logFollower } = require("./job-progress");
 const { verifyController } = require("./native-controller");
+async function offlineMetadata(filename) {
+  const metadata = JSON.parse(await fs.readFile(path.join(path.dirname(filename), "offline.json"), "utf8"));
+  const stat = await fs.lstat(filename);
+  if (!stat.isFile() || stat.isSymbolicLink() || metadata.schema_version !== 1 || metadata.kind !== "vortex-offline" ||
+      !/^[a-f0-9]{64}$/.test(metadata.archive_sha256) || metadata.archive_bytes !== stat.size) throw new Error("Invalid offline bundle metadata");
+  const digest = crypto.createHash("sha256");
+  for await (const bytes of require("fs").createReadStream(filename)) digest.update(bytes);
+  if (digest.digest("hex") !== metadata.archive_sha256) throw new Error("Offline bundle checksum mismatch");
+  return metadata;
+}
 
 // Send the sudo password through SSH stdin, never argv, the shell or a file.
 // No PTY means terminal echo cannot put it in stdout/logs.
@@ -74,19 +84,31 @@ async function initializeJetson(settings, remoteTarget, password, deps) {
         throw new Error("Invalid initialization package metadata");
       }
       const incoming = `${root}/incoming/${metadata.release_id}`;
+      const offlinePath = settings.offline_bundle_path ? path.resolve(deps.appDir, settings.offline_bundle_path) : null;
+      const offline = offlinePath ? await offlineMetadata(offlinePath) : null;
+      if (offline && (offline.profile !== metadata.build_profile ||
+          (settings.deployment_architecture && offline.host?.architecture !== settings.deployment_architecture))) {
+        throw new Error("Offline bundle profile/architecture does not match this deployment");
+      }
       await checked(`mkdir -p -- ${quote(incoming)} ${quote(root+"/jobs")}`);
       const sftp = await deps.getSftp(conn);
       emit(10, "Uploading setup snapshot...");
       for (const file of ["release.tar.gz", "vortexctl"]) {
         await deps.upload(sftp, path.join(directory, file), incoming+"/"+file);
       }
+      if (offline) {
+        emit(15, "Uploading offline provisioning bundle...");
+        await deps.upload(sftp, offlinePath, incoming+"/offline.tar.gz");
+      }
       await checked(verifyController(incoming+"/vortexctl", metadata.controller_sha256, quote));
-      metadata = { ...metadata, kind: "initialize", operation_id: operation };
+      metadata = { ...metadata, kind: "initialize", operation_id: operation,
+        ...(offline ? { offline_sha256: offline.archive_sha256 } : {}) };
       await deps.remember?.(metadata);
       emit(20, "Starting administrator setup...");
       const command = `${quote(incoming+"/vortexctl")} initialize-submit --root ${quote(root)} `+
         `--legacy-root ${quote(remoteTarget)} --job-id ${quote(operation)} --release-id ${quote(metadata.release_id)} `+
-        `--sha256 ${quote(metadata.archive_sha256)} --user ${quote(user)} --service ${quote(service)}`;
+        `--sha256 ${quote(metadata.archive_sha256)} --user ${quote(user)} --service ${quote(service)}`+
+        (offline ? ` --offline-bundle ${quote(incoming+"/offline.tar.gz")} --offline-sha256 ${quote(offline.archive_sha256)}` : "");
       await (deps.execAdministrator || execAdministrator)(conn, command, password);
       password = "";
     }
@@ -146,4 +168,4 @@ async function initializeJetson(settings, remoteTarget, password, deps) {
   }
 }
 
-module.exports = { initializeJetson, execAdministrator };
+module.exports = { initializeJetson, execAdministrator, offlineMetadata };

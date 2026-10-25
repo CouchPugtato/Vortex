@@ -1,4 +1,4 @@
-use crate::{common::*, jobs, launcher, package, service};
+use crate::{common::*, jobs, launcher, offline, package, service};
 use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 use std::{
@@ -6,6 +6,22 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+pub const PACKAGES: &[&str] = &[
+    "ca-certificates",
+    "curl",
+    "git",
+    "build-essential",
+    "pkg-config",
+    "cmake",
+    "clang",
+    "libclang-dev",
+    "libssl-dev",
+    "libudev-dev",
+    "libturbojpeg0-dev",
+    "libv4l-dev",
+    "v4l-utils",
+    "dbus-user-session",
+];
 pub struct Options<'a> {
     pub root: &'a Path,
     pub legacy: &'a Path,
@@ -14,6 +30,7 @@ pub struct Options<'a> {
     pub job: &'a str,
     pub release: &'a str,
     pub sha: &'a str,
+    pub offline: Option<(&'a Path, &'a str)>,
 }
 impl Options<'_> {
     pub fn validate(&self) -> Result<()> {
@@ -45,10 +62,14 @@ impl Options<'_> {
         id(self.job)?;
         id(self.release)?;
         checksum(self.sha)?;
+        if let Some((path, sha)) = self.offline {
+            ensure!(path.is_absolute(), "Offline bundle path must be absolute");
+            checksum(sha)?;
+        }
         Ok(())
     }
     fn args(&self, action: &str) -> Vec<String> {
-        [
+        let mut args: Vec<String> = [
             action,
             "--root",
             self.root.to_str().unwrap(),
@@ -67,7 +88,16 @@ impl Options<'_> {
         ]
         .into_iter()
         .map(str::to_string)
-        .collect()
+        .collect();
+        if let Some((path, sha)) = self.offline {
+            args.extend([
+                "--offline-bundle".into(),
+                path.display().to_string(),
+                "--offline-sha256".into(),
+                sha.into(),
+            ]);
+        }
+        args
     }
 }
 pub fn submit(o: &Options) -> Result<Value> {
@@ -213,40 +243,39 @@ pub fn initialize(o: &Options) -> Result<Value> {
                 fs2::available_space(o.root)? >= 6 * 1024 * 1024 * 1024,
                 "Initialization needs 6 GiB free space"
             );
-            update("packages", json!({}))?;
-            logged(
-                Command::new("apt-get")
-                    .args(["-o", "DPkg::Lock::Timeout=120", "update"])
-                    .env("DEBIAN_FRONTEND", "noninteractive"),
-                &log,
-                7200,
-            )?;
-            logged(
-                Command::new("apt-get")
-                    .args([
-                        "-o",
-                        "DPkg::Lock::Timeout=120",
-                        "install",
-                        "-y",
-                        "ca-certificates",
-                        "curl",
-                        "git",
-                        "build-essential",
-                        "pkg-config",
-                        "cmake",
-                        "clang",
-                        "libclang-dev",
-                        "libssl-dev",
-                        "libudev-dev",
-                        "libturbojpeg0-dev",
-                        "libv4l-dev",
-                        "v4l-utils",
-                        "dbus-user-session",
-                    ])
-                    .env("DEBIAN_FRONTEND", "noninteractive"),
-                &log,
-                7200,
-            )?;
+            let bundle = if let Some((archive, sha)) = o.offline {
+                let dest = work.join("offline-inputs");
+                offline::extract(
+                    archive,
+                    sha,
+                    &dest,
+                    &work,
+                    string(&manifest, "build_profile")?,
+                )?;
+                Some(dest)
+            } else {
+                None
+            };
+            update("packages", json!({"offline":bundle.is_some()}))?;
+            if let Some(bundle) = &bundle {
+                offline::install_packages(bundle, &log)?;
+            } else {
+                logged(
+                    Command::new("apt-get")
+                        .args(["-o", "DPkg::Lock::Timeout=120", "update"])
+                        .env("DEBIAN_FRONTEND", "noninteractive"),
+                    &log,
+                    7200,
+                )?;
+                logged(
+                    Command::new("apt-get")
+                        .args(["-o", "DPkg::Lock::Timeout=120", "install", "-y"])
+                        .args(PACKAGES)
+                        .env("DEBIAN_FRONTEND", "noninteractive"),
+                    &log,
+                    7200,
+                )?;
+            }
             for (exe, args) in [
                 ("usermod", vec!["-aG".into(), "video".into(), o.user.into()]),
                 ("loginctl", vec!["enable-linger".into(), o.user.into()]),
@@ -273,32 +302,51 @@ pub fn initialize(o: &Options) -> Result<Value> {
             );
             update("toolchain", json!({}))?;
             let rustup = a.home.join(".cargo/bin/rustup");
-            if !rustup.is_file() {
-                let installer = work.join("rustup-init.sh");
-                logged(
-                    Command::new("curl")
-                        .args([
-                            "--proto",
-                            "=https",
-                            "--tlsv1.2",
-                            "-fsSL",
-                            "https://sh.rustup.rs",
-                            "-o",
-                        ])
-                        .arg(&installer),
-                    &log,
-                    300,
-                )?;
-                service::chown(&installer, &a)?;
+            let pin = launcher::pin(&work)?;
+            if let Some(bundle) = &bundle {
+                offline::install_user(bundle, o.user, &a.home, &pin)?;
+            } else {
+                if !rustup.is_file() {
+                    let installer = work.join("rustup-init.sh");
+                    logged(
+                        Command::new("curl")
+                            .args([
+                                "--proto",
+                                "=https",
+                                "--tlsv1.2",
+                                "-fsSL",
+                                "https://sh.rustup.rs",
+                                "-o",
+                            ])
+                            .arg(&installer),
+                        &log,
+                        300,
+                    )?;
+                    service::chown(&installer, &a)?;
+                    run_user(
+                        &[
+                            "sh".into(),
+                            installer.display().to_string(),
+                            "-y".into(),
+                            "--profile".into(),
+                            "minimal".into(),
+                            "--default-toolchain".into(),
+                            "none".into(),
+                        ],
+                        o.user,
+                        &a.home,
+                        &log,
+                        7200,
+                    )?;
+                }
                 run_user(
                     &[
-                        "sh".into(),
-                        installer.display().to_string(),
-                        "-y".into(),
+                        rustup.display().to_string(),
+                        "toolchain".into(),
+                        "install".into(),
+                        pin.clone(),
                         "--profile".into(),
                         "minimal".into(),
-                        "--default-toolchain".into(),
-                        "none".into(),
                     ],
                     o.user,
                     &a.home,
@@ -306,36 +354,19 @@ pub fn initialize(o: &Options) -> Result<Value> {
                     7200,
                 )?;
             }
-            let pin = launcher::pin(&work)?;
-            run_user(
-                &[
-                    rustup.display().to_string(),
-                    "toolchain".into(),
-                    "install".into(),
-                    pin.clone(),
-                    "--profile".into(),
-                    "minimal".into(),
-                ],
-                o.user,
-                &a.home,
-                &log,
-                7200,
-            )?;
             update("dependencies", json!({}))?;
-            run_user(
-                &[
-                    a.home.join(".cargo/bin/cargo").display().to_string(),
-                    format!("+{pin}"),
-                    "fetch".into(),
-                    "--locked".into(),
-                    "--manifest-path".into(),
-                    work.join("Cargo.toml").display().to_string(),
-                ],
-                o.user,
-                &a.home,
-                &log,
-                7200,
-            )?;
+            let mut fetch = vec![
+                a.home.join(".cargo/bin/cargo").display().to_string(),
+                format!("+{pin}"),
+                "fetch".into(),
+                "--locked".into(),
+                "--manifest-path".into(),
+                work.join("Cargo.toml").display().to_string(),
+            ];
+            if bundle.is_some() {
+                fetch.push("--offline".into());
+            }
+            run_user(&fetch, o.user, &a.home, &log, 7200)?;
         }
         // The staging worker acquires the normal user's lock. Never build or run
         // the vision executable as root, including the saved-image smoke test.

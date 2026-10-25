@@ -44,3 +44,8 @@ deployment/target/release/vortexctl launch --source . --build --online
 See [deployment operations](../docs/deployment.md). Real camera and JetPack
 validation still require a target device. The tests use isolated directories
 and fake service managers; they do not install packages or modify host services.
+
+Additional opt-in tests exercise actual systemd using a dedicated test account;
+see [service and hardware validation](../docs/deployment-validation.md).
+Offline provisioning preparation is described in the
+[offline guide](../docs/offline-deployment.md).

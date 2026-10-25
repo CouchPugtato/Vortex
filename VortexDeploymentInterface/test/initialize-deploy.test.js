@@ -59,6 +59,16 @@ test("initialization uploads and verifies setup, then uses privileged stdin subm
   assert.equal(h.progress.at(-1).status, "done");
   assert(!h.commands.some((command) => command.includes(" activate ")));
 });
+test("offline setup uploads a checked bundle and forwards its exact hash to the detached worker", async (t) => {
+  const os=require("node:os"),crypto=require("node:crypto");
+  const folder=await fs.mkdtemp(path.join(os.tmpdir(),"vortex-offline-init-"));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+  const bytes=Buffer.from("offline archive"),sha=crypto.createHash("sha256").update(bytes).digest("hex");
+  await fs.writeFile(path.join(folder,"offline.tar.gz"),bytes);
+  await fs.writeFile(path.join(folder,"offline.json"),JSON.stringify({schema_version:1,kind:"vortex-offline",profile:"cpu",host:{architecture:"aarch64"},archive_bytes:bytes.length,archive_sha256:sha}));
+  const h=harness();await initializeJetson({offline_bundle_path:path.join(folder,"offline.tar.gz")},remote,"admin",h.deps);
+  assert(h.uploads.some(p=>p.endsWith("/offline.tar.gz")));
+  assert(h.administrator[0].command.includes("--offline-bundle"));assert(h.administrator[0].command.includes(`--offline-sha256 '${sha}'`));assert.equal(h.saved.offline_sha256,sha);
+});
 
 test("setup reattaches without uploading again or asking for administrator credentials", async () => {
   const h = harness([{ state: "building", log_tail: "compiling release" }, "ready"]);

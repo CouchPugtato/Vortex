@@ -37,6 +37,9 @@ builds retain the normal Electron Builder signing settings.
 - Edit and save runtime `config/config.json`.
 - Initialize a flashed Jetson from **Jetson Setup**, including dependencies, Rust,
   camera permissions and managed startup, without opening an SSH terminal.
+- Initialize without internet using a matching [offline bundle](../docs/offline-deployment.md).
+- Preview or apply old-release cleanup, and run camera/preview acceptance checks
+  through **Deployment maintenance**.
 - Stage a checksummed source release over SSH/SFTP and build it without replacing
   or restarting the running installation.
 - Attach to production camera previews and detections without replacing the pipeline.
@@ -70,3 +73,8 @@ builds retain the normal Electron Builder signing settings.
   to enable production diagnostics and watchdog notifications.
 
 - Connection errors like `ECONNREFUSED` / `10061` mean host/port are unreachable.
+
+Tag pushes matching `v*` build the installer and portable executable with SHA256
+checksums and upload a draft GitHub release. Manual workflow dispatch produces
+artifacts without publishing. Installers currently ship unsigned. Native files
+and installers are generated artifacts rather than checked-in binaries.

@@ -1,0 +1,10 @@
+"use strict";
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const directory = path.resolve(__dirname, "../dist");
+const files = fs.readdirSync(directory).filter((name) => name.endsWith(".exe")).sort();
+if (files.length < 2) throw new Error("Expected both installer and portable executable");
+const lines = files.map((name) => crypto.createHash("sha256").update(fs.readFileSync(path.join(directory, name))).digest("hex")+"  "+name);
+fs.writeFileSync(path.join(directory, "SHA256SUMS"), lines.join("\n")+"\n");
+console.log("Release checksums created for "+files.length+" executables.");

@@ -1,0 +1,67 @@
+name: Desktop installers
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  controllers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Prepare compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          pip install ziglang==0.13.0
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 install cargo-zigbuild --locked --version 0.23.4
+      - run: node VortexDeploymentInterface/scripts/build-native.js
+      - uses: actions/upload-artifact@v4
+        with: { name: release-controllers, path: VortexDeploymentInterface/native/, if-no-files-found: error }
+  installers:
+    needs: controllers
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/download-artifact@v4
+        with: { name: release-controllers, path: VortexDeploymentInterface/native }
+      - name: Test and build installers
+        working-directory: VortexDeploymentInterface
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npm ci
+          if ($env:GITHUB_REF_TYPE -eq "tag") { npm version ($env:GITHUB_REF_NAME -replace '^v','') --no-git-tag-version --allow-same-version }
+          npm run check:native
+          npm test
+          npm run dist:win -- --publish never --config.win.signAndEditExecutable=false
+          node scripts/release-checksums.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vortex-windows-installers
+          path: |
+            VortexDeploymentInterface/dist/*.exe
+            VortexDeploymentInterface/dist/SHA256SUMS
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: installers
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: vortex-windows-installers, path: installers }
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" installers/* --verify-tag --draft --generate-notes --title "Vortex $RELEASE_TAG"

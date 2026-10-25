@@ -68,6 +68,11 @@ const el = {
   setupRemote: document.querySelector("#setupRemote"),
   setupService: document.querySelector("#setupService"),
   administratorPassword: document.querySelector("#administratorPassword"),
+  offlineBundle: document.querySelector("#offlineBundle"),
+  browseOfflineBundle: document.querySelector("#browseOfflineBundle"),
+  previewCleanup: document.querySelector("#previewCleanup"),
+  applyCleanup: document.querySelector("#applyCleanup"),
+  validateDevice: document.querySelector("#validateDevice"),
   initializeJetson: document.querySelector("#initializeJetson"),
   runtimePath: document.querySelector("#runtimePath"),
   jetsonWatts: document.querySelector("#jetsonWatts"),
@@ -308,6 +313,7 @@ function hydrateAppConfig(cfg) {
   el.setupLocal.value = cfg.local_path || "";
   el.setupRemote.value = cfg.remote_path || "/home/vortex/deployments";
   el.setupService.value = cfg.startup_service_name || "vortex-vision.service";
+  if (el.offlineBundle) el.offlineBundle.value = cfg.offline_bundle_path || "";
   if (!cfg.pass) el.jetsonSetup.open = true;
   if (cfg.last_ready_release && ![...el.readyRelease.options].some((option) => option.value === cfg.last_ready_release)) {
     el.readyRelease.add(new Option(cfg.last_ready_release, cfg.last_ready_release));
@@ -410,6 +416,7 @@ function readAppConfigFromUI() {
     local_path: el.setupLocal.value.trim(),
     remote_path: el.setupRemote.value.trim(),
     startup_service_name: el.setupService.value.trim(),
+    offline_bundle_path: el.offlineBundle?.value.trim() || "",
     preview_camera_index: normalizedCam,
     runtime_config_path: el.runtimePath.value.trim(),
     tag_map_path: tagMapPath,
@@ -1363,6 +1370,19 @@ async function init() {
       await window.vortexApi.releaseStatus({ ...readAppConfigFromUI(), last_ready_release: el.readyRelease.value });
     } catch (error) { appendLog(`Release status failed: ${error.message}`); }
   });
+  el.browseOfflineBundle?.addEventListener("click", async () => {
+    const file=await window.vortexApi.chooseFile({filters:[{name:"Offline bundle",extensions:["gz"]}]});
+    if(file) el.offlineBundle.value=file;
+  });
+  for (const [button,action] of [[el.previewCleanup,"cleanup-preview"],[el.applyCleanup,"cleanup"],[el.validateDevice,"validate"]]) {
+    button?.addEventListener("click",async()=>{
+      button.disabled=true;
+      appendLog(action==="validate" ? "Checking cameras and previews for 150 seconds..." : "Checking release retention...");
+      try { const result=await window.vortexApi.maintenance(readAppConfigFromUI(),action);appendLog(JSON.stringify(result,null,2)); }
+      catch(error){appendLog(`Maintenance failed: ${error.message}`);}
+      finally{button.disabled=false;}
+    });
+  }
   window.vortexApi.onReleaseState((overview) => {
     if (overview.ready?.length) {
       const existing = el.readyRelease.value;

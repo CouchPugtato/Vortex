@@ -25,11 +25,13 @@
             <input id="setupRemote" placeholder="/home/vortex/deployments" />
             <label for="setupService">Startup service</label>
             <input id="setupService" placeholder="vortex-vision.service" />
+            <label for="offlineBundle">Offline initialization bundle (optional)</label>
+            <div class="row"><input id="offlineBundle" placeholder="offline.tar.gz; leave blank for online setup" /><button id="browseOfflineBundle">Browse</button></div>
             <label for="administratorPassword">Administrator password (sudo)</label>
             <input id="administratorPassword" type="password" autocomplete="off" placeholder="Leave empty for passwordless sudo" />
             <div class="row"><button id="initializeJetson" class="accent">Initialize Jetson</button></div>
-            <div class="hint">Use the sudo password for this Jetson account. Setup downloads dependencies,
-              builds and verifies a release, and prepares startup. The Jetson needs internet access,
+            <div class="hint">Use the sudo password for this Jetson account. Setup installs dependencies,
+              builds and verifies a release, and prepares startup. Internet is required unless a matching offline bundle is selected. The Jetson needs
               an installed Ubuntu/JetPack image, and SSH enabled. Passwords are not saved.
               Select Activate afterward to start the prepared release. Existing deployments can use
               this flow to update managed-service setup.</div>
@@ -143,6 +145,10 @@
             <button id="refreshReleases">Refresh Releases</button>
           </div>
           <div id="releaseState" class="hint">No release selected.</div>
+          <details><summary>Deployment maintenance</summary>
+            <div class="row wrap"><button id="previewCleanup">Preview Cleanup</button><button id="applyCleanup">Clean Old Files</button><button id="validateDevice">Run Device Check</button></div>
+            <div class="hint">Cleanup keeps selected/rollback releases, pending work, the newest three releases, and files newer than 14 days. Device checks observe every camera and preview for 150 seconds; detach diagnostics first.</div>
+          </details>
           <div class="hint">Diagnostics attaches to the production service and previews its processed
             frames and detections. Detaching leaves vision running. Activate and Rollback
             restart the service and verify every configured camera.</div>
