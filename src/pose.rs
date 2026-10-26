@@ -1,4 +1,4 @@
-use nalgebra::{DMatrix, DVector, Matrix3, Point2, Rotation3, SymmetricEigen, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Point2, Rotation3, SymmetricEigen, Vector2, Vector3};
 
 use crate::config::CameraConfig;
 
@@ -796,7 +796,7 @@ fn project_point(
     Some((camera.fx * x + camera.cx, camera.fy * y + camera.cy))
 }
 
-fn distort_normalized_point(p: (f64, f64), camera: &CameraConfig) -> (f64, f64) {
+pub(crate) fn distort_normalized_point(p: (f64, f64), camera: &CameraConfig) -> (f64, f64) {
     let (x, y) = p;
     let r2 = x * x + y * y;
     let radial = 1.0 + camera.k1 * r2 + camera.k2 * r2 * r2 + camera.k3 * r2 * r2 * r2;
@@ -811,16 +811,44 @@ pub(crate) fn undistort_normalized_point(pixel: (f64, f64), camera: &CameraConfi
     let mut x = x_dist;
     let mut y = y_dist;
 
-    for _ in 0..8 {
+    // Damped Newton inversion remains accurate at the edge of wide-angle
+    // cameras, where a short fixed-point iteration can oscillate or stall.
+    for _ in 0..30 {
         let r2 = x * x + y * y;
         let radial = 1.0 + camera.k1 * r2 + camera.k2 * r2 * r2 + camera.k3 * r2 * r2 * r2;
-        if radial.abs() < 1e-9 {
+        let (u, v) = distort_normalized_point((x, y), camera);
+        let error = Vector2::new(u - x_dist, v - y_dist);
+        if error.norm_squared() < 1e-24 {
             break;
         }
-        let x_tan = 2.0 * camera.p1 * x * y + camera.p2 * (r2 + 2.0 * x * x);
-        let y_tan = camera.p1 * (r2 + 2.0 * y * y) + 2.0 * camera.p2 * x * y;
-        x = (x_dist - x_tan) / radial;
-        y = (y_dist - y_tan) / radial;
+        let slope = camera.k1 + 2. * camera.k2 * r2 + 3. * camera.k3 * r2 * r2;
+        let a = radial + 2. * x * x * slope + 2. * camera.p1 * y + 6. * camera.p2 * x;
+        let b = 2. * x * y * slope + 2. * camera.p1 * x + 2. * camera.p2 * y;
+        let d = radial + 2. * y * y * slope + 6. * camera.p1 * y + 2. * camera.p2 * x;
+        let determinant = a * d - b * b;
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            break;
+        }
+        let step = Vector2::new(
+            (d * error.x - b * error.y) / determinant,
+            (a * error.y - b * error.x) / determinant,
+        );
+        let mut scale = 1.;
+        let mut improved = false;
+        for _ in 0..12 {
+            let next = (x - scale * step.x, y - scale * step.y);
+            let projected = distort_normalized_point(next, camera);
+            let cost = (projected.0 - x_dist).powi(2) + (projected.1 - y_dist).powi(2);
+            if cost.is_finite() && cost < error.norm_squared() {
+                (x, y) = next;
+                improved = true;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if !improved {
+            break;
+        }
     }
 
     (x, y)
@@ -901,6 +929,39 @@ fn select_best_pose_estimate<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strong_distortion_roundtrips_wide_angle_edge_rays() {
+        for (k1, k2, k3) in [
+            (-0.3, 0.08, -0.005),
+            (0.35, 0.04, 0.01),
+            (0.00055, -0.0255, 0.0044),
+        ] {
+            let mut camera = camera();
+            camera.k1 = k1;
+            camera.k2 = k2;
+            camera.k3 = k3;
+            camera.p1 = 0.003;
+            camera.p2 = -0.002;
+            for ix in -7..=7 {
+                for iy in -4..=4 {
+                    let point = (ix as f64 * 0.18, iy as f64 * 0.18);
+                    let distorted = distort_normalized_point(point, &camera);
+                    let recovered = undistort_normalized_point(
+                        (
+                            distorted.0 * camera.fx + camera.cx,
+                            distorted.1 * camera.fy + camera.cy,
+                        ),
+                        &camera,
+                    );
+                    assert!(
+                        (recovered.0 - point.0).hypot(recovered.1 - point.1) < 1e-8,
+                        "{point:?} -> {recovered:?}, k1={k1}"
+                    );
+                }
+            }
+        }
+    }
 
     fn camera() -> CameraConfig {
         CameraConfig {

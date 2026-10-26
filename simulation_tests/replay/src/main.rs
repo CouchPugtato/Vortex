@@ -130,8 +130,14 @@ fn evaluate_frame(
     let tags: HashMap<_, _> = manifest.tags.iter().map(|t| (t.id, t)).collect();
     let map_from_solver = Matrix3::new(0., 0., -1., 1., 0., 0., 0., -1., 0.);
     let start = Instant::now();
-    let detections = detector.detect(img.as_raw(), img.width() as usize, img.height() as usize)?;
+    let detections = detector.detect_calibrated(
+        img.as_raw(),
+        img.width() as usize,
+        img.height() as usize,
+        &manifest.camera,
+    )?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.;
+    let tag_pose_started = Instant::now();
     let mut results = Vec::new();
     let mut found = Vec::new();
     let mut valid = Vec::new();
@@ -225,6 +231,8 @@ fn evaluate_frame(
         .iter()
         .filter(|id| !valid.contains(id))
         .collect();
+    let tag_pose_ms = tag_pose_started.elapsed().as_secs_f64() * 1000.;
+    let joint_started = Instant::now();
     let raw_joint = if let Some(mount) = &manifest.robot_mount {
         let candidates = pose::planar_pose_candidates(
             &field_points,
@@ -256,6 +264,7 @@ fn evaluate_frame(
     } else {
         None
     };
+    let joint_ms = joint_started.elapsed().as_secs_f64() * 1000.;
     let joint = raw_joint
         .as_ref()
         .filter(|p| p.reprojection_rmse_px <= 2.)
@@ -297,6 +306,8 @@ fn evaluate_frame(
             "planar_rejected": planar_rejected,
             "detection_quality": detection_quality,
             "pose_candidates": pose_candidate_diagnostics,
+            "timing_ms": {"detection": elapsed_ms, "tag_pose": tag_pose_ms,
+                          "joint_pose": joint_ms, "total": start.elapsed().as_secs_f64()*1000.},
             "missing_or_invalid_ids": missing, "detection_ms": elapsed_ms, "poses": results,
             "localization_ms": start.elapsed().as_secs_f64()*1000.0-elapsed_ms,
             "unexpected_ids": found.iter().filter(|id| frame.allowed_ids.as_ref()

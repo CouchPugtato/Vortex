@@ -73,6 +73,31 @@ queue limits. They preserve the displayed pixels and frame-time metadata, includ
 routine context, and use `trigger: manual`. Review these cases before promotion;
 without an automatically measured failure they appear under `manual_review`.
 
+## Mixed range and lens distortion checks
+
+`test_mixed_tag_views.py` runs 30 synthetic native views with four nearby tags
+and one distant tag: 4–10 m range, central and oblique edge views, and ideal,
+barrel and pincushion lenses. Fixtures render through the actual distortion
+remap. Tests check nearby-tag recall, required far-tag recall and unconstrained
+camera position; distorted noise must not invent IDs. Results, including far-tag
+misses outside the required envelope, are saved to
+`chassis_sim/generated/mixed_tag_views.json`. The oblique barrel case at 8 m and
+oblique cases at 10 m remain deliberately difficult observations, not guaranteed
+decodes. `VORTEX_TEST_REPLAY` can select an alternate compiled native executable.
+
+CPU detection unions raw decoding with a cached rectified view. Recovered corners
+are mapped back to original distorted pixels; pose fitting and saved camera
+inputs keep the original calibration. Small dark regions receive bounded 4×
+recovery even when several large tags have already decoded. Recovery is limited
+to 24 regions and 1080p inputs. Very small, clipped, occluded or low-contrast tags
+still cannot be guaranteed to decode.
+
+Joint image fitting limits samples per tag, avoids effectively identical starts,
+reuses unaffected Jacobian blocks, and stops converged iterations. Physically
+distinct pose starts and original reprojection/front-side checks remain active.
+Native replay reports `timing_ms` for detection, per-tag posing and joint posing;
+use these to distinguish stale display estimates from missed detections.
+
 ## Triage saved failures
 
 ```text

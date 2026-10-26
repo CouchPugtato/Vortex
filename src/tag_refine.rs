@@ -32,6 +32,15 @@ impl std::fmt::Debug for TagPatch {
 }
 
 impl TagPatch {
+    pub(crate) fn on_image(
+        &self,
+        data: &[u8],
+        width: usize,
+        height: usize,
+        corners: [[f64; 2]; 4],
+    ) -> Option<Self> {
+        Self::with_pattern(data, width, height, corners, Some(&self.bits))
+    }
     pub fn new(data: &[u8], width: usize, height: usize, corners: [[f64; 2]; 4]) -> Option<Self> {
         Self::with_pattern(data, width, height, corners, None)
     }
@@ -542,8 +551,18 @@ fn refine_field_pose(
     let models: Vec<_> = patches
         .iter()
         .map(|(patch, transform)| {
-            let rays: Vec<_> = patch
-                .samples
+            // Bound joint-fit work per tag, preserving coverage over the entire
+            // patch. Stratified offsets avoid repeatedly sampling the same code
+            // columns when the patch width and sampling interval line up.
+            let count = patch.samples.len().min(512);
+            let samples: Vec<_> = (0..count)
+                .map(|i| {
+                    let begin = i * patch.samples.len() / count;
+                    let end = (i + 1) * patch.samples.len() / count;
+                    patch.samples[begin + (i * 37 % (end - begin))]
+                })
+                .collect();
+            let rays: Vec<_> = samples
                 .iter()
                 .map(|p| {
                     let (u, v) = pose::undistort_normalized_point(
@@ -556,8 +575,7 @@ fn refine_field_pose(
                     Vector3::new(u, v, 1.)
                 })
                 .collect();
-            let observed: Vec<_> = patch
-                .samples
+            let observed: Vec<_> = samples
                 .iter()
                 .map(|p| {
                     (patch.image.get_pixel(p[0] as u32, p[1] as u32)[0] as f64 - patch.black)
@@ -575,13 +593,24 @@ fn refine_field_pose(
             translation: Vector3::new(params[3], params[4], params[5]),
         },
     };
-    let residual = |params: &DVector<f64>| -> Option<DVector<f64>> {
+    let residual = |params: &DVector<f64>,
+                    changed_width: Option<(usize, &DVector<f64>)>|
+     -> Option<DVector<f64>> {
         if !params.iter().all(|v| v.is_finite()) {
             return None;
         }
         let camera_pose = field_pose(params);
-        let mut values = Vec::new();
+        let mut values = changed_width
+            .map(|(_, base)| base.as_slice().to_vec())
+            .unwrap_or_else(|| vec![0.; models.iter().map(|(_, _, rays, _)| rays.len()).sum()]);
+        let mut offset = 0;
         for (index, (patch, transform, rays, observed)) in models.iter().enumerate() {
+            // A tag's edge-spread parameter affects only that tag's residuals.
+            // Reuse every other block during numerical differentiation.
+            if changed_width.is_some_and(|(changed, _)| changed != index) {
+                offset += rays.len();
+                continue;
+            }
             let width = params[dimensions + index].exp();
             if !(0.01..=1.5).contains(&width) {
                 return None;
@@ -594,20 +623,32 @@ fn refine_field_pose(
             let inverse =
                 Matrix3::from_columns(&[r.column(0).into_owned(), r.column(1).into_owned(), t])
                     .try_inverse()?;
-            for (ray, observed) in rays.iter().zip(observed) {
+            for (sample, (ray, observed)) in rays.iter().zip(observed).enumerate() {
                 let local = inverse * ray;
                 if local.z <= 0. {
                     return None;
                 }
                 let u = (local.x / local.z / camera.tag_size_m + 0.5) * 8.;
                 let v = (local.y / local.z / camera.tag_size_m + 0.5) * 8.;
-                values.push(soft_cell_value(&patch.bits, u, v, width) - observed);
+                values[offset + sample] = soft_cell_value(&patch.bits, u, v, width) - observed;
             }
+            offset += rays.len();
         }
         Some(DVector::from_vec(values))
     };
     let mut best: Option<(f64, PoseEstimate)> = None;
+    let mut fitted: Vec<&Pose> = Vec::new();
     for candidate in candidates.iter().take(6) {
+        // Per-tag seeds often converge to essentially the same field pose.
+        // Keep physically distinct minima, not six repetitions of one fit.
+        let origin = -candidate.pose.rotation.transpose() * candidate.pose.translation;
+        if fitted.iter().any(|old| {
+            (origin + old.rotation.transpose() * old.translation).norm() < 0.03
+                && (candidate.pose.rotation - old.rotation).norm() < 0.02
+        }) {
+            continue;
+        }
+        fitted.push(&candidate.pose);
         let mut params = match mount {
             Some(mount) => {
                 let robot_rotation =
@@ -624,7 +665,7 @@ fn refine_field_pose(
             }
         };
         params = params.insert_rows(dimensions, models.len(), 0.4_f64.ln());
-        let Some(mut values) = residual(&params) else {
+        let Some(mut values) = residual(&params, None) else {
             continue;
         };
         let mut cost = values.norm_squared();
@@ -634,7 +675,12 @@ fn refine_field_pose(
             for j in 0..params.len() {
                 let mut shifted = params.clone();
                 shifted[j] += 1e-5;
-                if let Some(next) = residual(&shifted) {
+                let changed = if j >= dimensions {
+                    Some((j - dimensions, &values))
+                } else {
+                    None
+                };
+                if let Some(next) = residual(&shifted, changed) {
                     jacobian.set_column(j, &((next - &values) / 1e-5));
                 }
             }
@@ -650,17 +696,24 @@ fn refine_field_pose(
                 break;
             }
             let shifted = &params + delta;
-            if let Some(next) = residual(&shifted) {
+            if let Some(next) = residual(&shifted, None) {
                 let next_cost = next.norm_squared();
                 if next_cost < cost {
+                    let improvement = cost - next_cost;
                     params = shifted;
                     values = next;
                     cost = next_cost;
                     lambda = (lambda * 0.3).max(1e-8);
+                    if improvement < 1e-7 * cost.max(1e-12) {
+                        break;
+                    }
                     continue;
                 }
             }
             lambda = (lambda * 10.).min(1e10);
+            if lambda >= 1e8 {
+                break;
+            }
         }
         let score = cost / values.len() as f64;
         if score.sqrt() > 0.15 || !score.is_finite() {

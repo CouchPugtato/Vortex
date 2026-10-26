@@ -994,18 +994,24 @@ fn spawn_camera_pipeline(
                 width: usize,
                 height: usize,
                 processing_config: &ProcessingConfig,
+                camera_config: &CameraConfig,
             ) -> anyhow::Result<Vec<crate::detector::Detection>> {
                 match self {
                     DetectorWrapper::Cpu(d) => {
                         let scale = processing_config.resolution_scale_factor.clamp(0.1, 1.0);
                         if (scale - 1.0).abs() < f32::EPSILON {
-                            return d.detect(data, width, height);
+                            return d.detect_calibrated(data, width, height, camera_config);
                         }
 
                         let scaled_width = ((width as f32) * scale).round().max(1.0) as usize;
                         let scaled_height = ((height as f32) * scale).round().max(1.0) as usize;
                         let scaled = resize_gray_nearest(data, width, height, scaled_width, scaled_height);
-                        let mut out = d.detect(&scaled, scaled_width, scaled_height)?;
+                        let mut scaled_camera = camera_config.clone();
+                        scaled_camera.fx *= scale as f64;
+                        scaled_camera.fy *= scale as f64;
+                        scaled_camera.cx *= scale as f64;
+                        scaled_camera.cy *= scale as f64;
+                        let mut out = d.detect_calibrated(&scaled, scaled_width, scaled_height, &scaled_camera)?;
                         rescale_apriltag_detections(&mut out, 1.0 / scale as f64);
                         Ok(out)
                     }
@@ -1109,7 +1115,7 @@ fn spawn_camera_pipeline(
                 let mut joint_patches = Vec::new();
 
                 for detector in &mut detectors {
-                    let raw_dets = match detector.detect(&pixels, width, height, &processing_config) {
+                    let raw_dets = match detector.detect(&pixels, width, height, &processing_config, &camera_config) {
                         Ok(d) => d,
                         Err(e) => {
                             eprintln!("Detector {} failed on cam {}: {}", detector.name(), camera_index, e);

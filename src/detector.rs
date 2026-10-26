@@ -145,6 +145,12 @@ pub enum Detection {
 pub struct CpuDetector {
     inner: Detector,
     secondary: Detector,
+    rectification: Option<Rectification>,
+}
+
+struct Rectification {
+    key: (usize, usize, [f64; 9]),
+    pixels: Vec<[f32; 2]>,
 }
 
 impl CpuDetector {
@@ -154,6 +160,7 @@ impl CpuDetector {
         Ok(Self {
             inner: detector,
             secondary,
+            rectification: None,
         })
     }
 
@@ -169,8 +176,124 @@ impl CpuDetector {
             gray_data,
             width,
             height,
+            true,
         )
     }
+
+    /// Decode straight edges in an ideal view, then restore original distorted
+    /// pixel coordinates for pose fitting, patches, telemetry and calibration.
+    /// Union with raw decoding so rectification cannot remove existing tags.
+    pub fn detect_calibrated(
+        &mut self,
+        data: &[u8],
+        width: usize,
+        height: usize,
+        camera: &CameraConfig,
+    ) -> Result<Vec<Detection>> {
+        if [camera.k1, camera.k2, camera.k3, camera.p1, camera.p2]
+            .iter()
+            .all(|v| *v == 0.)
+        {
+            return self.detect(data, width, height);
+        }
+        let mut raw = detect_corners(
+            &mut self.inner,
+            &mut self.secondary,
+            data,
+            width,
+            height,
+            true,
+        )?;
+        let key = (
+            width,
+            height,
+            [
+                camera.fx, camera.fy, camera.cx, camera.cy, camera.k1, camera.k2, camera.k3,
+                camera.p1, camera.p2,
+            ],
+        );
+        if self.rectification.as_ref().map(|map| &map.key) != Some(&key) {
+            let pixels = (0..width * height)
+                .map(|i| {
+                    let p = distorted_pixel([(i % width) as f64, (i / width) as f64], camera);
+                    [p[0] as f32, p[1] as f32]
+                })
+                .collect();
+            self.rectification = Some(Rectification { key, pixels });
+        }
+        let rectified: Vec<u8> = self
+            .rectification
+            .as_ref()
+            .unwrap()
+            .pixels
+            .iter()
+            .map(|p| {
+                let x = p[0] as f64;
+                let y = p[1] as f64;
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || x < 0.
+                    || y < 0.
+                    || x >= (width - 1) as f64
+                    || y >= (height - 1) as f64
+                {
+                    return 255;
+                }
+                let ix = x as usize;
+                let iy = y as usize;
+                let dx = x - ix as f64;
+                let dy = y - iy as f64;
+                let a = data[iy * width + ix] as f64 * (1. - dx)
+                    + data[iy * width + ix + 1] as f64 * dx;
+                let b = data[(iy + 1) * width + ix] as f64 * (1. - dx)
+                    + data[(iy + 1) * width + ix + 1] as f64 * dx;
+                (a * (1. - dy) + b * dy).round().clamp(0., 255.) as u8
+            })
+            .collect();
+        let additions = detect_corners(
+            &mut self.inner,
+            &mut self.secondary,
+            &rectified,
+            width,
+            height,
+            true,
+        )?;
+        for addition in additions {
+            if let Detection::AprilTag(mut tag) = addition {
+                if raw
+                    .iter()
+                    .any(|d| matches!(d,Detection::AprilTag(old) if old.id==tag.id))
+                {
+                    continue;
+                }
+                tag.corners = tag.corners.map(|point| distorted_pixel(point, camera));
+                tag.center = distorted_pixel(tag.center, camera);
+                tag.image_patch = tag
+                    .image_patch
+                    .as_ref()
+                    .and_then(|patch| patch.on_image(data, width, height, tag.corners));
+                raw.push(Detection::AprilTag(tag));
+            }
+        }
+        let isolated = raw.len() == 1;
+        for d in &mut raw {
+            if let Detection::AprilTag(tag) = d {
+                tag.isolated = isolated;
+            }
+        }
+        Ok(raw)
+    }
+}
+
+fn distorted_pixel(point: [f64; 2], camera: &CameraConfig) -> [f64; 2] {
+    let (x, y) = pose::distort_normalized_point(
+        (
+            (point[0] - camera.cx) / camera.fx,
+            (point[1] - camera.cy) / camera.fy,
+        ),
+        camera,
+    );
+    [x * camera.fx + camera.cx, y * camera.fy + camera.cy]
 }
 
 fn build_inner_detector(nthreads: i32, decimate: f32) -> Result<Detector> {
@@ -204,6 +327,7 @@ fn detect_corners(
     gray_data: &[u8],
     width: usize,
     height: usize,
+    recover: bool,
 ) -> Result<Vec<Detection>> {
     anyhow::ensure!(
         width > 1 && height > 1 && width.checked_mul(height) == Some(gray_data.len()),
@@ -222,10 +346,12 @@ fn detect_corners(
         .into_iter()
         .filter(|det| det.decision_margin().is_finite() && det.decision_margin() >= 20.0)
         .collect();
-    // Interpolating a sparse small-tag frame improves quad extraction without
-    // pretending to add camera detail. Keep original detections and accept only
+    // Interpolation can recover small tags alongside large nearby tags too.
+    // Do not gate recovery on the count/size of tags already found: those do
+    // not describe the tags we missed. Bound allocation to 1080p-sized inputs.
+    // Keep original detections and accept only
     // independently decoded, higher-contrast additions at the original scale.
-    if detections.len() < 4
+    let sparse_small = detections.len() < 4
         && detections.iter().all(|det| {
             let c = det.corners();
             (0..4)
@@ -233,16 +359,11 @@ fn detect_corners(
                 .sum::<f64>()
                 / 4.
                 < 24.
-        })
-    {
+        });
+    if recover && width * height <= 1920 * 1080 && sparse_small {
         let source =
             image::GrayImage::from_raw(width as u32, height as u32, gray_data.to_vec()).unwrap();
-        let enlarged = image::imageops::resize(
-            &source,
-            width as u32 * 2,
-            height as u32 * 2,
-            image::imageops::FilterType::CatmullRom,
-        );
+        let enlarged = enlarge_for_recovery(&source);
         let mut recovery = unsafe { AprilImage::new_uinit(width * 2, height * 2)? };
         let stride = recovery.stride();
         let data = recovery.as_mut();
@@ -275,6 +396,65 @@ fn detect_corners(
                 }
             }
             detections.push(restored);
+        }
+    }
+    // In mixed-size scenes, magnify only small dark connected components.
+    // A second full-frame 2x pass costs too much and nearby decoded tags must
+    // not disable recovery of distant ones. Work is bounded to 24 small ROIs.
+    if recover && !sparse_small && width * height <= 1920 * 1080 {
+        for (x, y, w, h) in small_regions(gray_data, width, height).into_iter().take(24) {
+            if detections.iter().any(|d| {
+                let c = d.center();
+                c[0] >= x as f64
+                    && c[0] < (x + w) as f64
+                    && c[1] >= y as f64
+                    && c[1] < (y + h) as f64
+            }) {
+                continue;
+            }
+            let mut source = image::GrayImage::new(w as u32, h as u32);
+            for row in 0..h {
+                source.as_mut()[row * w..(row + 1) * w]
+                    .copy_from_slice(&gray_data[(y + row) * width + x..(y + row) * width + x + w]);
+            }
+            let enlarged = enlarge_for_recovery(&enlarge_for_recovery(&source));
+            let mut recovery = unsafe { AprilImage::new_uinit(w * 4, h * 4)? };
+            let stride = recovery.stride();
+            let data = recovery.as_mut();
+            data.fill(255);
+            for row in 0..h * 4 {
+                data[row * stride..row * stride + w * 4]
+                    .copy_from_slice(&enlarged.as_raw()[row * w * 4..(row + 1) * w * 4]);
+            }
+            for extra in detector.detect(&recovery) {
+                if !extra.decision_margin().is_finite()
+                    || extra.decision_margin() < 40.
+                    || extra.hamming() > 1
+                    || detections.iter().any(|d| d.id() == extra.id())
+                {
+                    continue;
+                }
+                let pointer = extra.into_raw();
+                let restored = unsafe { AprilRawDetection::from_raw(pointer.as_ptr()) };
+                unsafe {
+                    let d = &mut *pointer.as_ptr();
+                    for p in &mut d.p {
+                        p[0] = p[0] * 0.25 + x as f64;
+                        p[1] = p[1] * 0.25 + y as f64;
+                    }
+                    d.c[0] = d.c[0] * 0.25 + x as f64;
+                    d.c[1] = d.c[1] * 0.25 + y as f64;
+                    let matrix = &mut *d.H;
+                    for i in 0..3 {
+                        let last = *matrix.data.as_ptr().add(6 + i);
+                        *matrix.data.as_mut_ptr().add(i) =
+                            *matrix.data.as_ptr().add(i) * 0.25 + x as f64 * last;
+                        *matrix.data.as_mut_ptr().add(3 + i) =
+                            *matrix.data.as_ptr().add(3 + i) * 0.25 + y as f64 * last;
+                    }
+                }
+                detections.push(restored);
+            }
         }
     }
     // Multiple tags constrain the pose geometrically; reserve image alignment
@@ -351,6 +531,98 @@ fn detect_corners(
     }
 
     Ok(results)
+}
+
+// A fixed 2x separable Catmull-Rom filter avoids the general resizer's costly
+// per-pixel kernel setup. Preserve signed intermediate values until both passes.
+fn small_regions(data: &[u8], width: usize, height: usize) -> Vec<(usize, usize, usize, usize)> {
+    let mut seen = vec![false; data.len()];
+    let mut stack = Vec::new();
+    let mut regions = Vec::new();
+    for start in 0..data.len() {
+        if seen[start] || data[start] > 95 {
+            continue;
+        }
+        seen[start] = true;
+        stack.push(start);
+        let (mut x0, mut x1, mut y0, mut y1) =
+            (start % width, start % width, start / width, start / width);
+        let mut count = 0;
+        while let Some(index) = stack.pop() {
+            let x = index % width;
+            let y = index / width;
+            count += 1;
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+            for next in [
+                if x > 0 { Some(index - 1) } else { None },
+                if x + 1 < width { Some(index + 1) } else { None },
+                if y > 0 { Some(index - width) } else { None },
+                if y + 1 < height {
+                    Some(index + width)
+                } else {
+                    None
+                },
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !seen[next] && data[next] <= 95 {
+                    seen[next] = true;
+                    stack.push(next);
+                }
+            }
+        }
+        let w = x1 - x0 + 1;
+        let h = y1 - y0 + 1;
+        if count < 16 || !(6..=40).contains(&w) || !(6..=40).contains(&h) || w > h * 4 || h > w * 4
+        {
+            continue;
+        }
+        let left = x0.saturating_sub(5);
+        let top = y0.saturating_sub(5);
+        let right = (x1 + 6).min(width);
+        let bottom = (y1 + 6).min(height);
+        regions.push((left, top, right - left, bottom - top));
+    }
+    regions.sort_by_key(|r| std::cmp::Reverse(r.2 * r.3));
+    regions
+}
+
+fn enlarge_for_recovery(source: &image::GrayImage) -> image::GrayImage {
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+    let mut horizontal = vec![0_i32; width * 2 * height];
+    let taps = |index: usize| -> (isize, [i32; 4]) {
+        if index % 2 == 0 {
+            (index as isize / 2 - 1, [-3, 29, 111, -9])
+        } else {
+            (index as isize / 2, [-9, 111, 29, -3])
+        }
+    };
+    for y in 0..height {
+        for x in 0..width * 2 {
+            let (base, weights) = taps(x);
+            horizontal[y * width * 2 + x] = (0..4)
+                .map(|i| {
+                    let sx = (base + i as isize - 1).clamp(0, width as isize - 1) as usize;
+                    source.as_raw()[y * width + sx] as i32 * weights[i]
+                })
+                .sum();
+        }
+    }
+    image::GrayImage::from_fn(width as u32 * 2, height as u32 * 2, |x, y| {
+        let (base, weights) = taps(y as usize);
+        let value: i32 = (0..4)
+            .map(|i| {
+                let sy = (base + i as isize - 1).clamp(0, height as isize - 1) as usize;
+                horizontal[sy * width * 2 + x as usize] * weights[i]
+            })
+            .sum();
+        image::Luma([((value + 8192) / 16384).clamp(0, 255) as u8])
+    })
 }
 
 fn decoded_pattern(det: AprilRawDetection) -> (AprilRawDetection, Option<Vec<bool>>) {
@@ -513,6 +785,43 @@ fn solver_corners(corners: [[f64; 2]; 4]) -> [(f64, f64); 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_filter_preserves_interpolated_signal() {
+        let source = image::GrayImage::from_fn(23, 17, |x, y| {
+            image::Luma([((x * 37 + y * 73) % 256) as u8])
+        });
+        let actual = enlarge_for_recovery(&source);
+        let expected =
+            image::imageops::resize(&source, 46, 34, image::imageops::FilterType::CatmullRom);
+        for y in 4..30 {
+            for x in 4..42 {
+                assert!(
+                    (actual.get_pixel(x, y)[0] as i32 - expected.get_pixel(x, y)[0] as i32).abs()
+                        <= 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_regions_ignore_large_dark_background_and_keep_small_borders() {
+        let mut frame = image::GrayImage::from_pixel(120, 100, image::Luma([180]));
+        for y in 0..100 {
+            for x in 0..50 {
+                frame.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+        for y in 25..40 {
+            for x in 70..85 {
+                if x == 70 || x == 84 || y == 25 || y == 39 {
+                    frame.put_pixel(x, y, image::Luma([0]));
+                }
+            }
+        }
+        let regions = small_regions(frame.as_raw(), 120, 100);
+        assert_eq!(regions, vec![(65, 20, 25, 25)]);
+    }
 
     #[test]
     fn border_corners_use_integer_pixel_centers() {
