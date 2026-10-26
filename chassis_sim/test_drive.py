@@ -14,6 +14,7 @@ import numpy as np
 from wpimath.geometry import Pose3d
 from drive import camera_pose, robot_pose, ground_background, step, Telemetry, StreamReplay, HERE
 from generate import camera_pose as tag_camera_pose, render_fast, tag_geometry, tag_texture
+from chassis_geometry import transform
 
 
 class HarnessTests(unittest.TestCase):
@@ -100,6 +101,38 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(ghost.get()[0].X(), 3.2)
                 self.assertEqual(server.entries['PositionErrorM'].getDouble(-1), 0.)
                 self.assertEqual(server.entries['PredictionHorizonMs'].getDouble(-1), 100.)
+                # Full attitudes must reach the rendered structs, with separate
+                # Euler values for truth, raw vision and display prediction.
+                chassis = np.array([3., 2., .4, .3, .15, .25])
+                raw_pose = transform([3.1, 2., .5, .4, .2, .3])
+                display_pose = transform([3.2, 2., .6, .5, .25, .35])
+                deadline = time.monotonic()+2
+                while time.monotonic() < deadline:
+                    server.publish_actual(chassis, self.mount)
+                    server.publish_result((raw_pose, None, {'planar_localization': False,
+                                          'terrain': {'kind': 'ramp'}}, chassis, .1), display_raw=False)
+                    server.publish_display(display_pose, .1)
+                    if abs(actual.get().rotation().Y()+.25)<1e-9 and raw.get() and ghost.get() and abs(ghost.get()[0].rotation().Y()+.35)<1e-9:
+                        break
+                    time.sleep(.02)
+                for value, expected in ((actual.get(), transform(chassis)),
+                                        (raw.get()[0], raw_pose), (ghost.get()[0], display_pose)):
+                    np.testing.assert_allclose(value.rotation().toMatrix(), expected[1], atol=1e-12)
+                    np.testing.assert_allclose([value.X(), value.Y(), value.Z()], expected[0])
+                for kind, angles in (('Actual', (.15, -.25, .4)), ('RawVision', (.2, -.3, .5)),
+                                     ('Ghost', (.25, -.35, .6))):
+                    entries = server.rotation_entries[kind]
+                    self.assertTrue(entries['Valid'].getBoolean(False))
+                    for key, radians in zip(('RollDeg', 'PitchDeg', 'YawDeg'), angles):
+                        self.assertAlmostEqual(entries[key].getDouble(float('nan')), math.degrees(radians))
+                self.assertEqual(server.entries['LocalizationModel'].getString(''), 'free')
+                self.assertEqual(server.entries['Terrain'].getString(''), 'ramp')
+                server.clear_vision()
+                server.publish_display(None, 0.)
+                for kind in ('RawVision', 'Ghost'):
+                    self.assertFalse(server.rotation_entries[kind]['Valid'].getBoolean(True))
+                    self.assertTrue(math.isnan(server.rotation_entries[kind]['PitchDeg'].getDouble(0.)))
+                self.assertTrue(server.rotation_entries['Actual']['Valid'].getBoolean(False))
                 server.publish_result((None, None, {}, np.array([3, 2, 0]), .1))
                 deadline = time.monotonic() + 2
                 while ghost.get() and time.monotonic() < deadline:

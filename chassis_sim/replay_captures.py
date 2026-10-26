@@ -54,7 +54,8 @@ def replay_cases(root, executable, include_experiments=False, baseline=None, out
                 continue
             manifest = json.loads((case/'manifest.json').read_text(encoding='utf-8'))
             manifest['frames'] = []
-            if planar and capture.get('context', {}).get('renderer') in ('field', 'fast') and capture.get('context',{}).get('planar_localization',True):
+            planar_record=capture['frame'].get('result',{}).get('planar_localization',capture.get('context',{}).get('planar_localization',True))
+            if planar and capture.get('context', {}).get('renderer') in ('field', 'fast') and planar_record:
                 manifest['robot_mount'] = capture['frame']['assumed_mount']
             else:
                 manifest.pop('robot_mount',None)

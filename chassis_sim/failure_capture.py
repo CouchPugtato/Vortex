@@ -13,12 +13,14 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+from chassis_geometry import errors as chassis_errors
 
 
 @dataclass
 class CapturePolicy:
     position_m: float = .20
     heading_deg: float = 5.
+    tilt_deg: float = 5.
     confirm_frames: int = 2
     recovery_frames: int = 2
     cooldown_s: float = 5.
@@ -29,7 +31,7 @@ class CapturePolicy:
     max_replacements: int = 2
 
     def __post_init__(self):
-        for name in ('position_m', 'heading_deg', 'movement_m', 'turn_deg'):
+        for name in ('position_m', 'heading_deg', 'tilt_deg', 'movement_m', 'turn_deg'):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive and finite')
         if not math.isfinite(self.cooldown_s) or self.cooldown_s < 0:
@@ -66,7 +68,7 @@ def classify(ghost, chassis, report, visibility, known_ids, policy):
     unexpected = sorted(detected-set(allowed)) if visibility is not None else sorted(detected-set(known_ids))
     if unexpected:
         reasons.append('unexpected_tag')
-    position_error = heading_error = None
+    position_error = heading_error = tilt_error = height_error = None
     if ghost is None:
         if expected:
             reasons.append('missing_pose_with_visible_tags')
@@ -77,23 +79,29 @@ def classify(ghost, chassis, report, visibility, known_ids, policy):
                 or abs(np.linalg.det(rotation)-1) > 1e-3):
             reasons.append('nonfinite_or_invalid_pose')
         else:
-            position_error = float(np.linalg.norm(position-[chassis[0], chassis[1], 0]))
+            metrics=chassis_errors(ghost,chassis)
+            position_error,tilt_error,height_error=metrics['position_m'],metrics['tilt_deg'],metrics['height_m']
             angle = math.atan2(rotation[1, 0], rotation[0, 0])-chassis[2]
             heading_error = abs(math.degrees(math.atan2(math.sin(angle), math.cos(angle))))
             if position_error > policy.position_m:
                 reasons.append('position_error')
             if heading_error > policy.heading_deg:
                 reasons.append('heading_error')
+            if len(chassis)>=6 and tilt_error > policy.tilt_deg:
+                reasons.append('tilt_error')
     severity = max(position_error/policy.position_m if position_error is not None else 0,
                    heading_error/policy.heading_deg if heading_error is not None else 0,
-                   10 if any(r not in ('position_error', 'heading_error') for r in reasons) else 0)
+                   tilt_error/policy.tilt_deg if tilt_error is not None and len(chassis)>=6 else 0,
+                   10 if any(r not in ('position_error', 'heading_error', 'tilt_error') for r in reasons) else 0)
     return dict(reasons=reasons, position_error_m=position_error, heading_error_deg=heading_error,
+                tilt_error_deg=tilt_error,height_error_m=height_error,
                 severity=severity, expected_ids=expected, allowed_ids=allowed, unexpected_ids=unexpected)
 
 
 def fingerprint(record, result, context):
     signature = hashlib.sha256(json.dumps(json_safe(dict(camera=context['camera'], tags=context['tags'],
-        asset=context.get('asset'), actual=record['actual_mount'], assumed=record['assumed_mount'])),
+        asset=context.get('asset'), actual=record['actual_mount'], assumed=record['assumed_mount'],
+        terrain=record['report'].get('terrain'), planar=record['report'].get('planar_localization'))),
         sort_keys=True).encode()).hexdigest()
     thumbnail = cv2.resize(record['gray'], (32, 32), interpolation=cv2.INTER_AREA)
     return dict(signature=signature, chassis=list(map(float, record['chassis'])),
@@ -105,6 +113,9 @@ def same_scene(a, b, policy):
     if a['signature'] != b['signature']:
         return False
     p, q = a['chassis'], b['chassis']
+    if len(p)>=6 and len(q)>=6 and (abs(p[3]-q[3]) >= policy.movement_m or
+        max(abs(p[4]-q[4]),abs(p[5]-q[5])) >= math.radians(policy.turn_deg)):
+        return False
     turn = abs(math.degrees(math.atan2(math.sin(p[2]-q[2]), math.cos(p[2]-q[2]))))
     return np.linalg.norm(np.asarray(p[:2])-q[:2]) < policy.movement_m and turn < policy.turn_deg
 
@@ -271,6 +282,7 @@ class FailureCapture:
                     chassis_pose=record['chassis'], camera_position=record['camera_position'],
                     camera_rotation=record['camera_rotation'], actual_mount=record['actual_mount'],
                     assumed_mount=record['assumed_mount'], predicted_robot_pose=record['ghost'],
+                    terrain=record['report'].get('terrain'),
                     visibility=record['visibility'], result=record['report'])
 
     def _writer(self):

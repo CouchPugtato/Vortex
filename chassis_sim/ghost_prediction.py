@@ -3,6 +3,7 @@ from collections import deque
 import math
 
 import numpy as np
+from chassis_geometry import valid_pose
 
 
 class GhostPredictor:
@@ -22,7 +23,7 @@ class GhostPredictor:
             self.commands.popleft()
 
     def observe(self, raw, captured_at):
-        self.raw = None if raw is None else tuple(np.array(v, dtype=float, copy=True) for v in raw)
+        self.raw = tuple(np.array(v,dtype=float,copy=True) for v in raw) if valid_pose(raw) else None
         self.captured_at = captured_at
 
     def predict(self, now):
@@ -41,10 +42,19 @@ class GhostPredictor:
                 return None
             dt = min(end, now)-max(start, covered)
             yaw = math.atan2(rotation[1, 0], rotation[0, 0])
-            c, s = math.cos(yaw), math.sin(yaw)
-            # Match the simulator's per-tick Euler motion, without truth bounds.
-            position[:2] += [dt*(c*forward-s*left), dt*(s*forward+c*left)]
-            c, s = math.cos(turn*dt), math.sin(turn*dt)
-            rotation = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]) @ rotation
+            # Project drive commands through the estimated attitude, including
+            # vertical travel. Assume the last estimated surface normal stays
+            # fixed; no simulator terrain or actual attitude enters prediction.
+            position += rotation @ np.array([forward,left,0.])*dt
+            normal=rotation[:,2]
+            if abs(normal[2])>1e-6:
+                yaw+=turn*dt
+                f=np.array([math.cos(yaw),math.sin(yaw),0.])
+                f[2]=-(normal[:2]@f[:2])/normal[2]
+                f/=np.linalg.norm(f)
+                rotation=np.column_stack((f,np.cross(normal,f),normal))
+            else:
+                c,s=math.cos(turn*dt),math.sin(turn*dt)
+                rotation=np.array([[c,-s,0],[s,c,0],[0,0,1]])@rotation
             covered = min(end, now)
         return (position, rotation) if covered >= now-1e-8 else None

@@ -17,6 +17,38 @@ from setup_advantagescope import configure
 
 
 class FieldMathTests(unittest.TestCase):
+    def test_contact_surfaces_align_with_all_four_cad_bumps(self):
+        try:
+            folder=find_field_asset()
+        except FileNotFoundError as error:
+            self.skipTest(str(error))
+        import trimesh
+        from terrain import FIELD_BUMPS, Terrain
+        scene=trimesh.load_scene(folder/'model.glb',process=False)
+        transform=asset_transform(json.loads((folder/'config.json').read_text(encoding='utf-8')))
+        terrain=Terrain('field',bump_smoothing=0.)
+        panels={b.name:0 for b in FIELD_BUMPS}
+        for node in scene.graph.nodes_geometry:
+            node_transform,geometry=scene.graph[node]
+            if 'bump plastic' not in (str(node)+' '+str(geometry)).lower():continue
+            mesh=scene.geometry[geometry]
+            world=transform@node_transform
+            vertices=mesh.vertices@world[:3,:3].T+world[:3,3]
+            center=vertices.mean(axis=0)
+            bump=next(b for b in FIELD_BUMPS if b.contains(*center[:2]))
+            panels[bump.name]+=1
+            # Sample the largest upward face, avoiding holes and thickness edges.
+            triangles=vertices[mesh.faces]
+            normals=np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0])
+            areas=np.linalg.norm(normals,axis=1)
+            eligible=np.flatnonzero(normals[:,2]/areas>.9)
+            triangle=triangles[eligible[np.argmax(areas[eligible])]]
+            point=triangle.mean(axis=0)
+            self.assertAlmostEqual(terrain.surface(*point[:2]),point[2],delta=.002)
+            color=mesh.visual.material.baseColorFactor
+            self.assertGreater(color[2] if bump.name.startswith('blue') else color[0],200)
+        self.assertEqual(panels,{b.name:2 for b in FIELD_BUMPS})
+
     def test_camera_layout_setup_is_repeatable_and_preserves_field_tab(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'state-26_0_2.json'
@@ -130,6 +162,22 @@ class FieldOcclusionTests(unittest.TestCase):
                 self.assertEqual(outcome['passed'], 1)
             finally:
                 replay.close()
+
+    def test_added_ramp_is_visible_geometry_and_blocks_tag_visibility(self):
+        from terrain import Terrain
+        mount=json.loads((HERE/'demo_mounts.json').read_text())['actual']
+        tag=next(t for t in self.tags if t['id']==18)
+        base=np.array([tag['position'][0],tag['position'][1]-1.5,np.pi/2])
+        eye,rotation=camera_pose(base,mount)
+        image,labels=self.scene.render(eye,rotation,with_visibility=True)
+        self.assertTrue(next(t for t in labels if t['id']==18)['clearly_visible'])
+        terrain=Terrain('ramp',anchor_x=base[0],anchor_y=base[1],heading=base[2]+np.pi,
+                        height=2,length=.3,width=2)
+        blocked,labels=self.scene.render(eye,rotation,with_visibility=True,terrain_vertices=terrain.mesh())
+        self.assertFalse(next(t for t in labels if t['id']==18)['clearly_visible'])
+        self.assertFalse(np.array_equal(image,blocked))
+        _,labels=self.scene.render(eye,rotation,with_visibility=True)
+        self.assertTrue(next(t for t in labels if t['id']==18)['clearly_visible'])
 
 
 if __name__ == '__main__':

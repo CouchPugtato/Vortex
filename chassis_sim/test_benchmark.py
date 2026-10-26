@@ -210,7 +210,7 @@ class NativeBenchmarkTests(unittest.TestCase):
             self.skipTest('Build native replay before running route integration')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            args = build_parser().parse_args(['--renderer', 'fast', '--no-capture', '--replay-executable', str(executable)])
+            args = build_parser().parse_args(['--renderer', 'fast', '--terrain', 'flat', '--planar-pose', '--no-capture', '--replay-executable', str(executable)])
             args.max_error_meters = .2
             harness = Harness(args)
             try:

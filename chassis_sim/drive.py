@@ -14,6 +14,7 @@ import sys
 import time
 import threading
 import hashlib
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -25,6 +26,8 @@ from run import replay_command
 from ghost_prediction import GhostPredictor
 from camera_effects import CameraEffects, PROFILES, Sensor
 from dataclasses import asdict
+from chassis_geometry import transform as chassis_transform, errors as chassis_errors, valid_pose
+from terrain import TERRAINS, RAMP_HEIGHT, RAMP_LENGTH, RAMP_WIDTH, terrain_name, from_args as terrain_from_args
 
 MOUNT_KEYS = ("x_offset", "y_offset", "z_offset", "roll_deg", "pitch_deg", "yaw_deg")
 
@@ -59,8 +62,8 @@ def chassis_rotation(yaw):
 
 
 def camera_pose(chassis, mount):
-    r = chassis_rotation(chassis[2])
-    return (np.array([*chassis[:2], 0.]) + r @ np.array([mount[k] for k in MOUNT_KEYS[:3]]),
+    p, r = chassis_transform(chassis)
+    return (p + r @ np.array([mount[k] for k in MOUNT_KEYS[:3]]),
             r @ mount_rotation(mount))
 
 
@@ -148,11 +151,12 @@ class StreamReplay:
 
 
 def step(chassis, forward, left, turn, dt, field):
-    delta = chassis_rotation(chassis[2]) @ np.array([forward, left, 0.]) * dt
-    return np.array([np.clip(chassis[0] + delta[0], 0.4, field["length"] - 0.4),
+    delta = chassis_transform(chassis)[1] @ np.array([forward, left, 0.]) * dt
+    result = np.array([np.clip(chassis[0] + delta[0], 0.4, field["length"] - 0.4),
                      np.clip(chassis[1] + delta[1], 0.4, field["width"] - 0.4),
                      math.atan2(math.sin(chassis[2] + turn * dt),
                                 math.cos(chassis[2] + turn * dt))])
+    return np.concatenate((result,np.asarray(chassis[3:6]))) if len(chassis)>=6 else result
 
 
 class Harness:
@@ -205,9 +209,10 @@ class Harness:
         yaw = math.atan2(-normal[1], -normal[0]) - math.atan2(forward[1], forward[0])
         eye = np.array(tag["position"]) + getattr(args, 'start_distance', 1.5) * normal
         origin = eye - chassis_rotation(yaw) @ np.array([self.actual[k] for k in MOUNT_KEYS[:3]])
-        self.initial = np.array([origin[0], origin[1], yaw])
+        self.spawn = np.array([origin[0], origin[1], yaw])
+        self.configure_terrain(getattr(args,'terrain','flat'))
         self.chassis = self.initial.copy()
-        self.root = HERE / "generated" / f"session_{time.time_ns()}"
+        self.root = HERE / "generated" / f"session_{time.time_ns()}_{uuid4().hex[:8]}"
         self.root.mkdir(parents=True)
         self.env = os.environ.copy()
         command = replay_command(args, self.root, self.env)
@@ -248,21 +253,32 @@ class Harness:
                 for name in ('src/detector.rs', 'src/pose.rs', 'src/tag_refine.rs', 'src/config.rs',
                              'simulation_tests/replay/src/main.rs', 'simulation_tests/replay/Cargo.lock',
                              'chassis_sim/drive.py', 'chassis_sim/field_renderer.py', 'chassis_sim/failure_capture.py',
-                             'chassis_sim/camera_effects.py', 'chassis_sim/routes.py')}
+                             'chassis_sim/camera_effects.py', 'chassis_sim/routes.py',
+                             'chassis_sim/chassis_geometry.py', 'chassis_sim/terrain.py')}
             asset = None if self.field_asset is None else dict(path=str(self.field_asset),
                 model_sha256=hashlib.sha256((self.field_asset/'model.glb').read_bytes()).hexdigest(),
                 config=json.loads((self.field_asset/'config.json').read_text(encoding='utf-8')))
             context = dict(camera=self.camera, tags=self.tags, field_map=raw_field, runtime_config=raw,
                            renderer='field' if self.field_renderer else 'fast', asset=asset,
                            code_revision=revision, source_sha256=source_hashes,
-                           camera_effects=asdict(self.sensor.settings), seed=getattr(args, 'seed', 509))
+                           camera_effects=asdict(self.sensor.settings), seed=getattr(args, 'seed', 509),
+                           terrain=self.terrain.describe())
             context['planar_localization'] = not getattr(args,'free_pose',False)
             policy = CapturePolicy(position_m=getattr(args, 'capture_position_m', .2),
                 heading_deg=getattr(args, 'capture_heading_deg', 5.),
+                tilt_deg=getattr(args,'capture_tilt_deg',5.),
                 cooldown_s=getattr(args, 'capture_cooldown', 5.), max_cases=getattr(args, 'capture_max_cases', 50),
                 max_bytes=int(getattr(args, 'capture_max_mb', 1024)*1024*1024))
             self.capture = FailureCapture(getattr(args, 'capture_dir', HERE/'generated/captures'), self.root.name, context, policy)
             print(f"Failure captures: {self.capture.session}", flush=True)
+
+    def configure_terrain(self, kind, spawn=None):
+        spawn=self.spawn if spawn is None else spawn
+        terrain = terrain_from_args(self.args,spawn,kind)
+        mesh = terrain.mesh()
+        self.terrain_configuration = (terrain,mesh)
+        self.terrain,self.terrain_mesh = terrain,mesh
+        self.initial = terrain.apply(spawn)
 
     def close(self):
         if self.capture is not None:
@@ -273,6 +289,7 @@ class Harness:
 
     def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True):
         started = time.perf_counter()
+        terrain,terrain_mesh = self.terrain_configuration
         expected_mount = None if getattr(self.args,'free_pose',False) else assumed
         if self.manifest['robot_mount'] != expected_mount:
             self.replay.close()
@@ -285,7 +302,8 @@ class Harness:
                  "camera_position": position.tolist(), "camera_rotation": rotation.tolist(),
                  "expected_ids": []}
         if self.field_renderer is not None:
-            image, visibility = self.field_renderer.render(position, rotation, with_visibility=True)
+            image, visibility = self.field_renderer.render(position, rotation, with_visibility=True,
+                                                           terrain_vertices=terrain_mesh)
         else:
             background = ground_background(position, rotation, self.floor_camera, self.floor_width,
                                            self.floor_height, self.field, self.rays)
@@ -311,6 +329,8 @@ class Harness:
         report["vortex_ms"] = (time.perf_counter()-rendered_at)*1000
         report['sensor'] = effects
         report['sensor_settings'] = asdict(self.sensor.settings)
+        report['terrain'] = terrain.describe()
+        report['planar_localization'] = self.manifest['robot_mount'] is not None
         report['visibility'] = visibility
         estimate = report["joint_pose"]
         if estimate is None and report["poses"]:
@@ -353,12 +373,16 @@ class Telemetry:
         self.entries = {name: self.instance.getEntry("/VortexSim/" + name) for name in
                         ("Valid", "PositionErrorM", "HeadingErrorDeg", "LatencyMs", "PoseAgeMs",
                          "RenderMs", "VortexMs", "CameraFPS", "LoopFPS", "CapturesSaved", "CaptureDropped",
-                         "PredictedValid", "PredictionHorizonMs")}
+                         "PredictedValid", "PredictionHorizonMs", "TiltErrorDeg", "HeightErrorM",
+                         "ChassisPitchDeg", "ChassisRollDeg", "ChassisHeightM", "LocalizationModel", "Terrain")}
         self.result_times = deque(maxlen=100)
         self.entries["Valid"].setBoolean(False)
         self.ghost.set([])
         self.raw_vision.set([])
         self.entries["PredictedValid"].setBoolean(False)
+        self.rotation_entries={kind:{key:self.instance.getEntry(f'/VortexSim/Rotation/{kind}/{key}')
+            for key in ('RollDeg','PitchDeg','YawDeg','Valid')} for kind in ('Actual','RawVision','Ghost')}
+        for kind in self.rotation_entries:self.publish_rotation(kind,None)
 
     @staticmethod
     def pose(position, rotation):
@@ -366,7 +390,12 @@ class Telemetry:
         return Pose3d(Translation3d(*map(float, position)), Rotation3d(np.asarray(rotation)))
 
     def publish_actual(self, chassis, mount=None):
-        self.actual.set(self.pose([*chassis[:2], 0.], chassis_rotation(chassis[2])))
+        actual=chassis_transform(chassis)
+        self.actual.set(self.pose(*actual))
+        self.publish_rotation('Actual',actual)
+        for name,value in zip(('ChassisHeightM','ChassisRollDeg','ChassisPitchDeg'),
+                              (chassis[3],math.degrees(chassis[4]),math.degrees(chassis[5])) if len(chassis)>=6 else (0,0,0)):
+            self.entries[name].setDouble(float(value))
         if mount is not None:
             position, optical_rotation = camera_pose(chassis, mount)
             # AdvantageScope's camera poses use forward/left/up, not optical axes.
@@ -376,8 +405,13 @@ class Telemetry:
 
     def publish_result(self, result, display_raw=True):
         ghost, _, report, captured, latency = result
+        ghost=ghost if valid_pose(ghost) else None
+        self.publish_rotation('RawVision',ghost)
         self.entries["Valid"].setBoolean(ghost is not None)
         self.entries["LatencyMs"].setDouble(latency * 1000)
+        model = 'unknown' if 'planar_localization' not in report else 'planar' if report['planar_localization'] else 'free'
+        self.entries['LocalizationModel'].setString(model)
+        self.entries['Terrain'].setString(report.get('terrain',{}).get('kind','unknown'))
         self.entries["RenderMs"].setDouble(report.get("render_ms", 0.))
         self.entries["VortexMs"].setDouble(report.get("vortex_ms", 0.))
         capture = report.get('capture', {})
@@ -396,19 +430,43 @@ class Telemetry:
             self.publish_display(ghost, 0.)
         if ghost is not None:
             p, r = ghost
-            self.entries["PositionErrorM"].setDouble(float(np.linalg.norm(p - [*captured[:2], 0.])))
+            metrics=chassis_errors(ghost,captured)
+            self.entries["PositionErrorM"].setDouble(metrics['position_m'])
+            self.entries['TiltErrorDeg'].setDouble(metrics['tilt_deg'])
+            self.entries['HeightErrorM'].setDouble(metrics['height_m'])
             heading = math.atan2(r[1, 0], r[0, 0]) - captured[2]
             self.entries["HeadingErrorDeg"].setDouble(math.degrees(math.atan2(math.sin(heading), math.cos(heading))))
         else:
-            for name in ("PositionErrorM", "HeadingErrorDeg"):
+            for name in ("PositionErrorM", "HeadingErrorDeg", "TiltErrorDeg", "HeightErrorM"):
                 self.entries[name].setDouble(float("nan"))
         self.instance.flush()
 
     def publish_display(self, ghost, horizon):
+        ghost=ghost if valid_pose(ghost) else None
+        self.publish_rotation('Ghost',ghost)
         self.ghost.set([] if ghost is None else [self.pose(*ghost)])
         self.entries["PredictedValid"].setBoolean(ghost is not None)
         self.entries["PredictionHorizonMs"].setDouble(horizon*1000 if ghost is not None else float('nan'))
         self.instance.flush()
+
+    def publish_rotation(self,kind,pose):
+        entries=self.rotation_entries[kind]
+        good=valid_pose(pose)
+        entries['Valid'].setBoolean(good)
+        if good:
+            rotation=self.pose(*pose).rotation()
+            values=[math.degrees(value) for value in (rotation.X(),rotation.Y(),rotation.Z())]
+        else:
+            values=[float('nan')]*3
+        for name,value in zip(('RollDeg','PitchDeg','YawDeg'),values):
+            entries[name].setDouble(value)
+
+    def clear_vision(self):
+        self.raw_vision.set([])
+        self.publish_rotation('RawVision',None)
+        self.entries['Valid'].setBoolean(False)
+        for name in ('PositionErrorM','HeadingErrorDeg','TiltErrorDeg','HeightErrorM','PoseAgeMs'):
+            self.entries[name].setDouble(float('nan'))
 
 
 def gui(harness, telemetry):
@@ -502,8 +560,9 @@ def gui(harness, telemetry):
             for key in MOUNT_KEYS:
                 variables[col, key].set(str(mount[key]))
     mount_box.bind('<<ComboboxSelected>>', apply_mount_preset)
-    route_var = tk.StringVar(value='approach')
-    ttk.Combobox(controls, textvariable=route_var, values=list(ROUTES), state='readonly', width=14).pack(side='left')
+    terrain_routes = {'field': 'blue-lower-bump', 'custom-ramp': 'ramp-crossing', 'custom-cross-ramp': 'cross-ramp-crossing'}
+    route_var = tk.StringVar(value=terrain_routes.get(harness.terrain.kind, 'approach'))
+    ttk.Combobox(controls, textvariable=route_var, values=list(ROUTES), state='readonly', width=20).pack(side='left')
     active_route = None
     route_started = 0.
     active_profile = harness.args.camera_profile
@@ -515,25 +574,26 @@ def gui(harness, telemetry):
     preview.bind("<KeyPress>", lambda e: keys.add(e.keysym.lower()))
     preview.bind("<KeyRelease>", lambda e: keys.discard(e.keysym.lower()))
     preview.bind("<FocusOut>", lambda _: keys.clear())
-    def reset():
-        nonlocal generation, result_captured_at, active_route
-        active_route = None
-        keys.clear()
-        harness.chassis = harness.initial.copy()
+    def invalidate_vision():
+        nonlocal generation, result_captured_at
         generation += 1
         predictor.clear()
         result_captured_at = None
-        telemetry.raw_vision.set([])
-        telemetry.entries["Valid"].setBoolean(False)
-        for name in ("PositionErrorM", "HeadingErrorDeg", "PoseAgeMs"):
-            telemetry.entries[name].setDouble(float('nan'))
+        telemetry.clear_vision()
         telemetry.publish_display(None, 0.)
+    def reset():
+        nonlocal active_route
+        active_route=None
+        keys.clear()
+        harness.chassis=harness.initial.copy()
+        invalidate_vision()
     ttk.Button(root, text="Reset chassis", command=reset).grid(row=8, column=0)
     def start_route():
         nonlocal active_route, route_started
-        reset()
         route = Route.load(route_var.get(), ROUTES[route_var.get()])
-        active_route = route.timeline(harness.initial, harness.field)
+        harness.configure_terrain(harness.terrain.kind,route.prepare_initial(harness.spawn,harness.field))
+        reset()
+        active_route = route.timeline(harness.initial, harness.field, terrain=harness.terrain)
         route_started = time.perf_counter()
         preview.focus_set()
     ttk.Button(controls, text='Run route', command=start_route).pack(side='left')
@@ -542,6 +602,32 @@ def gui(harness, telemetry):
         active_route = None
         keys.clear()
     ttk.Button(controls, text='Stop', command=stop_route).pack(side='left')
+    terrain_controls=ttk.Frame(root)
+    terrain_controls.grid(row=14,columnspan=4,sticky='ew')
+    ttk.Label(terrain_controls,text='Terrain').pack(side='left')
+    terrain_var=tk.StringVar(value=harness.terrain.kind)
+    terrain_box=ttk.Combobox(terrain_controls,textvariable=terrain_var,values=TERRAINS,state='readonly',width=20)
+    terrain_box.pack(side='left')
+    attitude_label=tk.StringVar()
+    ttk.Label(terrain_controls,textvariable=attitude_label).pack(side='left')
+    def change_terrain(event=None):
+        harness.configure_terrain(terrain_var.get())
+        reset()
+        if terrain_var.get() in terrain_routes:
+            route_var.set(terrain_routes[terrain_var.get()])
+            status.set('Click Run route to cross the selected bump and return. Field mode enables all four blue/red bumps.')
+    terrain_box.bind('<<ComboboxSelected>>',change_terrain)
+    model_controls=ttk.Frame(root)
+    model_controls.grid(row=15,columnspan=4,sticky='ew')
+    ttk.Label(model_controls,text='Localization').pack(side='left')
+    model_var=tk.StringVar(value='Free 6-DoF' if harness.args.free_pose else 'Level chassis')
+    model_box=ttk.Combobox(model_controls,textvariable=model_var,values=('Level chassis','Free 6-DoF'),state='readonly',width=15)
+    model_box.pack(side='left')
+    ttk.Label(model_controls,text='3D rotations: NT /VortexSim/Rotation (degrees)').pack(side='left')
+    def change_model(event=None):
+        harness.args.free_pose=model_var.get()=='Free 6-DoF'
+        invalidate_vision()
+    model_box.bind('<<ComboboxSelected>>',change_model)
     def save():
         mounts = read_mounts()
         if mounts:
@@ -609,9 +695,11 @@ def gui(harness, telemetry):
                 predictor.record(previous, now-dt, 0., 0., 0.)
             predictor.record(now-dt, now, *commands)
             harness.chassis = (active_route.pose(now-route_started) if active_route is not None else
-                               step(harness.chassis, *commands, dt, harness.field))
+                               harness.terrain.apply(step(harness.chassis, *commands, dt, harness.field)))
         live_mounts = read_mounts()
         telemetry.publish_actual(harness.chassis, live_mounts[0] if live_mounts else None)
+        state=harness.chassis
+        attitude_label.set(f" Height {state[3]:.2f} m | roll {math.degrees(state[4]):.1f}° | pitch {math.degrees(state[5]):.1f}°" if len(state)>=6 else ' Level ground')
         if pending is not None and pending.done():
             try:
                 result = pending.result()
@@ -636,11 +724,9 @@ def gui(harness, telemetry):
                     status.set(status.get()+f" | {report['pipeline_error']}")
             except Exception as error:
                 predictor.observe(None, now)
-                telemetry.raw_vision.set([])
-                telemetry.ghost.set([])
-                telemetry.entries["Valid"].setBoolean(False)
-                for name in ("PositionErrorM", "HeadingErrorDeg"):
-                    telemetry.entries[name].setDouble(float("nan"))
+                result_captured_at = None
+                telemetry.clear_vision()
+                telemetry.publish_display(None,0.)
                 status.set(str(error))
             pending = None
         if result_captured_at is not None:
@@ -698,6 +784,7 @@ def build_parser():
     parser.add_argument('--capture-dir', type=Path, default=HERE/'generated/captures')
     parser.add_argument('--capture-position-m', type=float, default=.2)
     parser.add_argument('--capture-heading-deg', type=float, default=5.)
+    parser.add_argument('--capture-tilt-deg', type=float, default=5.)
     parser.add_argument('--capture-cooldown', type=float, default=5., help='Minimum seconds between case writes')
     parser.add_argument('--capture-max-cases', type=int, default=50, help='Maximum new cases per session')
     parser.add_argument('--capture-max-mb', type=float, default=1024., help='Total capture directory size limit')
@@ -706,7 +793,18 @@ def build_parser():
     parser.add_argument("--headless-frames", type=int, default=0, help="Finite integration check without GUI")
     parser.add_argument('--camera-profile', choices=PROFILES, default='clean')
     parser.add_argument('--seed', type=int, default=509)
-    parser.add_argument('--free-pose', action='store_true', help='Use unconstrained 6-DoF pose instead of the level-chassis model')
+    parser.add_argument('--free-pose', action='store_true', default=True, help='Use unconstrained 6-DoF pose (interactive default)')
+    parser.add_argument('--planar-pose', action='store_false', dest='free_pose', help='Use the level-chassis model as a comparison control')
+    parser.add_argument('--terrain', type=terrain_name, choices=TERRAINS, default='field', help='Field mode follows all four 2026 bumps; flat is a level-ground control')
+    parser.add_argument('--bump-smoothing', type=float, default=.18, help='Field bump contact smoothing radius in meters (0 disables, default .18)')
+    parser.add_argument('--chassis-pitch', type=float, default=0., help='Nose-up chassis pitch bias, degrees')
+    parser.add_argument('--chassis-roll', type=float, default=0., help='Left-side-up chassis roll bias, degrees')
+    parser.add_argument('--chassis-height', type=float, default=0., help='Base chassis elevation, meters')
+    parser.add_argument('--tilt-deg', type=float, default=10., help='Static pitch/roll terrain preset angle')
+    parser.add_argument('--ramp-height', type=float, default=RAMP_HEIGHT)
+    parser.add_argument('--ramp-length', type=float, default=RAMP_LENGTH, help='Horizontal run of each ramp face, meters')
+    parser.add_argument('--ramp-width', type=float, default=RAMP_WIDTH)
+    parser.add_argument('--ramp-crest', type=float, default=0., help='Optional flat crest length, meters')
     for key in asdict(CameraEffects()):
         parser.add_argument('--'+key.replace('_', '-'), type=float,
                             help=f'Override camera profile {key}')
@@ -729,12 +827,14 @@ def main():
     args.max_error_meters = .20
     from failure_capture import CapturePolicy
     try:
+        terrain_from_args(args,[0.,0.,0.])
         settings = asdict(PROFILES[args.camera_profile])
         settings.update({key: getattr(args, key) for key in settings if getattr(args, key) is not None})
         CameraEffects(**settings)
         if args.seed < 0:
             raise ValueError('Seed must be nonnegative')
         CapturePolicy(position_m=args.capture_position_m, heading_deg=args.capture_heading_deg,
+                      tilt_deg=args.capture_tilt_deg,
                       cooldown_s=args.capture_cooldown, max_cases=args.capture_max_cases,
                       max_bytes=int(args.capture_max_mb*1024*1024))
     except (ValueError, OverflowError) as error:

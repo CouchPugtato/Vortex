@@ -3,9 +3,18 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
+from terrain import FIELD_BUMPS
 
 
 ROUTES = {
+    # Face the hub while strafing across each bump, keeping its nearby tags in
+    # view during the tilted portion instead of looking downfield at tiny tags.
+    **{b.name+'-bump': [(.5,0,0,0),(4,0,(-.55 if b.name in ('blue-lower','red-upper') else .55),0),
+                       (.5,0,0,0),(4,0,(.55 if b.name in ('blue-lower','red-upper') else -.55),0),
+                       (1,0,0,0)] for b in FIELD_BUMPS},
+    # A 2.2 m crossing clears the default 2026-sized bump before reversing.
+    'ramp-crossing': [(.5,0,0,0),(4,-.55,0,0),(.5,0,0,0),(4,.55,0,0),(1,0,0,0)],
+    'cross-ramp-crossing': [(.5,0,0,0),(4,0,.55,0),(.5,0,0,0),(4,0,-.55,0),(1,0,0,0)],
     'approach': [(1, 0, 0, 0), (2, -.35, 0, 0), (2, .35, 0, 0), (1, 0, 0, 0)],
     'slalom': [(1, 0, 0, 0), (2, 0, .5, .18), (2, 0, -.5, -.18), (1, 0, 0, 0)],
     'turn': [(1, 0, 0, 0), (2, 0, 0, .7), (2, 0, 0, -.7), (1, 0, 0, 0)],
@@ -41,6 +50,29 @@ class Route:
     def duration(self):
         return sum(segment[0] for segment in self.segments)
 
+    def prepare_initial(self, initial, field):
+        """Reserve room for built-in terrain routes; preserve other spawns."""
+        result=np.array(initial,dtype=float)
+        bump=next((b for b in FIELD_BUMPS if self.name==b.name+'-bump'),None)
+        if bump is not None:
+            direction=1 if bump.name.startswith('blue') else -1
+            result[:3]=[bump.center[0]-direction*1.1,bump.center[1],
+                        math.pi/2 if bump.name.endswith('lower') else -math.pi/2]
+            if not (.4 <= result[0] <= field['length']-.4 and .4 <= result[1] <= field['width']-.4):
+                raise ValueError('2026 bump route does not fit inside this field')
+            return result
+        if self.name not in ('ramp-crossing','cross-ramp-crossing'):
+            return result
+        _,forward,left,_=next(s for s in self.segments if s[1] or s[2])
+        duration=next(s[0] for s in self.segments if s[1] or s[2])
+        c,s=math.cos(result[2]),math.sin(result[2])
+        displacement=duration*np.array([c*forward-s*left,s*forward+c*left])
+        for axis,size in enumerate((field['length'],field['width'])):
+            lo=.4-min(0.,displacement[axis]);hi=size-.4-max(0.,displacement[axis])
+            if lo>hi:raise ValueError('Terrain route does not fit inside the field')
+            result[axis]=np.clip(result[axis],lo,hi)
+        return result
+
     def command(self, timestamp):
         start = 0.
         for duration, *motion in self.segments:
@@ -49,7 +81,7 @@ class Route:
             start += duration
         return (0., 0., 0.)
 
-    def timeline(self, initial, field, dt=.02):
+    def timeline(self, initial, field, dt=.02, terrain=None):
         # Split at segment boundaries so short custom segments aren't skipped.
         from drive import step
         times, poses, commands = [0.], [np.array(initial, dtype=float)], []
@@ -59,15 +91,17 @@ class Route:
             while times[-1] < end-1e-10:
                 t = min(times[-1]+dt, end)
                 commands.append(tuple(motion))
-                poses.append(step(poses[-1], *motion, t-times[-1], field))
+                pose = step(poses[-1], *motion, t-times[-1], field)
+                poses.append(terrain.apply(pose) if terrain is not None else pose)
                 times.append(t)
             start = end
-        return Trajectory(np.array(times), np.array(poses), commands, field)
+        return Trajectory(np.array(times), np.array(poses), commands, field, terrain)
 
 
 class Trajectory:
-    def __init__(self, times, poses, commands, field):
+    def __init__(self, times, poses, commands, field, terrain=None):
         self.times, self.poses, self.commands, self.field = times, poses, commands, field
+        self.terrain = terrain
 
     def command(self, timestamp):
         if not 0 <= timestamp < self.times[-1]:
@@ -81,7 +115,8 @@ class Trajectory:
         if timestamp >= self.times[-1]:
             return self.poses[-1].copy()
         i = int(np.searchsorted(self.times, timestamp, side='right')-1)
-        return step(self.poses[i], *self.commands[i], timestamp-self.times[i], self.field)
+        pose=step(self.poses[i], *self.commands[i], timestamp-self.times[i], self.field)
+        return self.terrain.apply(pose) if self.terrain is not None else pose
 
     def prediction(self, raw, captured_at, delivered_at):
         from ghost_prediction import GhostPredictor

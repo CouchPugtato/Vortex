@@ -133,8 +133,9 @@ disable saving. Limits and thresholds can be changed with `--capture-position-m`
 `--capture-max-mb`, and `--capture-dir`. `CapturesSaved` and `CaptureDropped` are
 published to AdvantageScope. Use the synthetic test runner for generated datasets.
 
-Simulator poses use a calibrated level-chassis model. `--free-pose` selects
-unconstrained 6-DoF localization in driving, benchmarks, and capture replay. The
+Driving defaults to unconstrained 6-DoF localization. `--planar-pose` selects a
+calibrated level-chassis control. Benchmarks retain their flat/planar default;
+`--free-pose` also enables unconstrained localization in benchmarks and replay. The
 level-chassis solver uses the assumed mount and observed pixels; ground truth
 only scores results. Hardware keeps the unconstrained default. See the
 [localization model](../docs/simulator-testing.md#localization-model) for limits.
@@ -153,3 +154,19 @@ The full matrix runs 100 combinations (7,600 frames by default). Reports go to
 `chassis_sim/generated/benchmark_TIMESTAMP/` as Markdown, JSON, and CSV.
 See [simulator testing](../docs/simulator-testing.md) for profiles, extrinsic
 experiments, custom routes, baseline comparisons, and scoring limits.
+
+The simulator defaults to **field** terrain: both blue and both red bumps in
+AdvantageScope's 2026 field are driveable at their actual locations and heights.
+Choose **blue-lower-bump**, **blue-upper-bump**, **red-lower-bump**, or
+**red-upper-bump**, then click **Run route**. Each route crosses 2.2 m and returns
+in 10 seconds. Chassis contact blends entrances and crests over an 18 cm radius
+to avoid sudden roll/pitch changes (`--bump-smoothing` adjusts it). Straight faces
+retain their 15° slope; the existing CAD supplies the
+blue/red visuals. Free 6-DoF localization is the interactive default. The
+**Localization** selector switches between level-chassis and free 6-DoF estimates.
+Actual and Ghost both publish full 3D poses, including height, roll and pitch.
+Euler estimates are under `/VortexSim/Rotation/{Actual,RawVision,Ghost}/` as
+`RollDeg`, `PitchDeg`, `YawDeg`, and `Valid`. These use WPILib Euler angles:
+nose-up pitch is negative. Invalid estimates have `Valid=false` and NaN angles.
+Compare planar and free-pose models with the
+[ramp benchmark commands](../docs/simulator-testing.md#pitch-roll-and-ramps).

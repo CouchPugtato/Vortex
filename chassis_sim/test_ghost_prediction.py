@@ -5,6 +5,7 @@ import numpy as np
 
 from drive import chassis_rotation, step
 from ghost_prediction import GhostPredictor
+from chassis_geometry import transform
 
 
 class GhostPredictionTests(unittest.TestCase):
@@ -43,6 +44,30 @@ class GhostPredictionTests(unittest.TestCase):
         self.predictor.observe(self.raw, 10.05)
         self.predictor.record(10., 10.1, 2., 0., 0.)
         np.testing.assert_allclose(self.predictor.predict(10.1)[0], [3.1, 2., .1])
+
+    def test_prediction_follows_estimated_slope_without_actual_pose(self):
+        raw = transform([4., 3., .4, .8, .15, .3])
+        self.predictor.observe(raw, 10.)
+        self.predictor.record(10., 10.1, 2., .5, 0.)
+        p, r = self.predictor.predict(10.1)
+        np.testing.assert_allclose(p, raw[0] + raw[1] @ np.array([.2, .05, 0.]))
+        np.testing.assert_allclose(r, raw[1], atol=1e-12)
+        self.assertGreater(p[2], raw[0][2])
+
+    def test_turning_keeps_estimated_surface_normal_fixed(self):
+        raw = transform([4., 3., .4, .8, .15, .3])
+        self.predictor.observe(raw, 10.)
+        self.predictor.record(10., 10.1, 0., 0., 1.5)
+        p, r = self.predictor.predict(10.1)
+        np.testing.assert_allclose(p, raw[0])
+        np.testing.assert_allclose(r[:, 2], raw[1][:, 2], atol=1e-12)
+        np.testing.assert_allclose(r.T @ r, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(math.atan2(r[1, 0], r[0, 0]), .55)
+
+    def test_invalid_rotations_do_not_become_display_poses(self):
+        for rotation in (np.zeros((3, 3)), -np.eye(3), np.full((3, 3), np.nan), np.eye(2)):
+            self.predictor.observe((np.zeros(3), rotation), 10.)
+            self.assertIsNone(self.predictor.predict(10.))
 
     def test_missing_invalid_and_stale_frames_hide_ghost(self):
         self.predictor.record(10., 10.3, 2., 0., 0.)

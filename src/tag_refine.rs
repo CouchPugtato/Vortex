@@ -473,6 +473,69 @@ pub fn refine_planar_field_pose(
     field_points: &[Vector3<f64>],
     image_points: &[(f64, f64)],
 ) -> Option<PoseEstimate> {
+    refine_field_pose(
+        patches,
+        candidates,
+        camera,
+        Some(mount),
+        field_points,
+        image_points,
+    )
+}
+
+/// Fit multiple decoded patches in one camera frame. With no mount constraint
+/// the fit has six degrees of freedom and cannot use chassis height or attitude.
+pub fn estimate_field_pose(
+    patches: &[(&TagPatch, Pose)],
+    camera: &CameraConfig,
+    field_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+    initial_poses: &[Pose],
+) -> Option<PoseEstimate> {
+    if field_points.len() < 8 {
+        return None;
+    }
+    let corner_pose = pose::estimate_pose_from_correspondence_candidates(
+        field_points,
+        image_points,
+        camera,
+        true,
+        initial_poses,
+    );
+    let mut candidates = Vec::new();
+    if let Some(pose) = &corner_pose {
+        candidates.push(pose.clone());
+    }
+    for seed in initial_poses {
+        if let Some(rmse) =
+            pose::correspondence_reprojection_rmse(seed, field_points, image_points, camera)
+        {
+            candidates.push(PoseEstimate {
+                pose: seed.clone(),
+                reprojection_rmse_px: rmse,
+            });
+        }
+    }
+    candidates.sort_by(|a, b| a.reprojection_rmse_px.total_cmp(&b.reprojection_rmse_px));
+    refine_field_pose(
+        patches,
+        &candidates,
+        camera,
+        None,
+        field_points,
+        image_points,
+    )
+    .or(corner_pose)
+}
+
+fn refine_field_pose(
+    patches: &[(&TagPatch, Pose)],
+    candidates: &[PoseEstimate],
+    camera: &CameraConfig,
+    mount: Option<&pose::RobotMount>,
+    field_points: &[Vector3<f64>],
+    image_points: &[(f64, f64)],
+) -> Option<PoseEstimate> {
     if patches.is_empty() || candidates.is_empty() {
         return None;
     }
@@ -504,14 +567,22 @@ pub fn refine_planar_field_pose(
             (*patch, transform, rays, observed)
         })
         .collect();
+    let dimensions = if mount.is_some() { 3 } else { 6 };
+    let field_pose = |params: &DVector<f64>| match mount {
+        Some(mount) => mount.field_pose(params),
+        None => Pose {
+            rotation: Rotation3::new(Vector3::new(params[0], params[1], params[2])).into_inner(),
+            translation: Vector3::new(params[3], params[4], params[5]),
+        },
+    };
     let residual = |params: &DVector<f64>| -> Option<DVector<f64>> {
         if !params.iter().all(|v| v.is_finite()) {
             return None;
         }
-        let camera_pose = mount.field_pose(params);
+        let camera_pose = field_pose(params);
         let mut values = Vec::new();
         for (index, (patch, transform, rays, observed)) in models.iter().enumerate() {
-            let width = params[3 + index].exp();
+            let width = params[dimensions + index].exp();
             if !(0.01..=1.5).contains(&width) {
                 return None;
             }
@@ -537,12 +608,22 @@ pub fn refine_planar_field_pose(
     };
     let mut best: Option<(f64, PoseEstimate)> = None;
     for candidate in candidates.iter().take(6) {
-        let robot_rotation = candidate.pose.rotation.transpose() * mount.rotation().transpose();
-        let yaw = robot_rotation[(1, 0)].atan2(robot_rotation[(0, 0)]);
-        let position = -candidate.pose.rotation.transpose() * candidate.pose.translation
-            - Rotation3::from_axis_angle(&Vector3::z_axis(), yaw) * mount.offset();
-        let mut params = DVector::from_vec(vec![position.x, position.y, yaw]);
-        params = params.insert_rows(3, models.len(), 0.4_f64.ln());
+        let mut params = match mount {
+            Some(mount) => {
+                let robot_rotation =
+                    candidate.pose.rotation.transpose() * mount.rotation().transpose();
+                let yaw = robot_rotation[(1, 0)].atan2(robot_rotation[(0, 0)]);
+                let position = -candidate.pose.rotation.transpose() * candidate.pose.translation
+                    - Rotation3::from_axis_angle(&Vector3::z_axis(), yaw) * mount.offset();
+                DVector::from_vec(vec![position.x, position.y, yaw])
+            }
+            None => {
+                let r = Rotation3::from_matrix_unchecked(candidate.pose.rotation).scaled_axis();
+                let t = candidate.pose.translation;
+                DVector::from_vec(vec![r.x, r.y, r.z, t.x, t.y, t.z])
+            }
+        };
+        params = params.insert_rows(dimensions, models.len(), 0.4_f64.ln());
         let Some(mut values) = residual(&params) else {
             continue;
         };
@@ -585,7 +666,7 @@ pub fn refine_planar_field_pose(
         if score.sqrt() > 0.15 || !score.is_finite() {
             continue;
         }
-        let result = mount.field_pose(&params);
+        let result = field_pose(&params);
         let origin = -result.rotation.transpose() * result.translation;
         if patches
             .iter()

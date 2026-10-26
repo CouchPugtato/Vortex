@@ -245,11 +245,12 @@ fn evaluate_frame(
         )
         .or_else(|| candidates.into_iter().next())
     } else if field_points.len() >= 8 {
-        pose::estimate_pose_from_correspondence_candidates(
+        let patches: Vec<_> = field_patches.iter().map(|(p, t)| (p, t.clone())).collect();
+        tag_refine::estimate_field_pose(
+            &patches,
+            &manifest.camera,
             &field_points,
             &image_points,
-            &manifest.camera,
-            true,
             &field_seeds,
         )
     } else {
@@ -302,7 +303,7 @@ fn evaluate_frame(
                 .map_or_else(|| !tags.contains_key(id), |ids| !ids.contains(id))).collect::<Vec<_>>(),
             "position_passed": position_ok,
             "localization_mode": if joint.is_some() && manifest.robot_mount.is_some() { "planar" }
-                else if joint.is_some() { "multi_tag" } else { "single_tag" },
+                else if joint.is_some() && field_points.len()>=8 { "multi_tag" } else { "single_tag" },
             "joint_reprojection_rmse_px": raw_joint.map(|p| p.reprojection_rmse_px),
             "single_tag_diagnostic_passed": missing.is_empty()
                 && errors.iter().all(|e| e.is_finite() && *e <= max_error),

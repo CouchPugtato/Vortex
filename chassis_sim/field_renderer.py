@@ -125,12 +125,14 @@ class GPUScene:
             texture.repeat_x = texture.repeat_y = False
             self.tag_meshes.append((np.asarray(tag['position']), normal, vao, texture))
         self.renderer = self.ctx.info['GL_RENDERER']
+        self.terrain_data = None
+        self.terrain_vao = None
 
     def _solid_vao(self, vertices):
         buffer = self.ctx.buffer(np.asarray(vertices, dtype='f4').tobytes())
         return self.ctx.vertex_array(self.solid, [(buffer, '3f 3f 4f', 'position', 'normal', 'color')])
 
-    def render(self, position, rotation, draw_field=True, blockers=(), with_visibility=False):
+    def render(self, position, rotation, draw_field=True, blockers=(), with_visibility=False, terrain_vertices=None):
         self.fbo.use()
         self.fbo.clear(.55, .65, .75, 1, depth=1)
         self.ctx.enable(self.gl.DEPTH_TEST)
@@ -146,6 +148,14 @@ class GPUScene:
         self.tag_program['mvp'].write(mvp)
         if draw_field and self.field[0]:
             self.field[0].render()
+        data = None if terrain_vertices is None else np.asarray(terrain_vertices,dtype='f4').tobytes()
+        if data != self.terrain_data:
+            if self.terrain_vao is not None:
+                self.terrain_vao.release()
+            self.terrain_vao = None if data is None else self._solid_vao(terrain_vertices)
+            self.terrain_data = data
+        if self.terrain_vao is not None:
+            self.terrain_vao.render()
         temporary = []
         if blockers:
             import trimesh
@@ -263,8 +273,8 @@ class FieldRenderer:
             raise TimeoutError('Field renderer timed out')
         return self.connection.recv()
 
-    def render(self, position, rotation, draw_field=True, blockers=(), with_visibility=False):
-        self.connection.send((position, rotation, draw_field, blockers, with_visibility))
+    def render(self, position, rotation, draw_field=True, blockers=(), with_visibility=False, terrain_vertices=None):
+        self.connection.send((position, rotation, draw_field, blockers, with_visibility, terrain_vertices))
         kind, value = self._receive()
         if kind != 'frame':
             raise RuntimeError(value)

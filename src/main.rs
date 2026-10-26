@@ -1231,13 +1231,11 @@ fn spawn_camera_pipeline(
                                     floor_z_error,
                                     corners: apr_det.corners,
                                 }));
-                                if processing_config.planar_localization {
-                                    if let (Some(patch), Some(tag)) = (apr_det.image_patch.take(), tag_field) {
-                                        joint_patches.push((patch, pose::Pose {
-                                            rotation: tag.rot_field_from_tag,
-                                            translation: tag.pos,
-                                        }));
-                                    }
+                                if let (Some(patch), Some(tag)) = (apr_det.image_patch.take(), tag_field) {
+                                    joint_patches.push((patch, pose::Pose {
+                                        rotation: tag.rot_field_from_tag,
+                                        translation: tag.pos,
+                                    }));
                                 }
                             }
                             Detection::Yolo(yolo_det) => {
@@ -1302,13 +1300,10 @@ fn spawn_camera_pipeline(
                         &joint_object_points, &joint_image_points,
                     ).or_else(|| candidates.into_iter().next())
                 } else if joint_object_points.len() >= 8 {
-                    pose::estimate_pose_from_correspondence_candidates(
-                            &joint_object_points,
-                            &joint_image_points,
-                            &camera_config,
-                            true,
-                            &joint_initial_poses,
-                        )
+                    let patches: Vec<_> = joint_patches.iter().map(|(p,t)| (p,t.clone())).collect();
+                    tag_refine::estimate_field_pose(
+                        &patches, &camera_config, &joint_object_points, &joint_image_points, &joint_initial_poses,
+                    )
                 } else {
                     None
                 };
