@@ -8,6 +8,13 @@ from analyze_captures import diagnose, main, summarize
 
 
 class CaptureAnalysisTests(unittest.TestCase):
+    def test_manual_cases_without_automatic_failure_remain_for_review(self):
+        capture=dict(trigger='manual',failure=dict(reasons=[]))
+        self.assertEqual(diagnose(capture,dict(reasons=[]),{})['primary'],'manual_review')
+        self.assertEqual(diagnose(capture,dict(reasons=['position_error']),{})['primary'],'position_error')
+        capture['failure']['reasons']=['position_error']
+        self.assertEqual(diagnose(capture,dict(reasons=[]),{})['primary'],'resolved')
+
     def test_missing_detection_and_rejected_pose_are_distinct(self):
         outcome=dict(reasons=['missing_pose_with_visible_tags'],expected_ids=[18])
         self.assertEqual(diagnose({},outcome,dict(detected_ids=[]))['primary'],'missed_tags')

@@ -253,6 +253,7 @@ class Harness:
                 self.replay.close()
                 raise
         self.capture = None
+        self.capture_record = None
         if not getattr(args, 'no_capture', False):
             from failure_capture import CapturePolicy, FailureCapture
             revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=HERE.parent,
@@ -387,11 +388,13 @@ class Harness:
         ghost = None if estimate is None else robot_pose(
             estimate["camera_position"], estimate["camera_rotation"], assumed)
         if self.capture is not None and not effects['dropped_frame']:
-            self.capture.observe(dict(gray=gray, image=image, ghost=ghost, chassis=chassis.copy(),
+            record=dict(gray=gray, image=image, ghost=ghost, chassis=chassis.copy(),
                 report=dict(report), actual_mount=dict(actual), assumed_mount=dict(assumed),
                 camera_position=position.tolist(), camera_rotation=rotation.tolist(), visibility=visibility,
                 camera=dict(self.camera),
-                monotonic_s=started, captured_utc=captured_utc))
+                monotonic_s=started, captured_utc=captured_utc)
+            self.capture.observe(record)
+            self.capture_record=record
             report['capture'] = self.capture.status()
         if realtime and effects['injected_latency_ms'] > 0:
             time.sleep(effects['injected_latency_ms']/1000)
@@ -596,7 +599,20 @@ def gui(harness, telemetry):
     open_button = ttk.Button(root, text='Open last capture', command=open_capture, state='disabled')
     open_button.grid(row=12, column=0, columnspan=2)
     capture_count = tk.StringVar(value='Captures: 0')
-    ttk.Label(root, textvariable=capture_count).grid(row=12, column=2, columnspan=2)
+    capture_controls=ttk.Frame(root)
+    capture_controls.grid(row=12,column=2,columnspan=2)
+    ttk.Label(capture_controls,textvariable=capture_count).pack(side='left')
+    manual_frame=None
+    manual_pending=None
+    def manual_capture():
+        nonlocal manual_pending
+        if manual_frame is None or manual_pending is not None:return
+        # Snapshot the displayed frame, even if another camera sample is running.
+        manual_pending=pool.submit(harness.capture.manual,manual_frame)
+        manual_button.configure(state='disabled')
+        status.set('Manual capture requested')
+    manual_button=ttk.Button(capture_controls,text='Capture frame',command=manual_capture,state='disabled')
+    manual_button.pack(side='left',padx=8)
     from routes import ROUTES, MOUNT_PRESETS, Route, mounts_for
     controls = ttk.Frame(root)
     controls.grid(row=13, columnspan=4, sticky='ew')
@@ -631,7 +647,9 @@ def gui(harness, telemetry):
     preview.bind("<KeyRelease>", lambda e: keys.discard(e.keysym.lower()))
     preview.bind("<FocusOut>", lambda _: keys.clear())
     def invalidate_vision():
-        nonlocal generation, result_captured_at
+        nonlocal generation, result_captured_at, manual_frame
+        manual_frame=None
+        manual_button.configure(state='disabled')
         generation += 1
         predictor.clear()
         result_captured_at = None
@@ -740,7 +758,7 @@ def gui(harness, telemetry):
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame, active_route, active_profile, next_config_poll, source_profile, failed_generation
+        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame, active_route, active_profile, next_config_poll, source_profile, failed_generation, manual_frame, manual_pending
         now = time.perf_counter()
         if now>=next_config_poll:
             profile=config_watcher.poll(now)
@@ -769,7 +787,8 @@ def gui(harness, telemetry):
                 action = 'updated' if event['updated'] else 'captured'
                 reasons = ', '.join(reason.replace('_', ' ') for reason in event['reasons'])
                 category = ' [mount experiment]' if event['experiment'] else ''
-                notification.set(f"Bad pose {action}{category}: {reasons}\n{last_capture}")
+                title='Manual capture saved' if event.get('manual') else f'Bad pose {action}'
+                notification.set(f"{title}{category}: {reasons or 'flagged for review'}\n{last_capture}")
                 banner.configure(background='#fff3cd', foreground='#664d03')
                 banner.grid()
                 open_button.configure(state='normal')
@@ -780,6 +799,17 @@ def gui(harness, telemetry):
                 notification_until = 0.
         else:
             capture_count.set('Captures disabled')
+        if manual_pending is not None and manual_pending.done():
+            try:message=manual_pending.result()
+            except Exception as error:message=f'Manual capture failed: {error}'
+            status.set(message)
+            if message!='Manual capture queued':
+                notification.set(message)
+                banner.configure(background='#fff3cd',foreground='#664d03')
+                banner.grid()
+                notification_until=now+2
+            manual_pending=None
+            if manual_frame is not None:manual_button.configure(state='normal')
         if "space" in keys:
             active_route = None
             keys.clear()
@@ -816,6 +846,9 @@ def gui(harness, telemetry):
             try:
                 result = pending.result()
                 ghost, image, report, _, latency = result
+                manual_frame=(harness.capture_record if harness.capture is not None and
+                              not report.get('sensor',{}).get('dropped_frame') else None)
+                manual_button.configure(state='normal' if manual_frame is not None and manual_pending is None else 'disabled')
                 if not report.get('sensor', {}).get('dropped_frame'):
                     telemetry.publish_result(result, display_raw=False)
                     result_captured_at = captured_at
@@ -869,7 +902,9 @@ def gui(harness, telemetry):
         tick()
         root.mainloop()
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        # A manual save can be queued behind detection; finish it before closing
+        # the capture writer so closing the window cannot silently discard it.
+        pool.shutdown(wait=True, cancel_futures=False)
         harness.close()
         telemetry.instance.stopServer()
         if timer is not None:

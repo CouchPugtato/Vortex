@@ -111,6 +111,15 @@ stay in memory except for automatically captured failures.
 
 ## Failure capture
 
+**Capture frame**, beside the capture count, manually saves the displayed camera
+frame even when automatic checks find no failure. It works during routines too.
+Manual saves skip confirmation, cooldown and duplicate filtering, but respect
+session/disk limits. Saves include pixels, poses, camera settings and diagnostics,
+are marked `trigger: manual`, and announce completion in the banner. Frames with
+no automatic failure stay in the analysis report's `manual_review` group; review
+visibility and expectations before promoting them. The button is disabled until
+a camera frame is available, during a request, or with `--no-capture`.
+
 Enabled by default. Cases go to `chassis_sim/generated/captures/SESSION/regressions/`;
 mount mismatches go to `experiments/`. Triggers are >20 cm position error, >5° heading
 error, invalid output, invented IDs, or missing pose with clearly visible tags.

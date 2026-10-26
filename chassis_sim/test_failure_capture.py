@@ -40,6 +40,44 @@ class CaptureTests(unittest.TestCase):
         self.capture.jobs.join()
         return list(Path(self.temp.name).rglob('capture.json'))
 
+    def test_manual_saves_missing_pose_even_when_visibility_does_not_trigger(self):
+        record=self.record(ghost=None,visible=False)
+        record['report']['routine']=dict(name='blue-alliance-survey',elapsed_s=12.)
+        self.capture.observe(record)
+        self.assertEqual(self.cases(),[])
+        self.assertEqual(self.capture.manual(record),'Manual capture queued')
+        path=self.cases()[0]
+        metadata=json.loads(path.read_text())
+        self.assertEqual(metadata['trigger'],'manual')
+        self.assertEqual(metadata['failure']['reasons'],[])
+        self.assertEqual(metadata['frame']['result']['routine'],record['report']['routine'])
+        np.testing.assert_array_equal(cv2.imread(str(path.parent/'image.png'),0),record['gray'])
+        self.assertTrue(self.capture.take_notifications()[0]['manual'])
+        self.assertEqual(self.capture.status()['total'],1)
+
+    def test_manual_bypasses_confirmation_cooldown_and_duplicate_filter(self):
+        record=self.record()
+        self.capture.observe(record)
+        self.capture.observe(dict(record,monotonic_s=.1))
+        self.cases()
+        for _ in range(2):
+            self.assertEqual(self.capture.manual(record),'Manual capture queued')
+            self.capture.jobs.join()
+        self.assertEqual(len(self.cases()),3)
+        self.assertEqual(self.capture.episode['replacements'],0)
+
+    def test_manual_reports_session_disk_and_queue_limits(self):
+        self.capture.accepted=self.capture.policy.max_cases
+        self.assertIn('session limit',self.capture.manual(self.record()))
+        self.capture.accepted=0
+        self.capture.used_bytes=self.capture.policy.max_bytes
+        self.assertIn('disk limit',self.capture.manual(self.record()))
+        self.capture.used_bytes=0
+        from unittest.mock import patch
+        with patch.object(self.capture,'_queue',return_value=False):
+            self.assertIn('queue is full',self.capture.manual(self.record()))
+        self.assertEqual(self.capture.accepted,0)
+
     def test_thousand_stationary_failures_save_one_case(self):
         for i in range(1000):
             self.capture.observe(self.record(i*.05))

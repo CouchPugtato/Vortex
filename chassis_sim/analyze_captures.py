@@ -52,7 +52,10 @@ def diagnose(capture, evaluation, result, latency_ms=100.):
             labels.append('latency')
             evidence.append(f'Original capture processing + injected delay: {total:.1f} ms (threshold {latency_ms:g} ms); not proof of an accuracy failure')
     experiment=capture.get('category')=='configuration_experiment'
-    primary='calibration_experiment' if experiment else 'resolved' if not reasons else labels[0] if labels else 'unclassified'
+    manual_review=capture.get('trigger')=='manual' and not capture.get('failure',{}).get('reasons')
+    if manual_review:evidence.append('User flagged this frame; automatic checks did not establish a failure. Review visible tags and expectations.')
+    primary=('calibration_experiment' if experiment else 'manual_review' if not reasons and manual_review else
+             'resolved' if not reasons else labels[0] if labels else 'unclassified')
     return dict(primary=primary,labels=labels,evidence=evidence,recorded_latency_ms=total,
                 latency_threshold_ms=latency_ms,experiment=experiment,
                 routine=capture.get('frame',{}).get('result',{}).get('routine'))

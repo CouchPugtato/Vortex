@@ -221,6 +221,23 @@ class FailureCapture:
             self.last_save = now
         return result
 
+    def manual(self, record):
+        """Camera executor only: save a user request without automatic trigger gates."""
+        if self.accepted >= self.policy.max_cases:
+            return 'Capture session limit reached; increase --capture-max-cases or start a new session'
+        if self.error:return self.error
+        if self.used_bytes >= self.policy.max_bytes:return 'Capture disk limit reached'
+        result=classify(record['ghost'],record['chassis'],record['report'],record['visibility'],
+                        [t['id'] for t in self.context['tags']],self.policy)
+        mark=fingerprint(record,result,self.context)
+        experiment=any(abs(record['actual_mount'][k]-record['assumed_mount'][k])>1e-6 for k in record['actual_mount'])
+        path=self.session/('experiments' if experiment else 'regressions')/f'case_{uuid4().hex[:12]}'
+        if not self._queue(dict(kind='new',path=path,record=record,result=result,mark=mark,before=None,manual=True)):
+            return 'Capture queue is full; try again shortly'
+        self.accepted+=1
+        self.history.append(mark)
+        return 'Manual capture queued'
+
     def _queue(self, job):
         if self.error or self.used_bytes >= self.policy.max_bytes:
             return False
@@ -256,6 +273,7 @@ class FailureCapture:
             manifest = dict(schema_version=1, backend=context['renderer'], width=record['gray'].shape[1],
                             height=record['gray'].shape[0], camera=context['camera'], tags=context['tags'], frames=[frame])
             capture = dict(schema_version=1, review_status='unreviewed', category=frame['group'], policy=asdict(self.policy),
+                           trigger='manual' if job.get('manual') else 'automatic',
                            fingerprint=mark, failure=result, frame=self._frame_details(record), context=context)
             files = {'image.png': self._png(record['gray']), 'preview.png': self._png(record['image']),
                      'manifest.json': json.dumps(json_safe(manifest), indent=2).encode(),
@@ -280,6 +298,7 @@ class FailureCapture:
                 self.saved += 1
             if job['kind'] in ('new', 'replace'):
                 self.notifications.append(dict(path=str(path), updated=job['kind'] == 'replace',
+                    manual=job.get('manual',False),
                     reasons=job['result']['reasons'], experiment=path.parent.name == 'experiments'))
 
     @staticmethod

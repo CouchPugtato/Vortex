@@ -66,6 +66,13 @@ cooldown, image deduplication and session budgets apply; saves include the route
 name and elapsed seconds. The 50-case default budget can be raised with
 `--capture-max-cases` for a longer collection session.
 
+**Capture frame**, next to the capture count, saves the currently displayed frame
+even if automatic visibility checks don't see a problem. Manual saves bypass
+confirmation, cooldown and deduplication while keeping session, disk and writer
+queue limits. They preserve the displayed pixels and frame-time metadata, including
+routine context, and use `trigger: manual`. Review these cases before promotion;
+without an automatically measured failure they appear under `manual_review`.
+
 ## Triage saved failures
 
 ```text
