@@ -53,7 +53,7 @@ impl Drop for Sandbox {
             if Command::new("userdel")
                 .arg(&self.user)
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok_and(|s| s.success() || s.code() == Some(6))
             {
                 break;
             }
@@ -69,6 +69,45 @@ impl Drop for Sandbox {
     }
 }
 impl Sandbox {
+    fn create() -> Result<Self> {
+        let user = format!("vortex-test-{}", &token()[..10]);
+        let home = PathBuf::from(format!("/home/{user}"));
+        ensure!(!home.exists(), "Test home already exists");
+        for database in ["passwd", "group"] {
+            let lookup = output(Command::new("getent").args([database, &user]), 10)?;
+            ensure!(
+                lookup.status.code() == Some(2),
+                "Test identity already exists or {database} lookup failed: {user}"
+            );
+        }
+        // Install the cleanup guard before useradd: failures can leave a partially
+        // created account. Do not copy a runner's skeleton or initialize login
+        // history, mail, or container sub-ID ranges for this disposable user.
+        let sandbox = Self {
+            root: home.join("vision.deployment"),
+            unit: format!("{user}.service"),
+            user,
+            home,
+        };
+        checked(
+            Command::new("useradd")
+                .args(["-M", "-U", "--no-log-init", "-s", "/bin/bash", "-d"])
+                .arg(&sandbox.home)
+                .args(["-K", "SUB_UID_COUNT=0", "-K", "SUB_GID_COUNT=0"])
+                .arg(&sandbox.user),
+            60,
+        )?;
+        fs::create_dir(&sandbox.home)?;
+        mode(&sandbox.home, 0o700)?;
+        checked(
+            Command::new("chown")
+                .arg(format!("{}:{}", sandbox.user, sandbox.user))
+                .arg(&sandbox.home),
+            10,
+        )?;
+        Ok(sandbox)
+    }
+
     fn command(&self, action: &str) -> Command {
         let mut c = Command::new("runuser");
         c.args(["-u", &self.user, "--", "env"])
@@ -167,19 +206,7 @@ impl Sandbox {
 fn actual_service_lifecycle() -> Result<()> {
     admin()?;
     checked(Command::new("systemctl").arg("show-environment"), 10)?;
-    let user = format!("vortex-test-{}", &token()[..10]);
-    let home = PathBuf::from(format!("/home/{user}"));
-    ensure!(!home.exists(), "Test home already exists");
-    checked(
-        Command::new("useradd").args(["-m", "-s", "/bin/bash", &user]),
-        20,
-    )?;
-    let s = Sandbox {
-        root: home.join("vision.deployment"),
-        unit: format!("{user}.service"),
-        user,
-        home,
-    };
+    let s = Sandbox::create()?;
     fs::create_dir_all(s.home.join(".local/state/vortex"))?;
     fs::write(s.home.join(".local/state/vortex/deployment.lock"), "")?;
     fs::create_dir_all(&s.root)?;
@@ -351,18 +378,7 @@ fn actual_offline_initialization() -> Result<()> {
         Path::new("/etc/vortex-rehearsal-guest").is_file(),
         "Initialization rehearsal requires a disposable guest"
     );
-    let user = format!("vortex-test-{}", &token()[..10]);
-    checked(
-        Command::new("useradd").args(["-m", "-s", "/bin/bash", &user]),
-        20,
-    )?;
-    let home = PathBuf::from(format!("/home/{user}"));
-    let s = Sandbox {
-        root: home.join("vision.deployment"),
-        unit: format!("{user}.service"),
-        user,
-        home,
-    };
+    let s = Sandbox::create()?;
     let out = tempfile::tempdir_in(&s.home)?;
     let repo = repository();
     let mut device = read(repo.join("config/device.json"))?;
@@ -498,18 +514,7 @@ fn actual_reboot_recovery() -> Result<()> {
             !state.exists(),
             "Existing rehearsal state must be inspected"
         );
-        let user = format!("vortex-test-{}", &token()[..10]);
-        checked(
-            Command::new("useradd").args(["-m", "-s", "/bin/bash", &user]),
-            20,
-        )?;
-        let home = PathBuf::from(format!("/home/{user}"));
-        let s = Sandbox {
-            root: home.join("vision.deployment"),
-            unit: format!("{user}.service"),
-            user,
-            home,
-        };
+        let s = Sandbox::create()?;
         fs::create_dir_all(&s.root)?;
         fs::create_dir_all(s.home.join(".local/state/vortex"))?;
         fs::write(s.home.join(".local/state/vortex/deployment.lock"), "")?;

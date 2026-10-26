@@ -101,6 +101,22 @@ fn build_check_never_implicitly_compiles() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    #[test]
+    fn command_timeout_keeps_subprocess_diagnostics() {
+        let error = vortexctl::common::output(
+            std::process::Command::new("sh").args([
+                "-c",
+                "printf 'setup started'; printf 'account setup blocked' >&2; exec sleep 10",
+            ]),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after 1s"), "{error}");
+        assert!(error.contains("stdout:\nsetup started"), "{error}");
+        assert!(error.contains("stderr:\naccount setup blocked"), "{error}");
+    }
+
     fn packaged(h: &Harness) -> Value {
         let output = h.temp.path().join("package");
         let mut c: Value =

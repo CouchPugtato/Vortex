@@ -262,21 +262,25 @@ pub fn output(cmd: &mut Command, seconds: u64) -> Result<Output> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("Command timed out: {cmd:?}")
+            bail!(
+                "Command timed out after {seconds}s: {cmd:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&tail(stdout, 8192)?),
+                String::from_utf8_lossy(&tail(stderr, 8192)?)
+            )
         }
     };
     use std::io::{Seek, SeekFrom};
-    fn tail(mut f: File) -> Result<Vec<u8>> {
+    fn tail(mut f: File, limit: u64) -> Result<Vec<u8>> {
         let n = f.metadata()?.len();
-        f.seek(SeekFrom::Start(n.saturating_sub(4 * 1024 * 1024)))?;
+        f.seek(SeekFrom::Start(n.saturating_sub(limit)))?;
         let mut v = Vec::new();
         f.read_to_end(&mut v)?;
         Ok(v)
     }
     Ok(Output {
         status,
-        stdout: tail(stdout)?,
-        stderr: tail(stderr)?,
+        stdout: tail(stdout, 4 * 1024 * 1024)?,
+        stderr: tail(stderr, 4 * 1024 * 1024)?,
     })
 }
 pub fn checked(cmd: &mut Command, seconds: u64) -> Result<Output> {
