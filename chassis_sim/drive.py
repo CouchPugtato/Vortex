@@ -74,6 +74,13 @@ def robot_pose(camera_position, camera_rotation, mount):
     return p, r
 
 
+def apply_calibration_error(actual, error):
+    assumed={key:float(actual[key])+float(error[key]) for key in MOUNT_KEYS}
+    if not all(math.isfinite(value) for value in assumed.values()):
+        raise ValueError('Mount and calibration error values must be finite')
+    return assumed
+
+
 def camera_rays(camera, width, height):
     yy, xx = np.indices((height, width), dtype=np.float32)
     return np.stack(((xx-camera["cx"])/camera["fx"],
@@ -174,13 +181,15 @@ class Harness:
         self.camera = dict(raw.get("camera_profiles", {}).get(str(args.camera_index), raw["camera"]))
         self.source_camera = dict(self.camera)
         self.actual = {k: float(self.camera.get(k, 0)) for k in MOUNT_KEYS}
-        self.assumed = self.actual.copy()
         if args.mounts:
             saved = json.loads(args.mounts.read_text())
-            self.actual, self.assumed = ({k: float(saved[name][k]) for k in MOUNT_KEYS}
-                                         for name in ("actual", "assumed"))
-            if not all(math.isfinite(v) for m in (self.actual, self.assumed) for v in m.values()):
+            saved_actual=saved.get('actual',saved)
+            self.actual = {k:float(saved_actual[k]) for k in MOUNT_KEYS}
+            if not all(math.isfinite(v) for v in self.actual.values()):
                 raise ValueError("Mount values must be finite")
+        # Calibration errors are a transient experiment, never restored from files.
+        self.calibration_error=dict.fromkeys(MOUNT_KEYS,0.)
+        self.assumed = apply_calibration_error(self.actual,self.calibration_error)
         self.projection = CameraProjection(self.camera,args.width,args.height,args.calibration_width,
                                            args.calibration_height,args.ideal_camera)
         self.camera = self.projection.camera
@@ -532,7 +541,7 @@ def gui(harness, telemetry):
               "Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.")
     ttk.Label(root,textvariable=camera_header).grid(columnspan=4)
     variables = {}
-    for col, (title, mount) in enumerate((("Actual mount", harness.actual), ("Vortex assumed mount", harness.assumed))):
+    for col, (title, mount) in enumerate((("Camera mount", harness.actual), ("Calibration error (+meters / +degrees)", harness.calibration_error))):
         ttk.Label(root, text=title).grid(row=1, column=col * 2, columnspan=2)
         for row, key in enumerate(MOUNT_KEYS, 2):
             ttk.Label(root, text=key).grid(row=row, column=col * 2)
@@ -599,9 +608,10 @@ def gui(harness, telemetry):
     mount_box.pack(side='left')
     preset_base=dict(harness.actual)
     def apply_mount_preset(event=None):
-        for col, mount in enumerate(mounts_for(mount_var.get(), preset_base)):
-            for key in MOUNT_KEYS:
-                variables[col, key].set(str(mount[key]))
+        actual,assumed=mounts_for(mount_var.get(),preset_base)
+        for key in MOUNT_KEYS:
+            variables[0,key].set(str(actual[key]))
+            variables[1,key].set(str(assumed[key]-actual[key]))
     mount_box.bind('<<ComboboxSelected>>', apply_mount_preset)
     terrain_routes = {'field': 'blue-lower-bump', 'custom-ramp': 'ramp-crossing', 'custom-cross-ramp': 'cross-ramp-crossing'}
     route_var = tk.StringVar(value=terrain_routes.get(harness.terrain.kind, 'approach'))
@@ -671,20 +681,17 @@ def gui(harness, telemetry):
         harness.args.free_pose=model_var.get()=='Free 6-DoF'
         invalidate_vision()
     model_box.bind('<<ComboboxSelected>>',change_model)
-    def save():
-        mounts = read_mounts()
-        if mounts:
-            (harness.root / "mounts.json").write_text(json.dumps(dict(actual=mounts[0], assumed=mounts[1]), indent=2))
-            status.set(f"Saved mounts to {harness.root / 'mounts.json'}")
-    ttk.Button(root, text="Save mounts", command=save).grid(row=8, column=2)
+    def reset_calibration_error():
+        for key in MOUNT_KEYS:variables[1,key].set('0.0')
+    ttk.Button(root, text="Reset calibration error", command=reset_calibration_error).grid(row=8, column=2)
     def read_mounts():
         try:
-            mounts = [{k: float(variables[col, k].get()) for k in MOUNT_KEYS} for col in range(2)]
-            if not all(math.isfinite(v) for m in mounts for v in m.values()):
+            actual,error = [{k: float(variables[col, k].get()) for k in MOUNT_KEYS} for col in range(2)]
+            if not all(math.isfinite(v) for m in (actual,error) for v in m.values()):
                 raise ValueError()
-            return mounts
+            return actual,apply_calibration_error(actual,error)
         except ValueError:
-            status.set("Mount values must be finite numbers; camera sampling paused.")
+            status.set("Mount and calibration error values must be finite numbers; camera sampling paused.")
             return None
     calibration_controls=ttk.LabelFrame(root,text=f'Live camera calibration (intrinsics at {harness.args.calibration_width}×{harness.args.calibration_height}; config file watched)')
     calibration_controls.grid(row=16,columnspan=4,sticky='ew')
@@ -745,7 +752,7 @@ def gui(harness, telemetry):
                         for key in MOUNT_KEYS:
                             if profile[key]!=source_profile.get(key):
                                 preset_base[key]=profile[key]
-                                for col in range(2):variables[col,key].set(str(profile[key]))
+                                variables[0,key].set(str(profile[key]))
                     source_profile=profile
                 except (ValueError,TypeError) as error:
                     config_watcher.applied=None
@@ -869,7 +876,7 @@ def build_parser():
     parser.add_argument("--field", type=Path, default=HERE.parent / "config/2026-rebuilt-welded.json")
     parser.add_argument("--camera-index", type=int, default=0)
     mounts = parser.add_mutually_exclusive_group()
-    mounts.add_argument("--mounts", type=Path, help="Load actual/assumed mounts instead of the selected camera config")
+    mounts.add_argument("--mounts", type=Path, help="Load the camera mount only; saved assumed mounts and calibration errors are ignored")
     mounts.add_argument('--demo-mount', action='store_const', dest='mounts', const=HERE/'demo_mounts.json', help='Use the upright demo mount')
     mounts.add_argument("--use-config-mount", action="store_true", help="Use mount from production camera config")
     parser.add_argument("--advantagescope", type=Path, help="Also launch an installed AdvantageScope executable")

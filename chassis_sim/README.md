@@ -54,19 +54,22 @@ Click the camera preview: **W/S** forward/back, **A/D** strafe, **Q/E** or **Lef
 The default spawn faces tag 18 at 1.5 m, clear of the trench structure.
 Use `--start-tag ID` and `--start-distance METERS` to change it.
 
-Edit **Actual mount** to change the rendered camera and **Vortex assumed mount**
-to change conversion of Vortex's camera pose into the ghost chassis pose.
-Both mounts default to the selected production camera profile (`--camera-index`).
+Edit **Camera mount** to change the rendered camera. **Calibration error** adds
+offsets to that mount for Vortex's chassis estimate: meters for translation,
+degrees for rotation. Zero means Vortex uses the correct mount. Errors always
+start at zero on launch and are never saved to configuration files.
+The camera mount defaults to the selected production camera profile (`--camera-index`).
 Use `--demo-mount` for the upright demo camera, or `--mounts PATH` for saved mounts.
 Offsets are robot-relative meters. Angles follow Vortex's current convention:
 `Ry(yaw) Rx(pitch) Rz(roll)`, acting on camera optical axes (right/down/forward).
 They are not conventional chassis yaw/pitch/roll. An upright forward camera uses
 `yaw_deg=90`, `pitch_deg=0`, `roll_deg=-90` in that convention.
-Start with matching mounts, then introduce an offset or angle error in one column.
-**Save mounts** writes a session file; reload with `--mounts PATH`.
+Introduce errors to test incorrect calibration; **Reset calibration error** clears
+all offsets. `--mounts PATH` loads only the camera mount, ignoring any saved
+assumed mount. Capture diagnostics retain the effective mounts for replay.
 The production config is never overwritten.
 
-Mount fields update live. **Live camera calibration** also lets you edit focal
+Mount and error fields update live. **Live camera calibration** also lets you edit focal
 lengths, principal point, distortion, tag size and output width/height. Changes
 apply after 300 ms without typing; camera setup runs in the background and stale
 poses are cleared. Incomplete or invalid fields pause sampling until corrected.

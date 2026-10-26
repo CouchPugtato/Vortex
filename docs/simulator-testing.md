@@ -21,6 +21,10 @@ renderer, and native replay swap together on the camera worker; failed setup
 leaves the previous resources intact. Chassis state is preserved, and results
 from before the edit are discarded. Saved failures snapshot each frame's effective
 calibration and dimensions, including changes made during the session.
+The GUI **Calibration error** fields are additive offsets from the camera mount
+(meters/degrees), always zero on launch. They are session-only: there is no save
+action, and `--mounts` ignores any saved assumed mount or calibration errors.
+Changing the camera mount or reloading config preserves the current error offsets.
 
 Start with a short run:
 

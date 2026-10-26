@@ -12,7 +12,7 @@ import ntcore
 import cv2
 import numpy as np
 from wpimath.geometry import Pose3d
-from drive import camera_pose, robot_pose, ground_background, step, Telemetry, StreamReplay, HERE
+from drive import camera_pose, robot_pose, apply_calibration_error, MOUNT_KEYS, ground_background, step, Telemetry, StreamReplay, HERE
 from generate import camera_pose as tag_camera_pose, render_fast, tag_geometry, tag_texture
 from chassis_geometry import transform
 
@@ -38,6 +38,18 @@ class HarnessTests(unittest.TestCase):
         np.testing.assert_allclose(p, [2.9, 2, 0], atol=1e-12)
         p, rr = robot_pose(eye, r, dict(self.mount, pitch_deg=5))
         self.assertAlmostEqual(math.degrees(math.atan2(rr[1, 0], rr[0, 0])), 5)
+
+    def test_calibration_error_is_an_additive_offset_and_zero_tracks_mount_changes(self):
+        error=dict.fromkeys(MOUNT_KEYS,0.)
+        self.assertEqual(apply_calibration_error(self.mount,error),self.mount)
+        changed=dict(self.mount,x_offset=.4,pitch_deg=12)
+        self.assertEqual(apply_calibration_error(changed,error),changed)
+        error.update(x_offset=.1,pitch_deg=-3)
+        assumed=apply_calibration_error(changed,error)
+        self.assertAlmostEqual(assumed['x_offset'],.5)
+        self.assertEqual(assumed['pitch_deg'],9)
+        self.assertEqual(changed['x_offset'],.4)
+        with self.assertRaises(ValueError):apply_calibration_error(changed,dict(error,y_offset=float('nan')))
 
     def test_robot_relative_driving_and_boundaries(self):
         field = dict(length=16, width=8)

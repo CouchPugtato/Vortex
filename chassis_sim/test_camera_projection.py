@@ -92,6 +92,28 @@ class CameraProjectionTests(unittest.TestCase):
 
 
 class NativeCameraConfigTests(unittest.TestCase):
+    def test_saved_assumed_mount_and_errors_are_never_restored(self):
+        executable=HERE.parent/'simulation_tests/replay/target'/(
+            'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name=='nt' else 'release/vortex-synthetic-replay')
+        if not executable.is_file():self.skipTest('Build native replay first')
+        actual=json.loads((HERE/'demo_mounts.json').read_text())['actual']
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'mounts.json'
+            original=json.dumps(dict(actual=actual,assumed=dict(actual,x_offset=9),
+                                     calibration_error=dict.fromkeys(MOUNT_KEYS,5.)))
+            path.write_text(original)
+            args=build_parser().parse_args(['--renderer','fast','--width','320','--ideal-camera','--no-capture',
+                                           '--mounts',str(path),'--replay-executable',str(executable)])
+            args.max_error_meters=.2
+            harness=Harness(args)
+            try:
+                self.assertEqual(harness.actual,actual)
+                self.assertEqual(harness.assumed,actual)
+                self.assertEqual(harness.calibration_error,dict.fromkeys(MOUNT_KEYS,0.))
+                self.assertFalse((harness.root/'mounts.json').exists())
+            finally:harness.close()
+            self.assertEqual(path.read_text(),original)
+
     def test_selected_profile_pixels_and_calibration_reach_native_replay(self):
         executable=HERE.parent/'simulation_tests/replay/target'/(
             'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name=='nt' else 'release/vortex-synthetic-replay')
