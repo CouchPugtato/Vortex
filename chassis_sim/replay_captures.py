@@ -11,6 +11,7 @@ import cv2
 
 from drive import HERE, StreamReplay, robot_pose
 from failure_capture import CapturePolicy, classify, json_safe
+from analyze_captures import diagnose, summarize, write_markdown
 
 
 def compare_reports(current, baseline):
@@ -84,17 +85,20 @@ def replay_cases(root, executable, include_experiments=False, baseline=None, out
                 dict(manifest=manifest, truth=frame['chassis_pose'], mount=frame['assumed_mount'],
                      visibility=frame['visibility'], policy=capture['policy']), sort_keys=True).encode()).hexdigest()
             results.append(dict(case=str(case), case_id=case.relative_to(root).as_posix(), input_signature=signature,
-                                passed=passed, evaluation=outcome, result=report))
+                                passed=passed, evaluation=outcome, result=report,
+                                analysis=diagnose(capture,outcome,report)))
             print(f"{'PASS' if passed else 'FAIL'} {case.name}: {outcome['reasons']}")
     finally:
         if stream is not None:
             stream.close()
     output = dict(total=len(results), passed=sum(result['passed'] for result in results), cases=results)
+    output['failure_groups']=summarize(results)
     if baseline is not None:
         output['changes'] = compare_reports(output, baseline)
     destination = output_path or root/'capture_replay_report.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(json_safe(output), indent=2), encoding='utf-8')
+    write_markdown(output,destination.with_suffix('.analysis.md'))
     return output
 
 

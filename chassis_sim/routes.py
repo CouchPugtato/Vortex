@@ -6,7 +6,49 @@ import numpy as np
 from terrain import FIELD_BUMPS
 
 
+def alliance_survey():
+    """Slow rotating loops in both halves of the blue zone, then a bump crossing.
+
+    Red uses the same robot-relative commands from a mirrored starting pose.
+    Sample world paths into body commands without giving truth to localization.
+    """
+    segments=[]
+    point=np.array([3.15,2.])
+    yaw=0.
+    spin=2*math.pi/48
+
+    def follow(seconds, target, turn=spin):
+        nonlocal point,yaw
+        count=math.ceil(seconds/.1)
+        dt=seconds/count
+        for i in range(count):
+            next_point=np.asarray(target((i+1)/count))
+            velocity=(next_point-point)/dt
+            mid=yaw+turn*dt/2
+            c,s=math.cos(mid),math.sin(mid)
+            segments.append((dt,c*velocity[0]+s*velocity[1],-s*velocity[0]+c*velocity[1],turn))
+            point=next_point;yaw+=turn*dt
+
+    def transfer(destination, speed=.18):
+        start=point.copy();destination=np.asarray(destination)
+        follow(float(np.linalg.norm(destination-start))/speed,lambda t:start+(destination-start)*t)
+
+    for y in (2.,6.):
+        if y==6.:transfer([3.15,y])
+        follow(96,lambda t:np.array([2.35+.8*math.cos(4*math.pi*t),y+.85*math.sin(4*math.pi*t)]))
+    bump=next(b for b in FIELD_BUMPS if b.name=='blue-upper')
+    transfer([bump.center[0]-1.1,bump.center[1]])
+    delta=math.atan2(math.sin(-math.pi/2-yaw),math.cos(-math.pi/2-yaw))
+    if abs(delta)>1e-8:
+        stationary=point.copy()
+        follow(abs(delta)/spin,lambda t:stationary,math.copysign(spin,delta))
+    # Face the hub and strafe across the bump into the neutral zone.
+    segments.extend([(5.5,0,.4,0),(48,0,0,spin),(2,0,0,0)])
+    return segments
+
+
 ROUTES = {
+    **{side+'-alliance-survey':alliance_survey() for side in ('blue','red')},
     # Face the hub while strafing across each bump, keeping its nearby tags in
     # view during the tilted portion instead of looking downfield at tiny tags.
     **{b.name+'-bump': [(.5,0,0,0),(4,0,(-.55 if b.name in ('blue-lower','red-upper') else .55),0),
@@ -53,6 +95,12 @@ class Route:
     def prepare_initial(self, initial, field):
         """Reserve room for built-in terrain routes; preserve other spawns."""
         result=np.array(initial,dtype=float)
+        if self.name in ('blue-alliance-survey','red-alliance-survey'):
+            if field['length']<16 or field['width']<7.8:
+                raise ValueError('Alliance survey requires a full-size 2026 field')
+            result[:3]=([3.15,2.,0.] if self.name.startswith('blue') else
+                        [field['length']-3.15,field['width']-2.,math.pi])
+            return result
         bump=next((b for b in FIELD_BUMPS if self.name==b.name+'-bump'),None)
         if bump is not None:
             direction=1 if bump.name.startswith('blue') else -1

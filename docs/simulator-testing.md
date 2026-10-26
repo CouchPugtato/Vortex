@@ -38,6 +38,7 @@ Results go to `chassis_sim/generated/benchmark_TIMESTAMP/`:
 - `report.json`: settings, per-frame errors, summaries, and capture replay results.
 - `frames.csv`: samples for plotting errors and latency.
 - `capture-replay-N.json`: results for each capture directory.
+- `capture-replay-N.analysis.md`: failure groups with evidence and image links.
 
 The console prints the exact directory. `--output NEW_DIRECTORY` chooses another;
 existing output directories are rejected to preserve reports.
@@ -48,6 +49,42 @@ The Python window has camera-profile and mount-preset selectors, plus **Run rout
 and **Stop**. Space stops a route; Reset also restores the spawn. Interactive
 routes support inspection in AdvantageScope and automatic failure capture.
 Use the benchmark command for route reports.
+
+The opt-in **blue-alliance-survey** and **red-alliance-survey** routines last
+about 4 minutes 44 seconds. Each circles through both halves of its alliance
+zone twice while slowly rotating, approaches the hub-side bump, crosses to the
+neutral zone and makes a final turn. Select **Terrain: field** to include actual
+2026 bump contact. Red mirrors blue. Routes remain kinematic, without collision
+response. Run both with:
+
+```text
+python chassis_sim/benchmark.py --routes blue-alliance-survey red-alliance-survey --terrain field --free-pose --profiles clean --mount-presets matched --sample-hz 2 --skip-capture-replay
+```
+
+Failure capture stays enabled throughout routines. Existing confirmation,
+cooldown, image deduplication and session budgets apply; saves include the route
+name and elapsed seconds. The 50-case default budget can be raised with
+`--capture-max-cases` for a longer collection session.
+
+## Triage saved failures
+
+```text
+python chassis_sim/analyze_captures.py chassis_sim/generated/captures
+```
+
+This reads historical capture results without rerunning Vortex, producing
+`analysis/analysis.md` and `analysis.json`. Each case has one primary group and
+may have multiple indicators: missed clearly visible tags, suspected ambiguity,
+incorrect rotation, position error, rejected pose, invalid output, false detection
+or pipeline error. Calibration experiments have their own primary group.
+Ambiguity requires similar-cost candidates for one tag with different physical
+poses; these are clues rather than proven causes. Latency uses recorded rendering,
+localization and injected delay (100 ms threshold, adjustable with `--latency-ms`).
+It doesn't imply that latency caused a capture-time pose error.
+
+Replay saved pixels with `replay_captures.py` to evaluate current code; its JSON
+includes `failure_groups` and it writes a companion `.analysis.md` report.
+Historical analysis and replay are labeled separately. Neither promotes cases.
 
 | Camera profile | Conditions |
 |---|---|

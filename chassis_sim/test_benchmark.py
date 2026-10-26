@@ -84,6 +84,32 @@ class SensorTests(unittest.TestCase):
 class RouteTests(unittest.TestCase):
     field = dict(length=16, width=8)
 
+    def test_long_surveys_visit_both_halves_spin_and_cross_bumps(self):
+        from terrain import Terrain, FIELD_BUMPS
+        field=dict(length=16.541,width=8.069)
+        paths=[]
+        for side,bump_name in [('blue','blue-upper'),('red','red-lower')]:
+            route=Route.load(side+'-alliance-survey',ROUTES[side+'-alliance-survey'])
+            initial=route.prepare_initial([0,0,0,0,0,0],field)
+            terrain=Terrain('field')
+            path=route.timeline(terrain.apply(initial),field,terrain=terrain)
+            self.assertGreater(route.duration,240)
+            self.assertLess(route.duration,360)
+            self.assertGreater(np.ptp(np.unwrap(path.poses[:,2])),8*math.pi)
+            self.assertLessEqual(max(abs(s[3]) for s in route.segments),math.radians(8))
+            self.assertGreater(path.poses[:,3].max(),.14)
+            self.assertGreater(path.poses[:,:2].min(),.5)
+            self.assertLess(path.poses[:,0].max(),field['length']-.5)
+            self.assertLess(path.poses[:,1].max(),field['width']-.5)
+            self.assertLess(path.poses[:10000,1].min(),2)
+            self.assertGreater(path.poses[:10000,1].max(),6)
+            bump=next(b for b in FIELD_BUMPS if b.name==bump_name)
+            direction=1 if side=='blue' else -1
+            self.assertGreater(direction*(path.poses[-1,0]-bump.center[0]),1.)
+            paths.append(path)
+        np.testing.assert_allclose(paths[0].poses[:,:2]+paths[1].poses[:,:2],
+                                   np.tile([field['length'],field['width']],(len(paths[0].poses),1)),atol=.002)
+
     def test_every_builtin_repeats_exactly_and_respects_bounds(self):
         for name, segments in ROUTES.items():
             route = Route.load(name, segments)
@@ -203,6 +229,31 @@ class ReportingTests(unittest.TestCase):
 
 
 class NativeBenchmarkTests(unittest.TestCase):
+    def test_running_routine_automatically_captures_with_context(self):
+        executable=HERE.parent/'simulation_tests/replay/target'/(
+            'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name=='nt' else 'release/vortex-synthetic-replay')
+        if not executable.is_file():self.skipTest('Build native replay before running routine capture integration')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            route=root/'route.json'
+            route.write_text(json.dumps(dict(name='routine-capture-check',segments=[[.4,0,.1,0]])))
+            code=main(['--demo-mount','--ideal-camera','--width','960','--renderer','fast',
+                       '--terrain','flat','--planar-pose','--replay-executable',str(executable),
+                       '--route-file',str(route),'--profiles','clean','--mount-presets','rotation-error',
+                       '--sample-hz','10','--capture-dir',str(root/'captures'),
+                       '--output',str(root/'report'),'--skip-capture-replay'])
+            self.assertEqual(code,0)  # Intentional calibration experiment.
+            captures=list((root/'captures').rglob('capture.json'))
+            self.assertGreaterEqual(len(captures),1)
+            capture=json.loads(captures[0].read_text())
+            self.assertEqual(capture['category'],'configuration_experiment')
+            self.assertIn('heading_error',capture['failure']['reasons'])
+            context=capture['frame']['result']['routine']
+            self.assertEqual(context['name'],'routine-capture-check')
+            self.assertGreaterEqual(context['elapsed_s'],.1)
+            self.assertLessEqual(context['elapsed_s'],.4)
+            self.assertTrue((captures[0].parent/'image.png').is_file())
+
     def test_native_route_and_automatic_capture_replay(self):
         executable = HERE.parent/'simulation_tests/replay/target'/(
             'x86_64-pc-windows-gnu/release/vortex-synthetic-replay.exe' if os.name == 'nt' else 'release/vortex-synthetic-replay')

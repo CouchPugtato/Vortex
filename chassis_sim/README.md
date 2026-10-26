@@ -114,6 +114,8 @@ stay in memory except for automatically captured failures.
 Enabled by default. Cases go to `chassis_sim/generated/captures/SESSION/regressions/`;
 mount mismatches go to `experiments/`. Triggers are >20 cm position error, >5° heading
 error, invalid output, invented IDs, or missing pose with clearly visible tags.
+Captures stay active during **Run route** and benchmark routines, using the same
+limits and deduplication. Saved diagnostics include the route name and elapsed time.
 Visibility uses renderer depth, independent of Vortex. Ground truth is from image
 capture time. Occluded or too-small tags alone do not trigger a missing-pose case.
 
@@ -137,10 +139,19 @@ Cases start unreviewed and are not automatically added to the permanent suite.
 
 ```text
 python chassis_sim/replay_captures.py chassis_sim/generated/captures
+python chassis_sim/analyze_captures.py chassis_sim/generated/captures
 python chassis_sim/replay_captures.py PATH_TO_ONE_CASE
 python chassis_sim/promote_capture.py PATH_TO_REVIEWED_CASE simulation_tests/captured_cases/CASE_NAME
 python chassis_sim/replay_captures.py simulation_tests/captured_cases
 ```
+
+`analyze_captures.py` writes `analysis/analysis.md` and `analysis.json` with groups
+for missed tags, suspected ambiguity, rotation errors and other failures, plus
+original capture latency indicators. It analyzes historical results; replay to
+check current code. Replay also writes a companion `.analysis.md` with current
+failure groups. Calibration experiments are counted separately. Similar-cost,
+physically different pose candidates suggest ambiguity; timing alone doesn't
+establish the cause of a bad pose.
 
 Replay uses current Vortex on saved pixels and checks chassis position and heading;
 no regeneration is needed. Experiments are skipped unless `--include-experiments`
@@ -166,6 +177,21 @@ Space stops a route. For repeatable reports and automatic capture replay:
 python chassis_sim/benchmark.py --routes approach --profiles clean --mount-presets matched
 python chassis_sim/benchmark.py
 ```
+
+Select **blue-alliance-survey** or **red-alliance-survey**, keep **Terrain: field**,
+and click **Run route** for a roughly five-minute survey. Each makes two slow
+circles in each half of its alliance zone while the chassis rotates at 7.5°/s,
+crosses a bump into the neutral zone, then turns once more. The red route mirrors
+the blue route. Starts reset to the appropriate alliance zone; **Stop** or Space
+ends the routine. Capture is enabled unless launched with `--no-capture`.
+
+For a repeatable full-field survey report (free 6-DoF, including bumps):
+
+```text
+python chassis_sim/benchmark.py --routes blue-alliance-survey red-alliance-survey --terrain field --free-pose --profiles clean --mount-presets matched --sample-hz 2 --skip-capture-replay
+```
+
+These long routes are opt-in and aren't included in the default benchmark matrix.
 
 The full matrix runs 100 combinations (7,600 frames by default). Reports go to
 `chassis_sim/generated/benchmark_TIMESTAMP/` as Markdown, JSON, and CSV.

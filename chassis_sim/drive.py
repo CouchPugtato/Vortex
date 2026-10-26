@@ -331,7 +331,7 @@ class Harness:
         if self.field_renderer is not None:
             self.field_renderer.close()
 
-    def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True, camera_settings=None):
+    def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True, camera_settings=None, routine=None):
         if camera_settings is not None:self.configure_camera(camera_settings,assumed)
         started = time.perf_counter()
         terrain,terrain_mesh = self.terrain_configuration
@@ -380,6 +380,7 @@ class Harness:
         report['planar_localization'] = self.manifest['robot_mount'] is not None
         report['visibility'] = visibility
         report['camera'] = dict(self.camera)
+        if routine is not None:report['routine']=dict(routine)
         estimate = report["joint_pose"]
         if estimate is None and report["poses"]:
             estimate = min(report["poses"], key=lambda p: p["reprojection_rmse_px"])
@@ -615,8 +616,10 @@ def gui(harness, telemetry):
     mount_box.bind('<<ComboboxSelected>>', apply_mount_preset)
     terrain_routes = {'field': 'blue-lower-bump', 'custom-ramp': 'ramp-crossing', 'custom-cross-ramp': 'cross-ramp-crossing'}
     route_var = tk.StringVar(value=terrain_routes.get(harness.terrain.kind, 'approach'))
-    ttk.Combobox(controls, textvariable=route_var, values=list(ROUTES), state='readonly', width=20).pack(side='left')
+    ttk.Label(controls, text='Routine').pack(side='left')
+    ttk.Combobox(controls, textvariable=route_var, values=list(ROUTES), state='readonly', width=24, height=16).pack(side='left')
     active_route = None
+    active_route_name = None
     route_started = 0.
     active_profile = harness.args.camera_profile
     preview.bind("<Button-1>", lambda _: preview.focus_set())
@@ -642,11 +645,12 @@ def gui(harness, telemetry):
         invalidate_vision()
     ttk.Button(root, text="Reset chassis", command=reset).grid(row=8, column=0)
     def start_route():
-        nonlocal active_route, route_started
+        nonlocal active_route, route_started, active_route_name
         route = Route.load(route_var.get(), ROUTES[route_var.get()])
         harness.configure_terrain(harness.terrain.kind,route.prepare_initial(harness.spawn,harness.field))
         reset()
         active_route = route.timeline(harness.initial, harness.field, terrain=harness.terrain)
+        active_route_name = route.name
         route_started = time.perf_counter()
         preview.focus_set()
     ttk.Button(controls, text='Run route', command=start_route).pack(side='left')
@@ -850,7 +854,9 @@ def gui(harness, telemetry):
             mounts = live_mounts
             camera_settings=read_camera_settings()
             if mounts and camera_settings:
-                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts, motion=commands,camera_settings=camera_settings)
+                routine=(dict(name=active_route_name,elapsed_s=now-route_started) if active_route is not None else None)
+                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts, motion=commands,
+                                      camera_settings=camera_settings,routine=routine)
                 captured_at = last
                 pending_generation = generation
             sample_at = max(sample_at + 1 / harness.args.camera_hz, now)

@@ -117,7 +117,8 @@ def run_route(harness, route, profile, preset, args, telemetry=None, terrain_kin
     for index in range(math.floor(route.duration*args.sample_hz)+1):
         timestamp = index/args.sample_hz
         truth = trajectory.pose(timestamp)
-        result = harness.localize(truth, actual, assumed, timestamp, route.command(timestamp), realtime=False)
+        result = harness.localize(truth, actual, assumed, timestamp, route.command(timestamp), realtime=False,
+                                  routine=dict(name=route.name,elapsed_s=timestamp))
         ghost, _, report, _, latency = result
         dropped = report['sensor']['dropped_frame']
         outcome = classify(ghost, truth, report, report['visibility'],
