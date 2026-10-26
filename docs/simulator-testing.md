@@ -9,6 +9,19 @@ or **7,600 frames** at the default 10 samples/second. Uses the production CPU
 detector and full-field renderer, including CAD occlusion. Dependencies and field
 assets are the same as interactive driving. `--renderer fast` selects tag-only tests.
 
+Camera output uses the selected production profile, its mount, and lens distortion
+at the full calibration resolution (1920×1080 by default). `--width 960` scales
+the intrinsics and output for a lighter run. To reproduce older idealized demo
+baselines, add `--demo-mount --ideal-camera --width 960`. Camera changes make old
+and new benchmark inputs incomparable; report signatures include output dimensions.
+
+Interactive camera fields apply live after a 300 ms typing debounce. The selected
+config profile is also reloaded after a stable file save. Camera projection,
+renderer, and native replay swap together on the camera worker; failed setup
+leaves the previous resources intact. Chassis state is preserved, and results
+from before the edit are discarded. Saved failures snapshot each frame's effective
+calibration and dimensions, including changes made during the session.
+
 Start with a short run:
 
 ```text

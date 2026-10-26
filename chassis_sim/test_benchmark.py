@@ -210,7 +210,7 @@ class NativeBenchmarkTests(unittest.TestCase):
             self.skipTest('Build native replay before running route integration')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            args = build_parser().parse_args(['--renderer', 'fast', '--terrain', 'flat', '--planar-pose', '--no-capture', '--replay-executable', str(executable)])
+            args = build_parser().parse_args(['--demo-mount','--width','960','--ideal-camera','--renderer', 'fast', '--terrain', 'flat', '--planar-pose', '--no-capture', '--replay-executable', str(executable)])
             args.max_error_meters = .2
             harness = Harness(args)
             try:
@@ -235,7 +235,7 @@ class NativeBenchmarkTests(unittest.TestCase):
                 harness.close()
             route = root/'short.json'
             route.write_text(json.dumps(dict(name='short', segments=[[.2, 0, .1, 0]])))
-            code = main(['--renderer', 'fast', '--replay-executable', str(executable), '--route-file', str(route),
+            code = main(['--demo-mount','--width','960','--ideal-camera','--renderer', 'fast', '--replay-executable', str(executable), '--route-file', str(route),
                          '--profiles', 'clean', '--mount-presets', 'matched', '--sample-hz', '10',
                          '--no-capture', '--capture-dir', str(root/'captures'), '--output', str(root/'result')])
             report = json.loads((root/'result/report.json').read_text())
@@ -245,7 +245,7 @@ class NativeBenchmarkTests(unittest.TestCase):
             expected = len(list((HERE.parent/'simulation_tests/captured_cases').rglob('capture.json')))
             self.assertEqual(report['capture_replays'][0]['passed'], expected)
             self.assertEqual(report['capture_replays'][1]['passed'], 1)
-            second = main(['--renderer', 'fast', '--replay-executable', str(executable), '--route-file', str(route),
+            second = main(['--demo-mount','--width','960','--ideal-camera','--renderer', 'fast', '--replay-executable', str(executable), '--route-file', str(route),
                            '--profiles', 'clean', '--mount-presets', 'matched', '--sample-hz', '10',
                            '--no-capture', '--capture-dir', str(root/'captures'), '--output', str(root/'second'),
                            '--baseline', str(root/'result/report.json')])

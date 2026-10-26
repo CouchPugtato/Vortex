@@ -99,7 +99,7 @@ def classify(ghost, chassis, report, visibility, known_ids, policy):
 
 
 def fingerprint(record, result, context):
-    signature = hashlib.sha256(json.dumps(json_safe(dict(camera=context['camera'], tags=context['tags'],
+    signature = hashlib.sha256(json.dumps(json_safe(dict(camera=record.get('camera',context['camera']), size=record['gray'].shape[:2], tags=context['tags'],
         asset=context.get('asset'), actual=record['actual_mount'], assumed=record['assumed_mount'],
         terrain=record['report'].get('terrain'), planar=record['report'].get('planar_localization'))),
         sort_keys=True).encode()).hexdigest()
@@ -176,6 +176,10 @@ class FailureCapture:
                           [t['id'] for t in self.context['tags']], self.policy)
         now = record['monotonic_s']
         previous = self.previous
+        if previous is not None and record.get('camera',self.context['camera'])!=previous.get('camera',self.context['camera']):
+            previous=None
+            self.bad_streak=self.good_streak=0
+            self.episode=None
         self.previous = record
         if not result['reasons']:
             self.bad_streak = 0
@@ -221,6 +225,7 @@ class FailureCapture:
         if self.error or self.used_bytes >= self.policy.max_bytes:
             return False
         try:
+            job['context']=dict(self.context,camera=job['record'].get('camera',self.context['camera']))
             self.jobs.put_nowait(job)
             return True
         except queue.Full:
@@ -237,6 +242,7 @@ class FailureCapture:
 
     def _write(self, job):
         path, record = job['path'], job['record']
+        context=job.get('context',self.context)
         if job['kind'] == 'after':
             files = {'after.png': self._png(record['gray']),
                      'after.json': json.dumps(json_safe(self._frame_details(record)), indent=2).encode()}
@@ -247,10 +253,10 @@ class FailureCapture:
                 case=dict(actual_mount=record['actual_mount'], assumed_mount=record['assumed_mount']),
                 camera_position=record['camera_position'], camera_rotation=record['camera_rotation'],
                 expected_ids=result['expected_ids'], allowed_ids=result['allowed_ids'])
-            manifest = dict(schema_version=1, backend=self.context['renderer'], width=record['gray'].shape[1],
-                            height=record['gray'].shape[0], camera=self.context['camera'], tags=self.context['tags'], frames=[frame])
+            manifest = dict(schema_version=1, backend=context['renderer'], width=record['gray'].shape[1],
+                            height=record['gray'].shape[0], camera=context['camera'], tags=context['tags'], frames=[frame])
             capture = dict(schema_version=1, review_status='unreviewed', category=frame['group'], policy=asdict(self.policy),
-                           fingerprint=mark, failure=result, frame=self._frame_details(record), context=self.context)
+                           fingerprint=mark, failure=result, frame=self._frame_details(record), context=context)
             files = {'image.png': self._png(record['gray']), 'preview.png': self._png(record['image']),
                      'manifest.json': json.dumps(json_safe(manifest), indent=2).encode(),
                      'capture.json': json.dumps(json_safe(capture), indent=2).encode()}
@@ -283,6 +289,7 @@ class FailureCapture:
                     camera_rotation=record['camera_rotation'], actual_mount=record['actual_mount'],
                     assumed_mount=record['assumed_mount'], predicted_robot_pose=record['ghost'],
                     terrain=record['report'].get('terrain'),
+                    camera=record.get('camera'),
                     visibility=record['visibility'], result=record['report'])
 
     def _writer(self):

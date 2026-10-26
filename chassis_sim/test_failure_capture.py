@@ -53,6 +53,19 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(metadata['frame']['chassis_pose'], [3,2,0])
         self.assertTrue((case/'manifest.json').exists())
 
+    def test_live_calibration_is_saved_with_its_pixels_and_restarts_confirmation(self):
+        self.capture.observe(dict(self.record(),camera=self.context['camera']))
+        camera=dict(self.context['camera'],fx=140)
+        self.capture.observe(dict(self.record(.1),camera=camera))
+        self.assertEqual(self.cases(),[])
+        self.capture.observe(dict(self.record(.2),camera=camera))
+        path=self.cases()[0]
+        manifest=json.loads((path.parent/'manifest.json').read_text())
+        metadata=json.loads(path.read_text())
+        self.assertEqual(manifest['camera'],camera)
+        self.assertEqual(metadata['frame']['camera'],camera)
+        self.assertEqual(metadata['context']['camera'],camera)
+
     def test_single_bad_frame_and_occluded_missing_pose_do_not_save(self):
         self.capture.observe(self.record())
         self.capture.observe(self.record(1,error=0))

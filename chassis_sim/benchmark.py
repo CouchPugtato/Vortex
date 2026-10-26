@@ -148,7 +148,8 @@ def run_route(harness, route, profile, preset, args, telemetry=None, terrain_kin
         if index % max(1, round(args.sample_hz*2)) == 0:
             print(f'  {timestamp:.1f}/{route.duration:.1f}s', flush=True)
     settings = dict(route=route.segments, initial=initial.tolist(), actual=actual, assumed=assumed,
-                    camera=harness.camera, tags=harness.tags, field=harness.field, renderer=args.renderer,
+                    camera=harness.camera, width=harness.width,height=harness.height,
+                    tags=harness.tags, field=harness.field, renderer=args.renderer,
                     effects=asdict(harness.sensor.settings), seed=args.seed, sample_hz=args.sample_hz,
                     position_m=policy.position_m, heading_deg=policy.heading_deg,tilt_deg=policy.tilt_deg,
                     terrain=harness.terrain.describe())

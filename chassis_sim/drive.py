@@ -25,6 +25,7 @@ from generate import render_fast, tag_geometry, tag_texture
 from run import replay_command
 from ghost_prediction import GhostPredictor
 from camera_effects import CameraEffects, PROFILES, Sensor
+from camera_projection import CameraProjection, CameraConfigWatcher, CALIBRATION_KEYS
 from dataclasses import asdict
 from chassis_geometry import transform as chassis_transform, errors as chassis_errors, valid_pose
 from terrain import TERRAINS, RAMP_HEIGHT, RAMP_LENGTH, RAMP_WIDTH, terrain_name, from_args as terrain_from_args
@@ -171,6 +172,7 @@ class Harness:
         self.sensor_started = time.perf_counter()
         raw = json.loads(args.config.read_text())
         self.camera = dict(raw.get("camera_profiles", {}).get(str(args.camera_index), raw["camera"]))
+        self.source_camera = dict(self.camera)
         self.actual = {k: float(self.camera.get(k, 0)) for k in MOUNT_KEYS}
         self.assumed = self.actual.copy()
         if args.mounts:
@@ -179,28 +181,25 @@ class Harness:
                                          for name in ("actual", "assumed"))
             if not all(math.isfinite(v) for m in (self.actual, self.assumed) for v in m.values()):
                 raise ValueError("Mount values must be finite")
-        # Ideal pinhole renderer. Scale intrinsics with the original calibration resolution.
-        scale = args.width / args.calibration_width
-        for k in ("fx", "fy", "cx", "cy"):
-            self.camera[k] *= scale
-        for k in ("k1", "k2", "k3", "p1", "p2"):
-            self.camera[k] = 0.
-        self.width = args.width
-        self.height = round(args.calibration_height * scale)
-        if self.height < 1 or min(self.camera["fx"], self.camera["fy"]) <= 0:
-            raise ValueError("Invalid image size or camera focal lengths")
+        self.projection = CameraProjection(self.camera,args.width,args.height,args.calibration_width,
+                                           args.calibration_height,args.ideal_camera)
+        self.camera = self.projection.camera
+        self.width,self.height = self.projection.width,self.projection.height
+        self.render_camera = self.projection.render_camera
+        self.render_width,self.render_height = self.projection.render_width,self.projection.render_height
+        self.camera_settings=dict(camera=dict(self.source_camera),width=self.width,height=self.height)
         raw_field = json.loads(args.field.read_text())
         self.field = raw_field["field"]
         self.tags = [tag_geometry(t) for t in raw_field["tags"]]
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         self.textures = {t["id"]: tag_texture(dictionary, t["id"]) for t in self.tags}
         # Floor is only visual context; keep tags and Vortex at full resolution.
-        self.floor_width, self.floor_height = max(2, self.width//4), max(2, self.height//4)
-        self.floor_camera = dict(self.camera)
+        self.floor_width, self.floor_height = max(2, self.render_width//4), max(2, self.render_height//4)
+        self.floor_camera = dict(self.render_camera)
         for k in ("fx", "cx"):
-            self.floor_camera[k] *= self.floor_width/self.width
+            self.floor_camera[k] *= self.floor_width/self.render_width
         for k in ("fy", "cy"):
-            self.floor_camera[k] *= self.floor_height/self.height
+            self.floor_camera[k] *= self.floor_height/self.render_height
         self.rays = camera_rays(self.floor_camera, self.floor_width, self.floor_height)
         # Spawn in front of the hub, clear of the trench structure at the old 2 m spawn.
         tag = next(t for t in self.tags if t["id"] == args.start_tag)
@@ -239,7 +238,7 @@ class Harness:
             try:
                 self.field_asset = find_field_asset(getattr(args, 'field_asset', None))
                 self.field_renderer = FieldRenderer(self.field_asset,
-                    self.camera, self.width, self.height, self.tags, self.textures)
+                    self.render_camera, self.render_width, self.render_height, self.tags, self.textures)
                 print(f"Field camera GPU: {self.field_renderer.renderer}", flush=True)
             except Exception:
                 self.replay.close()
@@ -253,7 +252,7 @@ class Harness:
                 for name in ('src/detector.rs', 'src/pose.rs', 'src/tag_refine.rs', 'src/config.rs',
                              'simulation_tests/replay/src/main.rs', 'simulation_tests/replay/Cargo.lock',
                              'chassis_sim/drive.py', 'chassis_sim/field_renderer.py', 'chassis_sim/failure_capture.py',
-                             'chassis_sim/camera_effects.py', 'chassis_sim/routes.py',
+                             'chassis_sim/camera_effects.py', 'chassis_sim/camera_projection.py', 'chassis_sim/routes.py',
                              'chassis_sim/chassis_geometry.py', 'chassis_sim/terrain.py')}
             asset = None if self.field_asset is None else dict(path=str(self.field_asset),
                 model_sha256=hashlib.sha256((self.field_asset/'model.glb').read_bytes()).hexdigest(),
@@ -280,6 +279,42 @@ class Harness:
         self.terrain,self.terrain_mesh = terrain,mesh
         self.initial = terrain.apply(spawn)
 
+    def configure_camera(self, settings, assumed):
+        """Run on the camera worker: prepare replacements before swapping them."""
+        if settings==self.camera_settings:return
+        projection=CameraProjection(settings['camera'],settings['width'],settings['height'],
+            self.args.calibration_width,self.args.calibration_height,self.args.ideal_camera)
+        floor_width,floor_height=max(2,projection.render_width//4),max(2,projection.render_height//4)
+        floor_camera=dict(projection.render_camera)
+        for key in ('fx','cx'):floor_camera[key]*=floor_width/projection.render_width
+        for key in ('fy','cy'):floor_camera[key]*=floor_height/projection.render_height
+        rays=camera_rays(floor_camera,floor_width,floor_height)
+        manifest=dict(self.manifest,width=projection.width,height=projection.height,camera=projection.camera,
+            robot_mount=None if self.args.free_pose else dict(assumed))
+        renderer=None
+        replay=None
+        try:
+            if self.field_renderer is not None:
+                from field_renderer import FieldRenderer
+                renderer=FieldRenderer(self.field_asset,projection.render_camera,projection.render_width,
+                    projection.render_height,self.tags,self.textures)
+            replay=StreamReplay(self.command[0],manifest,self.env,self.root)
+        except Exception:
+            if renderer is not None:renderer.close()
+            if replay is not None:replay.close()
+            raise
+        old_replay,old_renderer=self.replay,self.field_renderer
+        self.projection,self.camera,self.manifest=projection,projection.camera,manifest
+        self.source_camera=dict(settings['camera'])
+        self.width,self.height=projection.width,projection.height
+        self.render_camera=projection.render_camera
+        self.render_width,self.render_height=projection.render_width,projection.render_height
+        self.floor_camera,self.floor_width,self.floor_height,self.rays=floor_camera,floor_width,floor_height,rays
+        self.replay,self.field_renderer=replay,renderer
+        self.camera_settings=dict(camera=dict(settings['camera']),width=self.width,height=self.height)
+        old_replay.close()
+        if old_renderer is not None:old_renderer.close()
+
     def close(self):
         if self.capture is not None:
             self.capture.close()
@@ -287,7 +322,8 @@ class Harness:
         if self.field_renderer is not None:
             self.field_renderer.close()
 
-    def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True):
+    def localize(self, chassis, actual, assumed, timestamp=None, motion=(0., 0., 0.), realtime=True, camera_settings=None):
+        if camera_settings is not None:self.configure_camera(camera_settings,assumed)
         started = time.perf_counter()
         terrain,terrain_mesh = self.terrain_configuration
         expected_mount = None if getattr(self.args,'free_pose',False) else assumed
@@ -307,13 +343,15 @@ class Harness:
         else:
             background = ground_background(position, rotation, self.floor_camera, self.floor_width,
                                            self.floor_height, self.field, self.rays)
-            background = cv2.resize(background, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-            image, expected = render_fast(frame, self.tags, self.camera, self.width, self.height,
+            background = cv2.resize(background, (self.render_width, self.render_height), interpolation=cv2.INTER_LINEAR)
+            image, expected = render_fast(frame, self.tags, self.render_camera, self.render_width, self.render_height,
                                    self.textures, background=background, roi=True)
             # Fast rendering has no opaque field structures. Test only the known
             # fully visible tags; retain all mapped IDs as allowed for cropped tags.
             visibility = [dict(id=t['id'], visible_fraction=1., clearly_visible=t['id'] in expected)
                           for t in self.tags]
+        image = self.projection.output(image)
+        visibility = self.projection.visibility(visibility,position,rotation,self.tags,self.camera['tag_size_m'])
         timestamp = started-self.sensor_started if timestamp is None else timestamp
         image, effects = self.sensor.apply(image, timestamp, motion, self.camera['fx'])
         rendered_at = time.perf_counter()
@@ -332,6 +370,7 @@ class Harness:
         report['terrain'] = terrain.describe()
         report['planar_localization'] = self.manifest['robot_mount'] is not None
         report['visibility'] = visibility
+        report['camera'] = dict(self.camera)
         estimate = report["joint_pose"]
         if estimate is None and report["poses"]:
             estimate = min(report["poses"], key=lambda p: p["reprojection_rmse_px"])
@@ -341,6 +380,7 @@ class Harness:
             self.capture.observe(dict(gray=gray, image=image, ghost=ghost, chassis=chassis.copy(),
                 report=dict(report), actual_mount=dict(actual), assumed_mount=dict(assumed),
                 camera_position=position.tolist(), camera_rotation=rotation.tolist(), visibility=visibility,
+                camera=dict(self.camera),
                 monotonic_s=started, captured_utc=captured_utc))
             report['capture'] = self.capture.status()
         if realtime and effects['injected_latency_ms'] > 0:
@@ -487,8 +527,10 @@ def gui(harness, telemetry):
     for column in range(4):
         root.columnconfigure(column, weight=1)
     root.rowconfigure(10, weight=1)
-    ttk.Label(root, text="Camera preview — open AdvantageScope for the 3D field and chassis.\n"
-              "Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.").grid(columnspan=4)
+    camera_header=tk.StringVar(value=f"Camera {harness.args.camera_index}: {harness.width}×{harness.height}, "
+              f"{'ideal lens' if harness.args.ideal_camera else 'configured lens'} — open AdvantageScope for the 3D field.\n"
+              "Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.")
+    ttk.Label(root,textvariable=camera_header).grid(columnspan=4)
     variables = {}
     for col, (title, mount) in enumerate((("Actual mount", harness.actual), ("Vortex assumed mount", harness.assumed))):
         ttk.Label(root, text=title).grid(row=1, column=col * 2, columnspan=2)
@@ -555,8 +597,9 @@ def gui(harness, telemetry):
     mount_var = tk.StringVar(value='matched')
     mount_box = ttk.Combobox(controls, textvariable=mount_var, values=MOUNT_PRESETS, state='readonly', width=17)
     mount_box.pack(side='left')
+    preset_base=dict(harness.actual)
     def apply_mount_preset(event=None):
-        for col, mount in enumerate(mounts_for(mount_var.get(), harness.actual)):
+        for col, mount in enumerate(mounts_for(mount_var.get(), preset_base)):
             for key in MOUNT_KEYS:
                 variables[col, key].set(str(mount[key]))
     mount_box.bind('<<ComboboxSelected>>', apply_mount_preset)
@@ -643,6 +686,41 @@ def gui(harness, telemetry):
         except ValueError:
             status.set("Mount values must be finite numbers; camera sampling paused.")
             return None
+    calibration_controls=ttk.LabelFrame(root,text=f'Live camera calibration (intrinsics at {harness.args.calibration_width}×{harness.args.calibration_height}; config file watched)')
+    calibration_controls.grid(row=16,columnspan=4,sticky='ew')
+    source_profile=dict(harness.source_camera)
+    calibration_vars={}
+    for index,key in enumerate((*CALIBRATION_KEYS,'width','height')):
+        value=source_profile[key] if key in CALIBRATION_KEYS else getattr(harness,key)
+        variable=tk.StringVar(value=str(value))
+        calibration_vars[key]=variable
+        row,column=divmod(index,4)
+        ttk.Label(calibration_controls,text=key).grid(row=row,column=column*2)
+        ttk.Entry(calibration_controls,textvariable=variable,width=12).grid(row=row,column=column*2+1,sticky='ew')
+    def read_camera_settings():
+        try:
+            camera=dict(source_profile)
+            camera.update({key:float(calibration_vars[key].get()) for key in CALIBRATION_KEYS})
+            width,height=(int(calibration_vars[key].get()) for key in ('width','height'))
+            if not all(math.isfinite(camera[key]) for key in CALIBRATION_KEYS) or min(camera['fx'],camera['fy'],camera['tag_size_m'],width,height)<=0:
+                raise ValueError()
+            return dict(camera=camera,width=width,height=height)
+        except ValueError:
+            status.set('Enter finite calibration values and positive focal lengths, tag size, width and height; camera sampling paused.')
+            return None
+    fields_changed_at=-math.inf
+    failed_generation=None
+    def camera_fields_changed(*_):
+        nonlocal fields_changed_at,preview_frame
+        fields_changed_at=time.perf_counter()
+        invalidate_vision()
+        preview_frame=None
+        preview.itemconfigure(preview_item,image='')
+        status.set('Updating camera settings…')
+    for variable in (*variables.values(),*calibration_vars.values()):
+        variable.trace_add('write',camera_fields_changed)
+    config_watcher=CameraConfigWatcher(harness.args.config,harness.args.camera_index)
+    next_config_poll=0.
     pool = ThreadPoolExecutor(max_workers=1)
     pending = None
     last = time.perf_counter()
@@ -651,8 +729,27 @@ def gui(harness, telemetry):
     captured_at = None
     result_captured_at = None
     def tick():
-        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame, active_route, active_profile
+        nonlocal pending, last, physics_at, sample_at, captured_at, result_captured_at, last_capture, notification_until, pending_generation, preview_frame, active_route, active_profile, next_config_poll, source_profile, failed_generation
         now = time.perf_counter()
+        if now>=next_config_poll:
+            profile=config_watcher.poll(now)
+            next_config_poll=now+.2
+            if profile is not None:
+                try:
+                    profile.update({key:float(profile.get(key,0.)) for key in (*CALIBRATION_KEYS,*MOUNT_KEYS)})
+                    if not all(math.isfinite(profile[key]) for key in (*CALIBRATION_KEYS,*MOUNT_KEYS)) or min(profile['fx'],profile['fy'],profile['tag_size_m'])<=0:
+                        raise ValueError('invalid camera calibration')
+                    for key in CALIBRATION_KEYS:
+                        if profile[key]!=source_profile.get(key):calibration_vars[key].set(str(profile[key]))
+                    if harness.args.mounts is None:
+                        for key in MOUNT_KEYS:
+                            if profile[key]!=source_profile.get(key):
+                                preset_base[key]=profile[key]
+                                for col in range(2):variables[col,key].set(str(profile[key]))
+                    source_profile=profile
+                except (ValueError,TypeError) as error:
+                    config_watcher.applied=None
+                    config_watcher.error=f'Camera config reload: {error}'
         if harness.capture is not None:
             counts = harness.capture.status()
             capture_count.set(f"Captures: {counts['total']} total ({counts['saved']} this session)")
@@ -701,12 +798,12 @@ def gui(harness, telemetry):
         state=harness.chassis
         attitude_label.set(f" Height {state[3]:.2f} m | roll {math.degrees(state[4]):.1f}° | pitch {math.degrees(state[5]):.1f}°" if len(state)>=6 else ' Level ground')
         if pending is not None and pending.done():
+            if pending_generation != generation:
+                pending = None
+                root.after(1, tick)
+                return
             try:
                 result = pending.result()
-                if pending_generation != generation:
-                    pending = None
-                    root.after(1, tick)
-                    return
                 ghost, image, report, _, latency = result
                 if not report.get('sensor', {}).get('dropped_frame'):
                     telemetry.publish_result(result, display_raw=False)
@@ -714,6 +811,9 @@ def gui(harness, telemetry):
                     predictor.observe(ghost, captured_at)
                 preview_frame = image
                 redraw_preview()
+                camera_header.set(f"Camera {harness.args.camera_index}: {image.shape[1]}×{image.shape[0]}, "
+                    f"{'ideal lens' if harness.args.ideal_camera else 'configured lens'} — open AdvantageScope for the 3D field.\n"
+                    'Click camera to drive: W/S forward, A/D strafe, Q/E or Left/Right turn. Space stops.')
                 state = 'frame dropped' if report.get('sensor', {}).get('dropped_frame') else 'pose valid' if ghost is not None else 'no pose'
                 status.set(f"Tags: {report['detected_ids']} | {state} | "
                            f"frame {latency*1000:.0f} ms (render {report['render_ms']:.0f}, Vortex {report['vortex_ms']:.0f})")
@@ -727,6 +827,7 @@ def gui(harness, telemetry):
                 result_captured_at = None
                 telemetry.clear_vision()
                 telemetry.publish_display(None,0.)
+                failed_generation=generation
                 status.set(str(error))
             pending = None
         if result_captured_at is not None:
@@ -735,16 +836,18 @@ def gui(harness, telemetry):
         telemetry.publish_display(predictor.predict(last) if result_captured_at is not None and
                                   now-result_captured_at <= predictor.max_age else None,
                                   last-result_captured_at if result_captured_at is not None else 0.)
-        if pending is None and now >= sample_at:
+        if pending is None and now >= sample_at and now-fields_changed_at>=.3 and failed_generation!=generation:
             if profile_var.get() != active_profile:
                 active_profile = profile_var.get()
                 harness.sensor = Sensor(PROFILES[active_profile], harness.args.seed)
             mounts = live_mounts
-            if mounts:
-                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts, motion=commands)
+            camera_settings=read_camera_settings()
+            if mounts and camera_settings:
+                pending = pool.submit(harness.localize, harness.chassis.copy(), *mounts, motion=commands,camera_settings=camera_settings)
                 captured_at = last
                 pending_generation = generation
             sample_at = max(sample_at + 1 / harness.args.camera_hz, now)
+        if config_watcher.error:status.set(config_watcher.error)
         root.after(max(1, 5-round((time.perf_counter()-now)*1000)), tick)
     def close():
         root.destroy()
@@ -766,12 +869,14 @@ def build_parser():
     parser.add_argument("--field", type=Path, default=HERE.parent / "config/2026-rebuilt-welded.json")
     parser.add_argument("--camera-index", type=int, default=0)
     mounts = parser.add_mutually_exclusive_group()
-    mounts.add_argument("--mounts", type=Path, default=HERE / "demo_mounts.json",
-                        help="Load actual/assumed mounts (default: upright demo camera)")
+    mounts.add_argument("--mounts", type=Path, help="Load actual/assumed mounts instead of the selected camera config")
+    mounts.add_argument('--demo-mount', action='store_const', dest='mounts', const=HERE/'demo_mounts.json', help='Use the upright demo mount')
     mounts.add_argument("--use-config-mount", action="store_true", help="Use mount from production camera config")
     parser.add_argument("--advantagescope", type=Path, help="Also launch an installed AdvantageScope executable")
     parser.add_argument("--launch-advantagescope", action="store_true", help="Find and launch AdvantageScope")
-    parser.add_argument("--width", type=int, default=960)
+    parser.add_argument("--width", type=int, help='Output width (default: calibration width)')
+    parser.add_argument('--height', type=int, help='Output height (default: preserve calibration aspect ratio)')
+    parser.add_argument('--ideal-camera', action='store_true', help='Disable lens distortion for idealized regression controls')
     parser.add_argument("--calibration-width", type=int, default=1920)
     parser.add_argument("--calibration-height", type=int, default=1080)
     parser.add_argument("--start-tag", type=int, default=18)
@@ -839,9 +944,12 @@ def main():
                       max_bytes=int(args.capture_max_mb*1024*1024))
     except (ValueError, OverflowError) as error:
         parser.error(str(error))
-    if min(args.width, args.calibration_width, args.calibration_height) <= 0 or not math.isfinite(args.camera_hz) or args.camera_hz <= 0 or args.headless_frames < 0 or not math.isfinite(args.start_distance) or args.start_distance <= 0:
+    if min(args.width if args.width is not None else 1,args.height if args.height is not None else 1, args.calibration_width, args.calibration_height) <= 0 or not math.isfinite(args.camera_hz) or args.camera_hz <= 0 or args.headless_frames < 0 or not math.isfinite(args.start_distance) or args.start_distance <= 0:
         parser.error("Dimensions and rate must be positive; headless frame count cannot be negative")
     harness = Harness(args)
+    print(f'Camera {args.camera_index}: {harness.width}x{harness.height}, '
+          f'{"ideal" if args.ideal_camera else "configured"} lens, '
+          f'{"override" if args.mounts else "config"} mount',flush=True)
     try:
         telemetry = Telemetry(harness.root)
     except Exception:

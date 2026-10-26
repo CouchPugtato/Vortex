@@ -36,7 +36,7 @@ For a camera view inside AdvantageScope, add `/VortexSim/Camera` as **Camera Ove
 in the 3D Field, then right-click the field and select a fixed robot camera.
 The published pose uses the **actual** mount and field-relative forward/left/up axes.
 AdvantageScope keeps the selected robot camera's FOV and aspect ratio. The Python
-preview matches the detector projection exactly, including `fx`, `fy`, `cx`, and `cy`.
+preview matches the detector projection, including intrinsics and lens distortion.
 With AdvantageScope closed, `python chassis_sim/setup_advantagescope.py` adds a
 **Vortex Camera** tab and the camera override automatically, backing up its layout.
 
@@ -56,8 +56,8 @@ Use `--start-tag ID` and `--start-distance METERS` to change it.
 
 Edit **Actual mount** to change the rendered camera and **Vortex assumed mount**
 to change conversion of Vortex's camera pose into the ghost chassis pose.
-The default `demo_mounts.json` provides a matching upright forward-facing camera.
-Use `--use-config-mount` to start with the production camera profile's mount instead.
+Both mounts default to the selected production camera profile (`--camera-index`).
+Use `--demo-mount` for the upright demo camera, or `--mounts PATH` for saved mounts.
 Offsets are robot-relative meters. Angles follow Vortex's current convention:
 `Ry(yaw) Rx(pitch) Rz(roll)`, acting on camera optical axes (right/down/forward).
 They are not conventional chassis yaw/pitch/roll. An upright forward camera uses
@@ -66,8 +66,22 @@ Start with matching mounts, then introduce an offset or angle error in one colum
 **Save mounts** writes a session file; reload with `--mounts PATH`.
 The production config is never overwritten.
 
-The camera defaults to 960×540, scaling intrinsics from 1920×1080. Override
-`--calibration-width`/`--calibration-height` if the calibration uses another size.
+Mount fields update live. **Live camera calibration** also lets you edit focal
+lengths, principal point, distortion, tag size and output width/height. Changes
+apply after 300 ms without typing; camera setup runs in the background and stale
+poses are cleared. Incomplete or invalid fields pause sampling until corrected.
+The selected camera profile in the config file is watched too: saving it updates
+the matching fields without restarting or moving the chassis. Explicit mount
+file overrides remain in effect. GUI edits stay local to the simulation.
+
+The camera defaults to the full 1920×1080 calibration size, with the selected
+profile's `fx`, `fy`, `cx`, `cy`, `k1`, `k2`, `k3`, `p1`, and `p2`. The current
+config has no image-size fields; override `--calibration-width`/`--calibration-height`
+if it was calibrated at another size. `--width` and optional `--height` resize
+output and scale intrinsics per axis. The field and tags render with overscan,
+then lens distortion is applied before sensor effects, detection and capture.
+`--ideal-camera --demo-mount --width 960` restores the smaller idealized demo.
+Full resolution increases rendering and detection cost.
 `--camera-hz 40` controls sampling (default 40 FPS); actual throughput depends on
 CPU localization. Chassis/Actual publishes continuously at about 50 Hz, including
 while stationary. A second simulator using the same NT4 port is rejected.
@@ -84,8 +98,8 @@ python -m unittest discover -s chassis_sim -p "test_*.py"
 
 This is a kinematic chassis with field-boundary limits, not drivetrain physics or
 collision response. The camera renders static CAD geometry and exact tag textures,
-with simple lighting and a pinhole lens, with optional sensor effects. It doesn't model moving opponents,
-lens distortion, or shadows. The chassis can pass through geometry, putting the
+with simple lighting, calibrated lens distortion, and optional sensor effects.
+It doesn't model moving opponents or shadows. The chassis can pass through geometry, putting the
 camera inside an obstacle. Frames pass through production CPU detection/pose code;
 ground truth only scores the output. Vortex's GPU detector and live camera capture
 are not exercised.

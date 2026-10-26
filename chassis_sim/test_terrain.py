@@ -208,7 +208,7 @@ class NativeTiltTests(unittest.TestCase):
             root=Path(tmp)
             route=root/'route.json'
             route.write_text(json.dumps(dict(name='tilt-check',segments=[[.2,0,0,0]])))
-            main(['--renderer','fast','--replay-executable',str(executable),'--route-file',str(route),
+            main(['--demo-mount','--width','960','--ideal-camera','--renderer','fast','--replay-executable',str(executable),'--route-file',str(route),
                   '--profiles','clean','--mount-presets','matched','--terrains','flat','pitch','roll',
                   '--models','planar','free','--sample-hz','10','--no-capture','--skip-capture-replay',
                   '--chassis-height','.3',
